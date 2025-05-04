@@ -9,7 +9,9 @@ use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 use zeroize::Zeroize;
 
-use crate::chaos::{HenonMap, henon_warmup, logistic_map, chaotic_permutation, inverse_chaotic_permutation};
+use crate::chaos::{ChenSystem, TentMap, RabinovichFabrikantSystem, chen_warmup,
+                   tent_warmup, rf_warmup, interlaced_chaos_sequence,
+                   chaotic_permutation, inverse_chaotic_permutation};
 use crate::error::CryptoError;
 use crate::utils::{compress_data, decompress_data};
 
@@ -18,10 +20,16 @@ pub mod constants {
     pub const MAGIC: &[u8; 4] = b"AU79";
     pub const SALT_LEN: usize = 16;
     pub const HASH_LEN: usize = 32;
-    pub const LOGISTIC_SEED_LEN: usize = 8;
+    pub const TENT_SEED_LEN: usize = 8;
     pub const TIMESTAMP_LEN: usize = 8;
     pub const WARMUP_ITERATIONS: usize = 100;
     pub const CHACHA_NONCE_LEN: usize = 12;
+    
+    // Chen system parameters
+    pub const CHEN_DT: f64 = 0.01;
+    
+    // Rabinovich-Fabrikant parameters
+    pub const RF_DT: f64 = 0.01;
 }
 
 use constants::*;
@@ -63,22 +71,53 @@ pub fn encrypt(plaintext: &[u8], password: &str, input_filename: &str) -> Result
     let mut key = derive_key(password, &salt_bytes, &timestamp)?;
     let hash = blake3::hash(&key);
 
-    // Improve Chaotic Parameters
-    let a = 1.2 + (f64::from_le_bytes(hash.as_bytes()[0..8].try_into().unwrap()) / u64::MAX as f64) * 0.7;
-    let b = 0.1 + (f64::from_le_bytes(hash.as_bytes()[8..16].try_into().unwrap()) / u64::MAX as f64) * 0.8;
+    // Extract parameters for Chen system
+    let chen_a = 35.0 + (hash.as_bytes()[0] as f64) / 255.0;
+    let chen_b = 3.0 + (hash.as_bytes()[1] as f64) / 255.0;
+    let chen_c = 28.0 + (hash.as_bytes()[2] as f64) / 255.0;
+    
+    // Extract parameters for Tent Map
+    let tent_mu = 1.5 + (hash.as_bytes()[3] as f64) / 255.0;
+    
+    // Extract parameters for Rabinovich-Fabrikant system
+    let rf_alpha = 0.1 + (hash.as_bytes()[4] as f64) / 255.0;
+    let rf_gamma = 0.1 + (hash.as_bytes()[5] as f64) / 255.0;
 
     let mut rng = StdRng::from_seed(key);
-    let x0 = rng.gen_range(0.0..1.0);
-    let y0 = rng.gen_range(0.0..1.0);
-    let logistic_seed: f64 = rng.gen_range(0.0..1.0);
-    let mut henon = HenonMap::new(x0, y0, a, b);
+    
+    // Initialize chaotic systems
+    let chen_x0 = rng.gen_range(-10.0..10.0);
+    let chen_y0 = rng.gen_range(-10.0..10.0);
+    let chen_z0 = rng.gen_range(0.0..30.0);
+    
+    let tent_x0 = rng.gen_range(0.1..0.9); // Avoid fixed points at 0 and 1
+    
+    let rf_x0 = rng.gen_range(-1.0..1.0);
+    let rf_y0 = rng.gen_range(-1.0..1.0);
+    let rf_z0 = rng.gen_range(0.0..1.0);
+    
+    // Create chaotic systems
+    let mut chen = ChenSystem::new(chen_x0, chen_y0, chen_z0, chen_a, chen_b, chen_c, CHEN_DT);
+    let mut tent = TentMap::new(tent_x0, tent_mu);
+    let mut rf = RabinovichFabrikantSystem::new(rf_x0, rf_y0, rf_z0, rf_alpha, rf_gamma, RF_DT);
 
-    henon_warmup(&mut henon, WARMUP_ITERATIONS);
-    henon.evolve();
+    // Warm up the chaotic systems
+    chen_warmup(&mut chen, WARMUP_ITERATIONS);
+    tent_warmup(&mut tent, WARMUP_ITERATIONS);
+    rf_warmup(&mut rf, WARMUP_ITERATIONS);
+    
+    // Evolve the systems to make them more unpredictable
+    chen.evolve();
+    tent.evolve();
+    rf.evolve();
 
-    let logistic = logistic_map(logistic_seed, 3.99, compressed.len());
-    let permuted_plaintext = chaotic_permutation(&compressed, &logistic);
+    // Generate interlaced chaos sequence
+    let chaos_sequence = interlaced_chaos_sequence(&mut chen, &mut tent, &mut rf, compressed.len());
+    
+    // Perform permutation
+    let permuted_plaintext = chaotic_permutation(&compressed, &chaos_sequence);
 
+    // Continue with ChaCha20 encryption
     let nonce = generate_unique_nonce(&key, &timestamp);
 
     let mut cipher = ChaCha20::new((&key).into(), (&nonce).into());
@@ -105,7 +144,8 @@ pub fn encrypt(plaintext: &[u8], password: &str, input_filename: &str) -> Result
     mac.update(&extension);
     let final_mac = mac.finalize();
 
-    let logistic_bytes = logistic_seed.to_le_bytes();
+    // Store the tent map's initial value for decryption
+    let tent_bytes = tent_x0.to_le_bytes();
 
     key[..].zeroize();
 
@@ -116,7 +156,7 @@ pub fn encrypt(plaintext: &[u8], password: &str, input_filename: &str) -> Result
     result.extend_from_slice(&salt_bytes);
     result.extend_from_slice(&timestamp);
     result.extend_from_slice(&nonce);
-    result.extend_from_slice(&logistic_bytes);
+    result.extend_from_slice(&tent_bytes);
     result.push(extension_len);
     result.extend_from_slice(&extension);
     result.extend_from_slice(&ciphertext);
@@ -125,7 +165,7 @@ pub fn encrypt(plaintext: &[u8], password: &str, input_filename: &str) -> Result
 }
 
 pub fn decrypt(ciphertext_bundle: &[u8], password: &str) -> Result<(Vec<u8>, String), CryptoError> {
-    if ciphertext_bundle.len() < 4 + 1 + 1 + SALT_LEN + TIMESTAMP_LEN + CHACHA_NONCE_LEN + LOGISTIC_SEED_LEN + 1 + HASH_LEN {
+    if ciphertext_bundle.len() < 4 + 1 + 1 + SALT_LEN + TIMESTAMP_LEN + CHACHA_NONCE_LEN + TENT_SEED_LEN + 1 + HASH_LEN {
         return Err(CryptoError::InvalidCiphertextLength);
     }
 
@@ -142,8 +182,8 @@ pub fn decrypt(ciphertext_bundle: &[u8], password: &str) -> Result<(Vec<u8>, Str
     let salt_start = 6;
     let timestamp_start = salt_start + SALT_LEN;
     let nonce_start = timestamp_start + TIMESTAMP_LEN;
-    let logistic_start = nonce_start + CHACHA_NONCE_LEN;
-    let ext_len_start = logistic_start + LOGISTIC_SEED_LEN;
+    let tent_start = nonce_start + CHACHA_NONCE_LEN;
+    let ext_len_start = tent_start + TENT_SEED_LEN;
 
     let extension_len = ciphertext_bundle[ext_len_start] as usize;
     let ext_start = ext_len_start + 1;
@@ -156,8 +196,8 @@ pub fn decrypt(ciphertext_bundle: &[u8], password: &str) -> Result<(Vec<u8>, Str
 
     let salt_bytes = &ciphertext_bundle[salt_start..timestamp_start];
     let timestamp = &ciphertext_bundle[timestamp_start..nonce_start];
-    let nonce = &ciphertext_bundle[nonce_start..logistic_start];
-    let logistic_bytes = &ciphertext_bundle[logistic_start..ext_len_start];
+    let nonce = &ciphertext_bundle[nonce_start..tent_start];
+    let tent_bytes = &ciphertext_bundle[tent_start..ext_len_start];
     let extension = &ciphertext_bundle[ext_start..cipher_start];
     let encrypted = &ciphertext_bundle[cipher_start..mac_start];
     let mac_bytes = &ciphertext_bundle[mac_start..];
@@ -182,25 +222,56 @@ pub fn decrypt(ciphertext_bundle: &[u8], password: &str) -> Result<(Vec<u8>, Str
 
     let hash = blake3::hash(&key);
 
-    // Fixed the parameter mismatch:
-    let a = 1.2 + (f64::from_le_bytes(hash.as_bytes()[0..8].try_into().unwrap()) / u64::MAX as f64) * 0.7;
-    let b = 0.1 + (f64::from_le_bytes(hash.as_bytes()[8..16].try_into().unwrap()) / u64::MAX as f64) * 0.8;
+    // Extract parameters for Chen system - matching the encrypt function
+    let chen_a = 35.0 + (hash.as_bytes()[0] as f64) / 255.0;
+    let chen_b = 3.0 + (hash.as_bytes()[1] as f64) / 255.0;
+    let chen_c = 28.0 + (hash.as_bytes()[2] as f64) / 255.0;
+    
+    // Extract parameters for Tent Map
+    let tent_mu = 1.5 + (hash.as_bytes()[3] as f64) / 255.0;
+    
+    // Extract parameters for Rabinovich-Fabrikant system
+    let rf_alpha = 0.1 + (hash.as_bytes()[4] as f64) / 255.0;
+    let rf_gamma = 0.1 + (hash.as_bytes()[5] as f64) / 255.0;
 
     let mut rng = StdRng::from_seed(key);
-    let x0 = rng.gen_range(0.0..1.0);
-    let y0 = rng.gen_range(0.0..1.0);
-    let logistic_seed = f64::from_le_bytes(logistic_bytes.try_into().unwrap());
+    
+    // Initialize chaotic systems with identical parameters
+    let chen_x0 = rng.gen_range(-10.0..10.0);
+    let chen_y0 = rng.gen_range(-10.0..10.0);
+    let chen_z0 = rng.gen_range(0.0..30.0);
+    
+    let tent_x0 = f64::from_le_bytes(tent_bytes.try_into().unwrap());
+    
+    let rf_x0 = rng.gen_range(-1.0..1.0);
+    let rf_y0 = rng.gen_range(-1.0..1.0);
+    let rf_z0 = rng.gen_range(0.0..1.0);
+    
+    // Create chaotic systems
+    let mut chen = ChenSystem::new(chen_x0, chen_y0, chen_z0, chen_a, chen_b, chen_c, CHEN_DT);
+    let mut tent = TentMap::new(tent_x0, tent_mu);
+    let mut rf = RabinovichFabrikantSystem::new(rf_x0, rf_y0, rf_z0, rf_alpha, rf_gamma, RF_DT);
 
-    let mut henon = HenonMap::new(x0, y0, a, b);
-    henon_warmup(&mut henon, WARMUP_ITERATIONS);
-    henon.evolve();
+    // Warm up the chaotic systems
+    chen_warmup(&mut chen, WARMUP_ITERATIONS);
+    tent_warmup(&mut tent, WARMUP_ITERATIONS);
+    rf_warmup(&mut rf, WARMUP_ITERATIONS);
+    
+    // Evolve the systems
+    chen.evolve();
+    tent.evolve();
+    rf.evolve();
 
+    // First decrypt with ChaCha20
     let mut cipher = ChaCha20::new((&key).into(), (nonce).into());
     let mut decrypted = encrypted.to_vec();
     cipher.apply_keystream(&mut decrypted);
 
-    let logistic = logistic_map(logistic_seed, 3.99, decrypted.len());
-    let unpermuted = inverse_chaotic_permutation(&decrypted, &logistic);
+    // Generate the same interlaced chaos sequence
+    let chaos_sequence = interlaced_chaos_sequence(&mut chen, &mut tent, &mut rf, decrypted.len());
+    
+    // Reverse the permutation
+    let unpermuted = inverse_chaotic_permutation(&decrypted, &chaos_sequence);
 
     key[..].zeroize();
     let extension_str = String::from_utf8_lossy(extension).to_string();

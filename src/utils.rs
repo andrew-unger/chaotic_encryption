@@ -2,7 +2,6 @@ use flate2::read::ZlibDecoder;
 use flate2::write::ZlibEncoder;
 use flate2::Compression;
 use std::io::{self, Write};
-
 use crate::error::CryptoError;
 use crate::crypto::constants::*;
 
@@ -29,12 +28,12 @@ pub fn display_file_info(data: &[u8]) -> Result<(), CryptoError> {
     let flags = data[5];
     let timestamp_start = 6 + SALT_LEN;
     
-    if data.len() < timestamp_start + TIMESTAMP_LEN + CHACHA_NONCE_LEN + LOGISTIC_SEED_LEN + 1 {
+    if data.len() < timestamp_start + TIMESTAMP_LEN + CHACHA_NONCE_LEN + TENT_SEED_LEN + 1 {
         return Err(CryptoError::InvalidCiphertextLength);
     }
     
     let timestamp = u64::from_le_bytes(data[timestamp_start..timestamp_start+8].try_into().unwrap());
-    let logistic_seed = f64::from_le_bytes(data[timestamp_start+8+12..timestamp_start+8+12+8].try_into().unwrap());
+    let tent_seed = f64::from_le_bytes(data[timestamp_start+8+12..timestamp_start+8+12+8].try_into().unwrap());
     let ext_len = data[timestamp_start+8+12+8];
     let ext_start = timestamp_start+8+12+8+1;
     
@@ -49,7 +48,7 @@ pub fn display_file_info(data: &[u8]) -> Result<(), CryptoError> {
     println!("Version: {}", version);
     println!("Flags: {}", flags);
     println!("Timestamp (Unix Epoch): {}", timestamp);
-    println!("Logistic Seed: {}", logistic_seed);
+    println!("Tent Map Seed: {}", tent_seed);
     println!("Original Extension: .{}", String::from_utf8_lossy(extension));
     println!("----------------------");
     
