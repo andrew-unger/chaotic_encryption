@@ -1,15 +1,24 @@
 [package]
-name = "henon_encryption"
+name = "au79-crypto"
 version = "0.1.0"
 edition = "2021"
+authors = ["Your Name <your.email@example.com>"]
+description = "A custom encryption algorithm with chaotic cryptography"
 
 [dependencies]
-argon2 = "0.5"
-blake3 = "1.5"
-rand = "0.8"
-rpassword = "7.3"
-zeroize = "1.7"
-chacha20 = "0.9"
-flate2 = "1.0"
-subtle = "2.4"
-rayon = "1.10"
+argon2 = "0.5.0"
+blake3 = "1.4.1"
+chacha20 = "0.9.1"
+flate2 = "1.0.26"
+rand = "0.8.5"
+rayon = "1.7.0"
+rpassword = "7.2.0"
+subtle = "2.5.0"
+zeroize = "1.6.0"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
