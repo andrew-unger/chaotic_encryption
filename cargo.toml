@@ -1,0 +1,15 @@
+[package]
+name = "henon_encryption"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+argon2 = "0.5"
+blake3 = "1.5"
+rand = "0.8"
+rpassword = "7.3"
+zeroize = "1.7"
+chacha20 = "0.9"
+flate2 = "1.0"
+subtle = "2.4"
+rayon = "1.10"
