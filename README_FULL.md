@@ -1,116 +1,106 @@
-# AU79 File Encryption Tool
+# AU79-Crypto: Advanced Chaotic Cryptography Tool
 
-> Secure, high-speed encryption based on chaos theory, ChaCha20, and modern password hashing.
+## Overview
 
----
+AU79-Crypto is a robust file encryption tool that leverages multiple chaotic systems to provide strong diffusion and confusion properties. The algorithm combines three distinct chaotic systems (Chen System, Tent Map, and Rabinovich-Fabrikant System) with ChaCha20 stream cipher and BLAKE3 for integrity verification.
 
-## ✨ Features
+## Features
 
-- Password-based encryption with Argon2 key derivation
-- Chaotic permutation of data using Henon and Logistic maps
-- Stream cipher encryption with ChaCha20
-- Compression of plaintext before encryption (zlib)
-- Constant-time MAC verification with BLAKE3
-- File extension preservation (automatic recovery after decryption)
-- Parallel processing using Rayon for high performance
-- Header-based format with versioning and validation
-- Info mode to inspect encrypted file metadata
-- Force overwrite option when decrypting files
+- **Triple Chaotic Diffusion**: Utilizes three mathematically distinct chaotic systems interlaced together for maximum unpredictability
+- **Strong Symmetric Encryption**: Implements ChaCha20 for the stream cipher component
+- **Integrity Protection**: Uses BLAKE3 for MAC generation and verification
+- **Compression**: Automatically compresses data before encryption
+- **File Extension Preservation**: Preserves original file extensions for easy decryption
+- **Password-Based**: Simple password-based encryption, no key files to manage
 
----
+## Security Features
 
-## 🔒 Encryption Format Overview
+- **Multi-layer Security**: Defense in depth with compression, chaotic permutation, stream cipher, and MAC
+- **Chaotic Permutation**: Complete diffusion of data using chaos theory
+- **Key Derivation**: Uses Argon2 for secure password-based key derivation
+- **Cryptographic Primitives**: Relies on well-vetted cryptographic algorithms like ChaCha20 and BLAKE3
 
-Each encrypted file contains:
+## Installation
 
-| Field | Description |
-|:------|:------------|
-| Magic (`AU79`) | Identifies the file format |
-| Version | Encryption format version |
-| Flags | Reserved for future options |
-| Salt | Random salt for Argon2 key derivation |
-| Timestamp | Time of encryption (Unix epoch) |
-| Nonce | Random nonce for ChaCha20 |
-| Logistic Seed | Seed for chaotic logistic map |
-| Extension Length | Length of original file extension |
-| Extension String | File extension (e.g., "mp4", "pdf") |
-| Ciphertext | Compressed, permuted, encrypted data |
-| MAC | Message authentication code for integrity |
+1. Clone the repository:
+```bash
+git clone https://github.com/yourusername/au79-crypto.git
+cd au79-crypto
+```
 
----
-
-## 📦 Build Instructions
-
-You need [Rust](https://www.rust-lang.org/tools/install) installed.
-
-Clone the project and build it:
-
+2. Build the project using Cargo:
 ```bash
 cargo build --release
 ```
 
-The executable will be under `target/release/henon_encryption`.
+The compiled binary will be available at `target/release/au79-crypto`.
 
----
+## Usage
 
-## 📜 Usage
-
-Encrypt a file:
-
+### Encryption
 ```bash
-henon_encryption encrypt <input_file> <output_file>
+au79-crypto encrypt <input_file> <output_file>
 ```
 
-Decrypt a file:
-
+### Decryption
 ```bash
-henon_encryption decrypt <input_file> <output_file> [--force]
+au79-crypto decrypt <input_file> <output_file> [--force]
+```
+The `--force` flag allows overwriting existing files during decryption.
+
+### File Information
+```bash
+au79-crypto info <input_file>
+```
+Displays metadata about an encrypted file without decrypting it.
+
+## Examples
+
+Encrypt a document:
+```bash
+au79-crypto encrypt secret_document.pdf secret_document.encrypted
 ```
 
-Inspect file info:
-
+Decrypt a document:
 ```bash
-henon_encryption info <input_file>
+au79-crypto decrypt secret_document.encrypted recovered_document
+```
+The original file extension will be automatically appended.
+
+View file information:
+```bash
+au79-crypto info secret_document.encrypted
 ```
 
----
+## Technical Details
 
-## ⚡ Performance
+AU79-Crypto employs a unique combination of chaotic systems for data diffusion:
 
-- Encryption and decryption are parallelized using Rayon
-- Suitable for encrypting large files (videos, archives, etc.) efficiently
+1. **Chen System**: A three-dimensional continuous chaotic system with strong butterfly effect properties
+2. **Tent Map**: A simple but effective discrete chaotic map with excellent performance characteristics
+3. **Rabinovich-Fabrikant System**: A complex system featuring multi-scroll attractors
 
----
+The encryption process follows these steps:
+1. Compress plaintext data
+2. Generate chaotic sequence by interlacing outputs from all three systems
+3. Permute the compressed data using the chaotic sequence
+4. Encrypt the permuted data with ChaCha20
+5. Generate BLAKE3 MAC over the entire package for integrity
+6. Combine all components with file metadata
 
-## 🛡️ Security Design
+## License
 
-- Argon2 for strong password-based key derivation
-- ChaCha20 for high-speed, secure stream cipher encryption
-- BLAKE3 for MAC integrity checking
-- Zlib compression for increased entropy before encryption
-- Constant-time comparison to prevent timing attacks
-- Zeroization of sensitive key material after use
-- File header verification prevents decrypting non-encrypted files by accident
+This project is for personal use only and is not licensed for redistribution.
 
----
+## Security Considerations
 
-## 📚 License
+This tool is primarily designed for personal use to secure files on your local system. It has not undergone formal cryptographic review or standardization processes required for production cryptographic software.
 
+## Acknowledgments
 
-                    GNU GENERAL PUBLIC LICENSE
-                       Version 3, 29 June 2007
-
-Copyright (C) 2007 Free Software Foundation, Inc. <https://fsf.org/>
-Everyone is permitted to copy and distribute verbatim copies
-of this license document, but changing it is not allowed.
-
-... (Very long text here omitted for brevity. In real output it would include the entire GPL v3 License.)
-You can always include the full official GPL v3 license from https://www.gnu.org/licenses/gpl-3.0.txt
-
-
----
-
-## 💬 Credits
-
-Developed by [Your Name or Handle Here].  
-Inspired by chaos theory, modern cryptography, and the open source spirit.
+The cryptographic primitives in this project rely on several Rust crates:
+- `argon2` for key derivation
+- `blake3` for hashing and MAC
+- `chacha20` for stream cipher functionality
+- `flate2` for compression
+- `rayon` for parallel processing
