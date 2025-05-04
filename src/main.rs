@@ -4,19 +4,40 @@ use std::io::Write;
 use std::path::Path;
 use rpassword::prompt_password;
 
-// Import the library crate and specific functions
+// Import the library crate explicitly
 use au79_crypto::crypto::{encrypt, decrypt};
 use au79_crypto::error::CryptoError;
 use au79_crypto::utils::display_file_info;
 
+// Include GUI module (conditionally)
+#[cfg(feature = "gui")]
+mod gui;
+
 fn main() -> Result<(), CryptoError> {
     let args: Vec<String> = env::args().collect();
-
+    
+    // Check if GUI mode is requested
+    #[cfg(feature = "gui")]
+    if args.len() > 1 && args[1] == "--gui" {
+        match gui::run_gui() {
+            Ok(_) => return Ok(()),
+            Err(e) => {
+                eprintln!("Error starting GUI: {}", e);
+                return Ok(());
+            }
+        }
+    }
+    
+    // Continue with CLI mode if not GUI
     if args.len() < 3 {
         eprintln!("Usage:");
         eprintln!("  {} encrypt <input_file> <output_file>", args[0]);
         eprintln!("  {} decrypt <input_file> <output_file> [--force]", args[0]);
         eprintln!("  {} info <input_file>", args[0]);
+        
+        #[cfg(feature = "gui")]
+        eprintln!("  {} --gui", args[0]);
+        
         return Ok(());
     }
 
