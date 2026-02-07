@@ -1,13 +1,17 @@
+use std::io::{Cursor, Write as IoWrite};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::time::Instant;
 use std::fs;
 
 use eframe::egui;
+use zip::write::SimpleFileOptions;
 
 extern crate au79_crypto;
 use au79_crypto::crypto::{encrypt, decrypt};
 use au79_crypto::error::CryptoError;
+
+const ARCHIVE_EXTENSION: &str = "au79archive";
 
 // ── Constants ──────────────────────────────────────────────────────────────────
 
@@ -25,21 +29,10 @@ pub enum Mode {
     Info,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum BatchFileStatus {
-    Pending,
-    Processing,
-    Complete,
-    Failed,
-}
-
 #[derive(Debug, Clone)]
 pub struct BatchFileEntry {
     path: PathBuf,
     size: u64,
-    status: BatchFileStatus,
-    output_path: PathBuf,
-    error: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -52,8 +45,7 @@ pub enum PasswordStrength {
 }
 
 pub enum WorkerMessage {
-    FileComplete { index: usize, result: Result<String, String> },
-    BatchProgress { completed: usize, total: usize },
+    Complete(Result<String, String>),
     AllDone,
 }
 
@@ -74,6 +66,7 @@ pub struct Au79Gui {
     // Batch mode
     batch_mode: bool,
     batch_files: Vec<BatchFileEntry>,
+    batch_output_path: String,
 
     // Status / progress
     status_message: String,
@@ -100,6 +93,7 @@ impl Default for Au79Gui {
             show_password: false,
             batch_mode: false,
             batch_files: Vec::new(),
+            batch_output_path: String::new(),
             status_message: "Ready".into(),
             status_is_error: false,
             progress: 0.0,
@@ -144,7 +138,7 @@ impl Au79Gui {
                     ui.radio_value(&mut self.mode, Mode::Decrypt, "Decrypt");
                     ui.radio_value(&mut self.mode, Mode::Info, "File Info");
 
-                    if self.mode != Mode::Info {
+                    if self.mode == Mode::Encrypt {
                         ui.separator();
                         ui.checkbox(&mut self.batch_mode, "Batch Mode");
                     }
@@ -214,7 +208,7 @@ impl Au79Gui {
             egui::ScrollArea::vertical().show(ui, |ui| {
                 match self.mode {
                     Mode::Info => self.render_info_mode(ui),
-                    _ if self.batch_mode => self.render_batch_mode(ui),
+                    Mode::Encrypt if self.batch_mode => self.render_batch_mode(ui),
                     _ => self.render_single_mode(ui),
                 }
             });
@@ -301,17 +295,24 @@ impl Au79Gui {
             }
             if ui.button("Clear All").clicked() && !self.processing {
                 self.batch_files.clear();
+                self.batch_output_path.clear();
             }
+
+            let total_size: u64 = self.batch_files.iter().map(|e| e.size).sum();
             ui.label(
-                egui::RichText::new(format!("{} file(s)", self.batch_files.len()))
-                    .color(egui::Color32::GRAY),
+                egui::RichText::new(format!(
+                    "{} file(s)  ({})",
+                    self.batch_files.len(),
+                    format_file_size(total_size)
+                ))
+                .color(egui::Color32::GRAY),
             );
         });
 
         ui.add_space(6.0);
 
-        // File table
-        let available_height = (ui.available_height() - 200.0).max(100.0);
+        // File list
+        let available_height = (ui.available_height() - 240.0).max(80.0);
         egui::Frame::group(ui.style()).show(ui, |ui| {
             egui::ScrollArea::vertical()
                 .max_height(available_height)
@@ -330,13 +331,11 @@ impl Au79Gui {
                         let mut remove_idx: Option<usize> = None;
                         egui::Grid::new("batch_grid")
                             .striped(true)
-                            .num_columns(4)
+                            .num_columns(3)
                             .min_col_width(60.0)
                             .show(ui, |ui| {
-                                // Header
                                 ui.strong("File");
                                 ui.strong("Size");
-                                ui.strong("Status");
                                 ui.strong("");
                                 ui.end_row();
 
@@ -348,19 +347,6 @@ impl Au79Gui {
                                         .unwrap_or_else(|| "???".into());
                                     ui.label(&name);
                                     ui.label(format_file_size(entry.size));
-
-                                    let (text, color) = match &entry.status {
-                                        BatchFileStatus::Pending => {
-                                            ("Pending", egui::Color32::GRAY)
-                                        }
-                                        BatchFileStatus::Processing => {
-                                            ("Processing...", egui::Color32::YELLOW)
-                                        }
-                                        BatchFileStatus::Complete => ("Done", SUCCESS_GREEN),
-                                        BatchFileStatus::Failed => ("Failed", ERROR_RED),
-                                    };
-                                    ui.colored_label(color, text);
-
                                     if !self.processing {
                                         if ui.small_button("Remove").clicked() {
                                             remove_idx = Some(i);
@@ -369,18 +355,6 @@ impl Au79Gui {
                                         ui.label("");
                                     }
                                     ui.end_row();
-
-                                    // Show error detail for failed files
-                                    if let Some(err) = &entry.error {
-                                        ui.label("");
-                                        ui.label("");
-                                        ui.colored_label(
-                                            ERROR_RED,
-                                            egui::RichText::new(err).small(),
-                                        );
-                                        ui.label("");
-                                        ui.end_row();
-                                    }
                                 }
                             });
                         if let Some(idx) = remove_idx {
@@ -392,20 +366,36 @@ impl Au79Gui {
 
         ui.add_space(10.0);
 
+        // Output archive path
+        ui.label(egui::RichText::new("Output Archive").strong());
+        ui.horizontal(|ui| {
+            ui.add(
+                egui::TextEdit::singleline(&mut self.batch_output_path)
+                    .desired_width(ui.available_width() - 80.0)
+                    .hint_text("Output .au79 file..."),
+            );
+            if ui.button("Browse").clicked() {
+                let dialog = rfd::FileDialog::new()
+                    .set_title("Save Encrypted Archive")
+                    .add_filter("AU79 Encrypted", &["au79"]);
+                if let Some(path) = dialog.save_file() {
+                    self.batch_output_path = path.to_string_lossy().to_string();
+                }
+            }
+        });
+
+        ui.add_space(10.0);
+
         // Password
         self.render_password_fields(ui);
 
         ui.add_space(12.0);
 
         // Process button
-        let label = match self.mode {
-            Mode::Encrypt => format!("Encrypt {} File(s)", self.batch_files.len()),
-            Mode::Decrypt => format!("Decrypt {} File(s)", self.batch_files.len()),
-            Mode::Info => "Show Info".into(),
-        };
+        let label = format!("Encrypt {} File(s) as Archive", self.batch_files.len());
         let can_go = self.can_process();
         let btn = egui::Button::new(egui::RichText::new(&label).strong().size(16.0))
-            .min_size(egui::vec2(200.0, 36.0));
+            .min_size(egui::vec2(240.0, 36.0));
         if ui.add_enabled(can_go, btn).clicked() {
             self.start_batch_operation(ui.ctx().clone());
         }
@@ -525,18 +515,20 @@ impl Au79Gui {
             return;
         }
 
-        if self.batch_mode && self.mode != Mode::Info {
+        if self.batch_mode && self.mode == Mode::Encrypt {
             for file in &dropped {
                 if let Some(path) = &file.path {
                     let size = fs::metadata(path).map(|m| m.len()).unwrap_or(0);
-                    let output_path = self.compute_output_path(path);
                     self.batch_files.push(BatchFileEntry {
                         path: path.clone(),
                         size,
-                        status: BatchFileStatus::Pending,
-                        output_path,
-                        error: None,
                     });
+                    if self.batch_output_path.is_empty() {
+                        if let Some(dir) = path.parent() {
+                            self.batch_output_path =
+                                dir.join("archive.au79").to_string_lossy().to_string();
+                        }
+                    }
                 }
             }
         } else if let Some(first) = dropped.first() {
@@ -576,21 +568,21 @@ impl Au79Gui {
     }
 
     fn browse_batch_files(&mut self) {
-        let mut dialog = rfd::FileDialog::new().set_title("Select Files");
-        if self.mode == Mode::Decrypt {
-            dialog = dialog.add_filter("AU79 Encrypted", &["au79"]);
-        }
-        dialog = dialog.add_filter("All Files", &["*"]);
+        let dialog = rfd::FileDialog::new()
+            .set_title("Select Files")
+            .add_filter("All Files", &["*"]);
         if let Some(paths) = dialog.pick_files() {
             for path in paths {
                 let size = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-                let output_path = self.compute_output_path(&path);
+                if self.batch_output_path.is_empty() {
+                    if let Some(dir) = path.parent() {
+                        self.batch_output_path =
+                            dir.join("archive.au79").to_string_lossy().to_string();
+                    }
+                }
                 self.batch_files.push(BatchFileEntry {
                     path,
                     size,
-                    status: BatchFileStatus::Pending,
-                    output_path,
-                    error: None,
                 });
             }
         }
@@ -647,7 +639,7 @@ impl Au79Gui {
             Mode::Info => !self.input_path.is_empty(),
             Mode::Encrypt => {
                 let has_files = if self.batch_mode {
-                    !self.batch_files.is_empty()
+                    !self.batch_files.is_empty() && !self.batch_output_path.is_empty()
                 } else {
                     !self.input_path.is_empty() && !self.output_path.is_empty()
                 };
@@ -656,12 +648,9 @@ impl Au79Gui {
                     && self.password == self.confirm_password
             }
             Mode::Decrypt => {
-                let has_files = if self.batch_mode {
-                    !self.batch_files.is_empty()
-                } else {
-                    !self.input_path.is_empty() && !self.output_path.is_empty()
-                };
-                has_files && !self.password.is_empty()
+                !self.input_path.is_empty()
+                    && !self.output_path.is_empty()
+                    && !self.password.is_empty()
             }
         }
     }
@@ -689,7 +678,7 @@ impl Au79Gui {
                 Mode::Decrypt => decrypt_file(&input_path, &output_path, &password),
                 Mode::Info => show_file_info(&input_path),
             };
-            let _ = tx.send(WorkerMessage::FileComplete { index: 0, result });
+            let _ = tx.send(WorkerMessage::Complete(result));
             let _ = tx.send(WorkerMessage::AllDone);
             ctx.request_repaint();
         });
@@ -699,43 +688,18 @@ impl Au79Gui {
         let (tx, rx) = mpsc::channel();
         self.worker_rx = Some(rx);
         self.processing = true;
-        self.progress = 0.0;
-        self.status_message = "Processing batch...".into();
+        self.progress = 0.05;
+        self.status_message = "Creating archive...".into();
         self.status_is_error = false;
         self.operation_start = Some(Instant::now());
 
-        for entry in &mut self.batch_files {
-            if entry.status != BatchFileStatus::Complete {
-                entry.status = BatchFileStatus::Processing;
-                entry.error = None;
-            }
-        }
-
-        let files: Vec<(usize, PathBuf, PathBuf)> = self
-            .batch_files
-            .iter()
-            .enumerate()
-            .filter(|(_, e)| e.status == BatchFileStatus::Processing)
-            .map(|(i, e)| (i, e.path.clone(), e.output_path.clone()))
-            .collect();
-        let total = files.len();
-        let mode = self.mode;
+        let files: Vec<PathBuf> = self.batch_files.iter().map(|e| e.path.clone()).collect();
+        let output_path = PathBuf::from(&self.batch_output_path);
         let password = self.password.clone();
 
         std::thread::spawn(move || {
-            for (completed, (index, input, output)) in files.into_iter().enumerate() {
-                let result = match mode {
-                    Mode::Encrypt => encrypt_file(&input, &output, &password),
-                    Mode::Decrypt => decrypt_file(&input, &output, &password),
-                    Mode::Info => show_file_info(&input),
-                };
-                let _ = tx.send(WorkerMessage::FileComplete { index, result });
-                let _ = tx.send(WorkerMessage::BatchProgress {
-                    completed: completed + 1,
-                    total,
-                });
-                ctx.request_repaint();
-            }
+            let result = encrypt_archive(&files, &output_path, &password);
+            let _ = tx.send(WorkerMessage::Complete(result));
             let _ = tx.send(WorkerMessage::AllDone);
             ctx.request_repaint();
         });
@@ -746,30 +710,16 @@ impl Au79Gui {
 
         while let Ok(msg) = rx.try_recv() {
             match msg {
-                WorkerMessage::FileComplete { index, result } => match result {
+                WorkerMessage::Complete(result) => match result {
                     Ok(msg) => {
-                        if self.batch_mode {
-                            if let Some(entry) = self.batch_files.get_mut(index) {
-                                entry.status = BatchFileStatus::Complete;
-                            }
-                        }
                         self.status_message = msg;
                         self.status_is_error = false;
                     }
                     Err(err) => {
-                        if self.batch_mode {
-                            if let Some(entry) = self.batch_files.get_mut(index) {
-                                entry.status = BatchFileStatus::Failed;
-                                entry.error = Some(err.clone());
-                            }
-                        }
                         self.status_message = err;
                         self.status_is_error = true;
                     }
                 },
-                WorkerMessage::BatchProgress { completed, total } => {
-                    self.progress = completed as f32 / total as f32;
-                }
                 WorkerMessage::AllDone => {
                     self.processing = false;
                     if !self.status_is_error {
@@ -805,6 +755,17 @@ fn decrypt_file(input_path: &Path, output_path: &Path, password: &str) -> Result
         _ => format!("Decryption failed: {}", e),
     })?;
 
+    // Archive: extract zip contents to a directory
+    if extension == ARCHIVE_EXTENSION {
+        let extract_dir = output_path.with_extension("");
+        let count = extract_archive(&result, &extract_dir)?;
+        return Ok(format!(
+            "Extracted {} file(s) to {}",
+            count,
+            extract_dir.to_string_lossy()
+        ));
+    }
+
     let mut final_output = output_path.to_path_buf();
     if !extension.is_empty() {
         final_output.set_extension(&extension);
@@ -816,6 +777,71 @@ fn decrypt_file(input_path: &Path, output_path: &Path, password: &str) -> Result
         "Decrypted successfully: {}",
         final_output.to_string_lossy()
     ))
+}
+
+fn encrypt_archive(files: &[PathBuf], output_path: &Path, password: &str) -> Result<String, String> {
+    let archive = create_archive(files)?;
+    let filename = format!("archive.{}", ARCHIVE_EXTENSION);
+    let result = encrypt(&archive, password, &filename)
+        .map_err(|e| format!("Encryption failed: {}", e))?;
+    fs::write(output_path, result)
+        .map_err(|e| format!("Failed to write output: {}", e))?;
+    Ok(format!(
+        "Encrypted {} file(s) into {}",
+        files.len(),
+        output_path.to_string_lossy()
+    ))
+}
+
+fn create_archive(files: &[PathBuf]) -> Result<Vec<u8>, String> {
+    let buf = Vec::new();
+    let mut zip = zip::ZipWriter::new(Cursor::new(buf));
+    let options = SimpleFileOptions::default()
+        .compression_method(zip::CompressionMethod::Deflated);
+
+    for path in files {
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "unknown".into());
+        zip.start_file(&name, options)
+            .map_err(|e| format!("Failed to add {}: {}", name, e))?;
+        let data = fs::read(path)
+            .map_err(|e| format!("Failed to read {}: {}", name, e))?;
+        zip.write_all(&data)
+            .map_err(|e| format!("Failed to write {}: {}", name, e))?;
+    }
+
+    let cursor = zip.finish().map_err(|e| format!("Failed to finalize archive: {}", e))?;
+    Ok(cursor.into_inner())
+}
+
+fn extract_archive(data: &[u8], output_dir: &Path) -> Result<usize, String> {
+    let cursor = Cursor::new(data);
+    let mut archive = zip::ZipArchive::new(cursor)
+        .map_err(|e| format!("Failed to open archive: {}", e))?;
+
+    fs::create_dir_all(output_dir)
+        .map_err(|e| format!("Failed to create directory: {}", e))?;
+
+    let count = archive.len();
+    for i in 0..count {
+        let mut file = archive
+            .by_index(i)
+            .map_err(|e| format!("Archive error: {}", e))?;
+        let name = file.name().to_string();
+        // Prevent path traversal
+        if name.contains("..") {
+            continue;
+        }
+        let out_path = output_dir.join(&name);
+        let mut out_file = fs::File::create(&out_path)
+            .map_err(|e| format!("Failed to create {}: {}", name, e))?;
+        std::io::copy(&mut file, &mut out_file)
+            .map_err(|e| format!("Failed to extract {}: {}", name, e))?;
+    }
+
+    Ok(count)
 }
 
 fn show_file_info(input_path: &Path) -> Result<String, String> {

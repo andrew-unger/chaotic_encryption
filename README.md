@@ -14,8 +14,9 @@ Available as both a command-line tool and a cross-platform graphical application
 - **Argon2 Key Derivation** — Memory-hard password hashing resistant to brute force
 - **Automatic Compression** — Data is compressed before encryption
 - **File Extension Preservation** — Original file extension is restored on decryption
+- **Auto-Detection** — Automatically switches between Encrypt/Decrypt mode based on selected file
 - **Cross-Platform GUI** — Native desktop application built with egui/eframe
-- **Batch Mode** — Encrypt or decrypt multiple files at once through the GUI
+- **Batch Archive Mode** — Select multiple files, bundle them into a single encrypted `.au79` archive; decryption auto-extracts all files
 - **Drag-and-Drop** — Drop files directly onto the GUI window
 - **Password Strength Indicator** — Real-time feedback on password quality
 
@@ -55,7 +56,8 @@ The GUI provides:
 - File browser dialogs and drag-and-drop support
 - Password entry with show/hide toggle and strength indicator
 - Password confirmation for encryption
-- Batch mode for processing multiple files at once with per-file status tracking
+- Batch archive mode: bundle multiple files into a single encrypted `.au79` archive
+- Automatic extraction when decrypting a batch archive
 - Progress bar and elapsed time display
 - Dark theme with AU79 gold accent branding
 
@@ -151,6 +153,7 @@ The three systems are interlaced with weighted combination (30% / 30% / 40%) to 
 | `rayon` | Parallel sort for large-file permutations |
 | `eframe` / `egui` | Cross-platform GUI (optional) |
 | `rfd` | Native file dialogs (optional) |
+| `zip` | Archive creation for batch mode (optional) |
 
 ## Security Considerations
 
