@@ -541,6 +541,7 @@ impl Au79Gui {
             }
         } else if let Some(first) = dropped.first() {
             if let Some(path) = &first.path {
+                self.auto_detect_mode(path);
                 self.input_path = path.to_string_lossy().to_string();
                 self.output_path = self
                     .compute_output_path(path)
@@ -553,17 +554,17 @@ impl Au79Gui {
     // ── File Browsing ──────────────────────────────────────────────────────────
 
     fn browse_input(&mut self) {
-        let mut dialog = rfd::FileDialog::new().set_title("Select Input File");
-        if self.mode == Mode::Decrypt || self.mode == Mode::Info {
-            dialog = dialog.add_filter("AU79 Encrypted", &["au79"]);
-        }
-        dialog = dialog.add_filter("All Files", &["*"]);
+        let dialog = rfd::FileDialog::new()
+            .set_title("Select Input File")
+            .add_filter("All Files", &["*"])
+            .add_filter("AU79 Encrypted", &["au79"]);
         if let Some(path) = dialog.pick_file() {
+            self.auto_detect_mode(&path);
+            self.input_path = path.to_string_lossy().to_string();
             self.output_path = self
                 .compute_output_path(&path)
                 .to_string_lossy()
                 .to_string();
-            self.input_path = path.to_string_lossy().to_string();
         }
     }
 
@@ -592,6 +593,22 @@ impl Au79Gui {
                     error: None,
                 });
             }
+        }
+    }
+
+    // ── Auto-Detect Mode ─────────────────────────────────────────────────────
+
+    fn auto_detect_mode(&mut self, path: &Path) {
+        let is_au79 = path.extension().map(|e| e == "au79").unwrap_or(false)
+            || fs::read(path)
+                .ok()
+                .map(|d| d.len() >= 4 && &d[..4] == b"AU79")
+                .unwrap_or(false);
+
+        if is_au79 {
+            self.mode = Mode::Decrypt;
+        } else {
+            self.mode = Mode::Encrypt;
         }
     }
 
