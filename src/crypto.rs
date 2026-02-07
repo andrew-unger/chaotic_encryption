@@ -121,7 +121,7 @@ pub fn encrypt(plaintext: &[u8], password: &str, input_filename: &str) -> Result
     let nonce = generate_unique_nonce(&key, &timestamp);
 
     let mut cipher = ChaCha20::new((&key).into(), (&nonce).into());
-    let mut ciphertext = permuted_plaintext.clone();
+    let mut ciphertext = permuted_plaintext;
     cipher.apply_keystream(&mut ciphertext);
 
     let extension = Path::new(input_filename)
@@ -149,7 +149,7 @@ pub fn encrypt(plaintext: &[u8], password: &str, input_filename: &str) -> Result
 
     key[..].zeroize();
 
-    let mut result = Vec::new();
+    let mut result = Vec::with_capacity(4 + 1 + 1 + SALT_LEN + TIMESTAMP_LEN + CHACHA_NONCE_LEN + TENT_SEED_LEN + 1 + extension.len() + ciphertext.len() + 32);
     result.extend_from_slice(MAGIC);
     result.push(VERSION);
     result.push(0); // Flags
@@ -242,7 +242,8 @@ pub fn decrypt(ciphertext_bundle: &[u8], password: &str) -> Result<(Vec<u8>, Str
     let chen_z0 = rng.gen_range(0.0..30.0);
     
     let tent_x0 = f64::from_le_bytes(tent_bytes.try_into().unwrap());
-    
+    let _ = rng.gen_range(0.1..0.9_f64); // advance RNG to stay in sync with encrypt
+
     let rf_x0 = rng.gen_range(-1.0..1.0);
     let rf_y0 = rng.gen_range(-1.0..1.0);
     let rf_z0 = rng.gen_range(0.0..1.0);

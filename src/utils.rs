@@ -6,7 +6,7 @@ use crate::error::CryptoError;
 use crate::crypto::constants::*;
 
 pub fn compress_data(data: &[u8]) -> Result<Vec<u8>, CryptoError> {
-    let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+    let mut encoder = ZlibEncoder::new(Vec::new(), Compression::fast());
     encoder.write_all(data)?;
     Ok(encoder.finish()?)
 }

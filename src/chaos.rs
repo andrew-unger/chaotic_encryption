@@ -147,17 +147,31 @@ pub fn interlaced_chaos_sequence(
 }
 
 pub fn chaotic_permutation(input: &[u8], chaos_sequence: &[f64]) -> Vec<u8> {
-    let mut indices: Vec<(usize, f64)> = chaos_sequence.iter().cloned().enumerate().collect();
-    indices.par_sort_unstable_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
-    indices.par_iter().map(|(orig_idx, _)| input[*orig_idx]).collect()
+    let len = input.len();
+    let mut indices: Vec<usize> = (0..len).collect();
+
+    if len > 50_000 {
+        indices.par_sort_unstable_by(|&a, &b| chaos_sequence[a].total_cmp(&chaos_sequence[b]));
+    } else {
+        indices.sort_unstable_by(|&a, &b| chaos_sequence[a].total_cmp(&chaos_sequence[b]));
+    }
+
+    indices.iter().map(|&idx| input[idx]).collect()
 }
 
 pub fn inverse_chaotic_permutation(input: &[u8], chaos_sequence: &[f64]) -> Vec<u8> {
-    let mut indices: Vec<(usize, f64)> = chaos_sequence.iter().cloned().enumerate().collect();
-    indices.par_sort_unstable_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
-    let mut inverse = vec![0usize; input.len()];
-    for (i, (orig_idx, _)) in indices.iter().enumerate() {
-        inverse[*orig_idx] = i;
+    let len = input.len();
+    let mut indices: Vec<usize> = (0..len).collect();
+
+    if len > 50_000 {
+        indices.par_sort_unstable_by(|&a, &b| chaos_sequence[a].total_cmp(&chaos_sequence[b]));
+    } else {
+        indices.sort_unstable_by(|&a, &b| chaos_sequence[a].total_cmp(&chaos_sequence[b]));
     }
-    (0..input.len()).into_par_iter().map(|i| input[inverse[i]]).collect()
+
+    let mut result = vec![0u8; len];
+    for (i, &orig_idx) in indices.iter().enumerate() {
+        result[orig_idx] = input[i];
+    }
+    result
 }
