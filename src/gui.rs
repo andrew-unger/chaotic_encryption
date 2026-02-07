@@ -1,16 +1,23 @@
-use iced::{Application, Command, Element, Settings, Theme};
-use iced::widget::{Button, Column, Container, ProgressBar, Radio, Row, Text, TextInput};
-use iced::futures::channel::mpsc;
-use iced::Length;
 use std::path::{Path, PathBuf};
+use std::sync::mpsc;
+use std::time::Instant;
 use std::fs;
 
-// Import from the library via external path
+use eframe::egui;
+
 extern crate au79_crypto;
 use au79_crypto::crypto::{encrypt, decrypt};
 use au79_crypto::error::CryptoError;
 
-// Flag enum for application mode
+// ── Constants ──────────────────────────────────────────────────────────────────
+
+const GOLD: egui::Color32 = egui::Color32::from_rgb(255, 195, 0);
+const GOLD_DIM: egui::Color32 = egui::Color32::from_rgb(180, 140, 20);
+const SUCCESS_GREEN: egui::Color32 = egui::Color32::from_rgb(100, 220, 100);
+const ERROR_RED: egui::Color32 = egui::Color32::from_rgb(240, 80, 80);
+
+// ── Types ──────────────────────────────────────────────────────────────────────
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
     Encrypt,
@@ -18,480 +25,913 @@ pub enum Mode {
     Info,
 }
 
-// Message enum for GUI events
-#[derive(Debug, Clone)]
-pub enum Message {
-    ModeSelected(Mode),
-    InputPathChanged(String),
-    OutputPathChanged(String),
-    PasswordChanged(String),
-    ConfirmPasswordChanged(String),
-    BrowseInputClicked,
-    BrowseOutputClicked,
-    TogglePasswordVisibility,
-    ProcessFile,
-    OperationComplete(Result<String, String>),
-    FileInfoReceived(String),
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BatchFileStatus {
+    Pending,
+    Processing,
+    Complete,
+    Failed,
 }
 
-// Main GUI application state
+#[derive(Debug, Clone)]
+pub struct BatchFileEntry {
+    path: PathBuf,
+    size: u64,
+    status: BatchFileStatus,
+    output_path: PathBuf,
+    error: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PasswordStrength {
+    Empty,
+    Weak,
+    Fair,
+    Strong,
+    VeryStrong,
+}
+
+pub enum WorkerMessage {
+    FileComplete { index: usize, result: Result<String, String> },
+    BatchProgress { completed: usize, total: usize },
+    AllDone,
+}
+
+// ── Application State ──────────────────────────────────────────────────────────
+
 pub struct Au79Gui {
     mode: Mode,
+
+    // Single-file
     input_path: String,
     output_path: String,
+
+    // Password
     password: String,
     confirm_password: String,
     show_password: bool,
-    status: String,
+
+    // Batch mode
+    batch_mode: bool,
+    batch_files: Vec<BatchFileEntry>,
+
+    // Status / progress
+    status_message: String,
+    status_is_error: bool,
     progress: f32,
-    file_info: String,
     processing: bool,
-    sender: Option<mpsc::Sender<Message>>,
+    operation_start: Option<Instant>,
+
+    // File info
+    file_info_text: String,
+
+    // Worker thread
+    worker_rx: Option<mpsc::Receiver<WorkerMessage>>,
 }
 
-impl Application for Au79Gui {
-    type Message = Message;
-    type Theme = Theme;
-    type Executor = iced::executor::Default;
-    type Flags = ();
-
-    fn new(_flags: ()) -> (Self, Command<Message>) {
-        (
-            Self {
-                mode: Mode::Encrypt,
-                input_path: String::new(),
-                output_path: String::new(),
-                password: String::new(),
-                confirm_password: String::new(),
-                show_password: false,
-                status: "Ready.".into(),
-                progress: 0.0,
-                file_info: String::new(),
-                processing: false,
-                sender: None,
-            },
-            Command::none(),
-        )
-    }
-
-    fn title(&self) -> String {
-        String::from("AU79 Cryptography")
-    }
-
-    fn update(&mut self, message: Message) -> Command<Message> {
-        match message {
-            Message::ModeSelected(mode) => {
-                self.mode = mode;
-                self.status = "Ready.".into();
-                self.progress = 0.0;
-                self.file_info = String::new();
-
-                // Automatically update output path based on input path
-                if !self.input_path.is_empty() {
-                    let input_path = PathBuf::from(&self.input_path);
-                    
-                    match mode {
-                        Mode::Encrypt => {
-                            let mut output_path = input_path.clone();
-                            output_path.set_extension("au79");
-                            self.output_path = output_path.to_string_lossy().to_string();
-                        },
-                        Mode::Decrypt => {
-                            let mut output_path = input_path.clone();
-                            output_path.set_extension("");
-                            self.output_path = output_path.to_string_lossy().to_string();
-                        },
-                        _ => {}
-                    }
-                }
-            },
-            Message::InputPathChanged(path) => {
-                self.input_path = path;
-                
-                // Automatically update output path based on input path
-                if !self.input_path.is_empty() {
-                    let input_path = PathBuf::from(&self.input_path);
-                    
-                    match self.mode {
-                        Mode::Encrypt => {
-                            let mut output_path = input_path.clone();
-                            output_path.set_extension("au79");
-                            self.output_path = output_path.to_string_lossy().to_string();
-                        },
-                        Mode::Decrypt => {
-                            let mut output_path = input_path.clone();
-                            output_path.set_extension("");
-                            self.output_path = output_path.to_string_lossy().to_string();
-                        },
-                        _ => {}
-                    }
-                }
-            },
-            Message::OutputPathChanged(path) => {
-                self.output_path = path;
-            },
-            Message::PasswordChanged(password) => {
-                self.password = password;
-            },
-            Message::ConfirmPasswordChanged(password) => {
-                self.confirm_password = password;
-            },
-            Message::BrowseInputClicked => {
-                let task = iced::Command::perform(
-                    browse_file("Select Input File", false),
-                    |result| {
-                        match result {
-                            Some(path) => Message::InputPathChanged(path),
-                            None => Message::InputPathChanged(String::new()),
-                        }
-                    },
-                );
-                return task;
-            },
-            Message::BrowseOutputClicked => {
-                let task = iced::Command::perform(
-                    browse_file("Select Output File", true),
-                    |result| {
-                        match result {
-                            Some(path) => Message::OutputPathChanged(path),
-                            None => Message::OutputPathChanged(String::new()),
-                        }
-                    },
-                );
-                return task;
-            },
-            Message::TogglePasswordVisibility => {
-                self.show_password = !self.show_password;
-            },
-            Message::ProcessFile => {
-                if !self.can_process() {
-                    return Command::none();
-                }
-                
-                self.processing = true;
-                self.progress = 0.1;
-                self.status = "Working...".into();
-                self.file_info = String::new();
-                
-                let mode = self.mode;
-                let input_path = self.input_path.clone();
-                let output_path = self.output_path.clone();
-                let password = self.password.clone();
-                
-                let (sender, _receiver) = mpsc::channel(100);
-                self.sender = Some(sender);
-                
-                return Command::perform(
-                    async move {
-                        match mode {
-                            Mode::Encrypt => {
-                                let input = PathBuf::from(input_path);
-                                let output = PathBuf::from(output_path);
-                                match encrypt_file(&input, &output, &password) {
-                                    Ok(msg) => Message::OperationComplete(Ok(msg)),
-                                    Err(e) => Message::OperationComplete(Err(e)),
-                                }
-                            },
-                            Mode::Decrypt => {
-                                let input = PathBuf::from(input_path);
-                                let output = PathBuf::from(output_path);
-                                match decrypt_file(&input, &output, &password) {
-                                    Ok(msg) => Message::OperationComplete(Ok(msg)),
-                                    Err(e) => Message::OperationComplete(Err(e)),
-                                }
-                            },
-                            Mode::Info => {
-                                let input = PathBuf::from(input_path);
-                                match show_file_info(&input) {
-                                    Ok(info) => Message::FileInfoReceived(info),
-                                    Err(e) => Message::OperationComplete(Err(e)),
-                                }
-                            },
-                        }
-                    },
-                    |message| message,
-                );
-            },
-            Message::OperationComplete(result) => {
-                self.processing = false;
-                match result {
-                    Ok(message) => {
-                        self.status = message;
-                        self.progress = 1.0;
-                    },
-                    Err(error) => {
-                        self.status = format!("Error: {}", error);
-                        self.progress = 0.0;
-                    },
-                }
-            },
-            Message::FileInfoReceived(info) => {
-                self.processing = false;
-                self.status = "File information retrieved successfully.".into();
-                self.progress = 1.0;
-                self.file_info = info;
-            },
+impl Default for Au79Gui {
+    fn default() -> Self {
+        Self {
+            mode: Mode::Encrypt,
+            input_path: String::new(),
+            output_path: String::new(),
+            password: String::new(),
+            confirm_password: String::new(),
+            show_password: false,
+            batch_mode: false,
+            batch_files: Vec::new(),
+            status_message: "Ready".into(),
+            status_is_error: false,
+            progress: 0.0,
+            processing: false,
+            operation_start: None,
+            file_info_text: String::new(),
+            worker_rx: None,
         }
-        
-        Command::none()
-    }
-
-    fn view(&self) -> Element<Message> {
-        // Mode selection row
-        let mode_row = Row::new()
-            .spacing(20)
-            .push(Text::new("Mode:").size(16))
-            .push(Radio::new(
-                "Encrypt",
-                Mode::Encrypt,
-                Some(self.mode),
-                Message::ModeSelected,
-            ))
-            .push(Radio::new(
-                "Decrypt",
-                Mode::Decrypt,
-                Some(self.mode),
-                Message::ModeSelected,
-            ))
-            .push(Radio::new(
-                "File Info",
-                Mode::Info,
-                Some(self.mode),
-                Message::ModeSelected,
-            ));
-            
-        // Input file row
-        let input_row = Row::new()
-            .spacing(10)
-            .push(Text::new("Input File:").width(Length::Fixed(100.0)))
-            .push(
-                TextInput::new("Select input file...", &self.input_path)
-                    .on_input(Message::InputPathChanged)
-                    .padding(5)
-                    .width(Length::Fill)
-            )
-            .push(Button::new(Text::new("Browse")).on_press(Message::BrowseInputClicked));
-            
-        // Output file row (only for encrypt/decrypt)
-        let output_row = if self.mode != Mode::Info {
-            Row::new()
-                .spacing(10)
-                .push(Text::new("Output File:").width(Length::Fixed(100.0)))
-                .push(
-                    TextInput::new("Select output file...", &self.output_path)
-                        .on_input(Message::OutputPathChanged)
-                        .padding(5)
-                        .width(Length::Fill)
-                )
-                .push(Button::new(Text::new("Browse")).on_press(Message::BrowseOutputClicked))
-        } else {
-            Row::new()
-        };
-        
-        // Password row (only for encrypt/decrypt)
-        let password_row = if self.mode != Mode::Info {
-            let password_input = if self.show_password {
-                TextInput::new("Enter password...", &self.password)
-                    .on_input(Message::PasswordChanged)
-            } else {
-                TextInput::new("Enter password...", &self.password)
-                    .on_input(Message::PasswordChanged)
-                    .password()
-            };
-            
-            Row::new()
-                .spacing(10)
-                .push(Text::new("Password:").width(Length::Fixed(100.0)))
-                .push(password_input.padding(5).width(Length::Fill))
-                .push(Button::new(
-                    Text::new(if self.show_password { "Hide" } else { "Show" })
-                ).on_press(Message::TogglePasswordVisibility))
-        } else {
-            Row::new()
-        };
-        
-        // Confirm password row (only for encrypt)
-        let confirm_row = if self.mode == Mode::Encrypt {
-            let confirm_input = if self.show_password {
-                TextInput::new("Confirm password...", &self.confirm_password)
-                    .on_input(Message::ConfirmPasswordChanged)
-            } else {
-                TextInput::new("Confirm password...", &self.confirm_password)
-                    .on_input(Message::ConfirmPasswordChanged)
-                    .password()
-            };
-            
-            Row::new()
-                .spacing(10)
-                .push(Text::new("Confirm:").width(Length::Fixed(100.0)))
-                .push(confirm_input.padding(5).width(Length::Fill))
-        } else {
-            Row::new()
-        };
-        
-        // Action button
-        let button_text = match self.mode {
-            Mode::Encrypt => "Encrypt File",
-            Mode::Decrypt => "Decrypt File",
-            Mode::Info => "Show File Info",
-        };
-        
-        let action_button = Button::new(Text::new(button_text))
-            .width(Length::Fixed(150.0))
-            .style(iced::theme::Button::Primary);
-            
-        let action_button = if self.can_process() && !self.processing {
-            action_button.on_press(Message::ProcessFile)
-        } else {
-            action_button
-        };
-        
-        // Status row
-        let status_row = Row::new()
-            .spacing(10)
-            .push(Text::new("Status:").width(Length::Fixed(60.0)))
-            .push(Text::new(&self.status).width(Length::Fill));
-            
-        // Progress bar
-        let progress_bar = ProgressBar::new(0.0..=1.0, self.progress)
-            .width(Length::Fill);
-            
-        // File info (only shown when available)
-        let file_info = if !self.file_info.is_empty() {
-            Column::new()
-                .spacing(10)
-                .push(Text::new("File Information").size(18))
-                .push(Text::new(&self.file_info))
-        } else {
-            Column::new()
-        };
-        
-        // Main layout
-        let content = Column::new()
-            .spacing(20)
-            .padding(20)
-            .push(mode_row)
-            .push(input_row)
-            .push(output_row)
-            .push(password_row)
-            .push(confirm_row)
-            .push(action_button)
-            .push(status_row)
-            .push(progress_bar)
-            .push(file_info);
-            
-        Container::new(content)
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .center_x()
-            .center_y()
-            .into()
     }
 }
+
+// ── eframe::App ────────────────────────────────────────────────────────────────
+
+impl eframe::App for Au79Gui {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.poll_worker();
+        self.handle_dropped_files(ctx);
+
+        self.render_top_panel(ctx);
+        self.render_bottom_panel(ctx);
+        self.render_central_panel(ctx);
+    }
+}
+
+// ── Rendering ──────────────────────────────────────────────────────────────────
 
 impl Au79Gui {
-    fn can_process(&self) -> bool {
-        if self.input_path.is_empty() {
-            return false;
+    fn render_top_panel(&mut self, ctx: &egui::Context) {
+        egui::TopBottomPanel::top("header").show(ctx, |ui| {
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("AU79").size(22.0).strong().color(GOLD));
+                ui.label(egui::RichText::new("Crypto").size(22.0).color(GOLD_DIM));
+                ui.add_space(20.0);
+
+                ui.separator();
+                ui.add_space(10.0);
+
+                let enabled = !self.processing;
+                ui.add_enabled_ui(enabled, |ui| {
+                    ui.radio_value(&mut self.mode, Mode::Encrypt, "Encrypt");
+                    ui.radio_value(&mut self.mode, Mode::Decrypt, "Decrypt");
+                    ui.radio_value(&mut self.mode, Mode::Info, "File Info");
+
+                    if self.mode != Mode::Info {
+                        ui.separator();
+                        ui.checkbox(&mut self.batch_mode, "Batch Mode");
+                    }
+                });
+            });
+            ui.add_space(4.0);
+        });
+    }
+
+    fn render_bottom_panel(&mut self, ctx: &egui::Context) {
+        egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
+            ui.add_space(6.0);
+
+            // Status message
+            let color = if self.status_is_error {
+                ERROR_RED
+            } else if self.progress >= 1.0 {
+                SUCCESS_GREEN
+            } else {
+                ui.visuals().text_color()
+            };
+            ui.label(egui::RichText::new(&self.status_message).color(color));
+
+            // Progress bar
+            ui.add(
+                egui::ProgressBar::new(self.progress)
+                    .show_percentage()
+                    .animate(self.processing),
+            );
+
+            // Elapsed time
+            if let Some(start) = self.operation_start {
+                let elapsed = start.elapsed();
+                ui.label(
+                    egui::RichText::new(format!("Elapsed: {:.1}s", elapsed.as_secs_f64()))
+                        .small()
+                        .color(egui::Color32::GRAY),
+                );
+            }
+
+            ui.add_space(4.0);
+        });
+    }
+
+    fn render_central_panel(&mut self, ctx: &egui::Context) {
+        egui::CentralPanel::default().show(ctx, |ui| {
+            // Drag-and-drop overlay
+            if !ctx.input(|i| i.raw.hovered_files.is_empty()) {
+                let painter = ui.painter();
+                let rect = ui.max_rect();
+                painter.rect_filled(rect, 8.0, egui::Color32::from_black_alpha(180));
+                let text = if self.batch_mode {
+                    "Drop files to add to batch"
+                } else {
+                    "Drop file to set as input"
+                };
+                painter.text(
+                    rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    text,
+                    egui::FontId::proportional(24.0),
+                    GOLD,
+                );
+                return;
+            }
+
+            egui::ScrollArea::vertical().show(ui, |ui| {
+                match self.mode {
+                    Mode::Info => self.render_info_mode(ui),
+                    _ if self.batch_mode => self.render_batch_mode(ui),
+                    _ => self.render_single_mode(ui),
+                }
+            });
+        });
+    }
+
+    // ── Single File Mode ───────────────────────────────────────────────────────
+
+    fn render_single_mode(&mut self, ui: &mut egui::Ui) {
+        ui.add_space(8.0);
+
+        // Input file
+        ui.label(egui::RichText::new("Input File").strong());
+        ui.horizontal(|ui| {
+            ui.add(
+                egui::TextEdit::singleline(&mut self.input_path)
+                    .desired_width(ui.available_width() - 80.0)
+                    .hint_text("Select a file..."),
+            );
+            if ui.button("Browse").clicked() {
+                self.browse_input();
+            }
+        });
+        if !self.input_path.is_empty() {
+            if let Ok(meta) = fs::metadata(&self.input_path) {
+                ui.label(
+                    egui::RichText::new(format!("Size: {}", format_file_size(meta.len())))
+                        .small()
+                        .color(egui::Color32::GRAY),
+                );
+            }
         }
-        
+
+        ui.add_space(10.0);
+
+        // Output file
+        ui.label(egui::RichText::new("Output File").strong());
+        ui.horizontal(|ui| {
+            ui.add(
+                egui::TextEdit::singleline(&mut self.output_path)
+                    .desired_width(ui.available_width() - 80.0)
+                    .hint_text("Output location..."),
+            );
+            if ui.button("Browse").clicked() {
+                self.browse_output();
+            }
+        });
+
+        ui.add_space(10.0);
+
+        // Password
+        self.render_password_fields(ui);
+
+        ui.add_space(16.0);
+
+        // Action button
+        let button_label = match self.mode {
+            Mode::Encrypt => "Encrypt File",
+            Mode::Decrypt => "Decrypt File",
+            Mode::Info => "Show Info",
+        };
+        let can_go = self.can_process();
+        ui.horizontal(|ui| {
+            let btn = egui::Button::new(
+                egui::RichText::new(button_label).strong().size(16.0),
+            )
+            .min_size(egui::vec2(160.0, 36.0));
+
+            if ui.add_enabled(can_go, btn).clicked() {
+                self.start_single_operation(ui.ctx().clone());
+            }
+        });
+    }
+
+    // ── Batch Mode ─────────────────────────────────────────────────────────────
+
+    fn render_batch_mode(&mut self, ui: &mut egui::Ui) {
+        ui.add_space(8.0);
+
+        // Toolbar
+        ui.horizontal(|ui| {
+            if ui.button("Add Files").clicked() {
+                self.browse_batch_files();
+            }
+            if ui.button("Clear All").clicked() && !self.processing {
+                self.batch_files.clear();
+            }
+            ui.label(
+                egui::RichText::new(format!("{} file(s)", self.batch_files.len()))
+                    .color(egui::Color32::GRAY),
+            );
+        });
+
+        ui.add_space(6.0);
+
+        // File table
+        let available_height = (ui.available_height() - 200.0).max(100.0);
+        egui::Frame::group(ui.style()).show(ui, |ui| {
+            egui::ScrollArea::vertical()
+                .max_height(available_height)
+                .show(ui, |ui| {
+                    if self.batch_files.is_empty() {
+                        ui.vertical_centered(|ui| {
+                            ui.add_space(30.0);
+                            ui.label(
+                                egui::RichText::new("Drag files here or click Add Files")
+                                    .color(egui::Color32::GRAY)
+                                    .size(16.0),
+                            );
+                            ui.add_space(30.0);
+                        });
+                    } else {
+                        let mut remove_idx: Option<usize> = None;
+                        egui::Grid::new("batch_grid")
+                            .striped(true)
+                            .num_columns(4)
+                            .min_col_width(60.0)
+                            .show(ui, |ui| {
+                                // Header
+                                ui.strong("File");
+                                ui.strong("Size");
+                                ui.strong("Status");
+                                ui.strong("");
+                                ui.end_row();
+
+                                for (i, entry) in self.batch_files.iter().enumerate() {
+                                    let name = entry
+                                        .path
+                                        .file_name()
+                                        .map(|n| n.to_string_lossy().to_string())
+                                        .unwrap_or_else(|| "???".into());
+                                    ui.label(&name);
+                                    ui.label(format_file_size(entry.size));
+
+                                    let (text, color) = match &entry.status {
+                                        BatchFileStatus::Pending => {
+                                            ("Pending", egui::Color32::GRAY)
+                                        }
+                                        BatchFileStatus::Processing => {
+                                            ("Processing...", egui::Color32::YELLOW)
+                                        }
+                                        BatchFileStatus::Complete => ("Done", SUCCESS_GREEN),
+                                        BatchFileStatus::Failed => ("Failed", ERROR_RED),
+                                    };
+                                    ui.colored_label(color, text);
+
+                                    if !self.processing {
+                                        if ui.small_button("Remove").clicked() {
+                                            remove_idx = Some(i);
+                                        }
+                                    } else {
+                                        ui.label("");
+                                    }
+                                    ui.end_row();
+
+                                    // Show error detail for failed files
+                                    if let Some(err) = &entry.error {
+                                        ui.label("");
+                                        ui.label("");
+                                        ui.colored_label(
+                                            ERROR_RED,
+                                            egui::RichText::new(err).small(),
+                                        );
+                                        ui.label("");
+                                        ui.end_row();
+                                    }
+                                }
+                            });
+                        if let Some(idx) = remove_idx {
+                            self.batch_files.remove(idx);
+                        }
+                    }
+                });
+        });
+
+        ui.add_space(10.0);
+
+        // Password
+        self.render_password_fields(ui);
+
+        ui.add_space(12.0);
+
+        // Process button
+        let label = match self.mode {
+            Mode::Encrypt => format!("Encrypt {} File(s)", self.batch_files.len()),
+            Mode::Decrypt => format!("Decrypt {} File(s)", self.batch_files.len()),
+            Mode::Info => "Show Info".into(),
+        };
+        let can_go = self.can_process();
+        let btn = egui::Button::new(egui::RichText::new(&label).strong().size(16.0))
+            .min_size(egui::vec2(200.0, 36.0));
+        if ui.add_enabled(can_go, btn).clicked() {
+            self.start_batch_operation(ui.ctx().clone());
+        }
+    }
+
+    // ── Info Mode ──────────────────────────────────────────────────────────────
+
+    fn render_info_mode(&mut self, ui: &mut egui::Ui) {
+        ui.add_space(8.0);
+
+        ui.label(egui::RichText::new("Select an AU79 encrypted file").strong());
+        ui.horizontal(|ui| {
+            ui.add(
+                egui::TextEdit::singleline(&mut self.input_path)
+                    .desired_width(ui.available_width() - 80.0)
+                    .hint_text("Select .au79 file..."),
+            );
+            if ui.button("Browse").clicked() {
+                self.browse_input();
+            }
+        });
+
+        ui.add_space(12.0);
+
+        let can_go = !self.input_path.is_empty() && !self.processing;
+        let btn = egui::Button::new(egui::RichText::new("Show File Info").strong())
+            .min_size(egui::vec2(140.0, 32.0));
+        if ui.add_enabled(can_go, btn).clicked() {
+            match show_file_info(&PathBuf::from(&self.input_path)) {
+                Ok(info) => {
+                    self.file_info_text = info;
+                    self.status_message = "File info retrieved.".into();
+                    self.status_is_error = false;
+                    self.progress = 1.0;
+                }
+                Err(e) => {
+                    self.file_info_text.clear();
+                    self.status_message = format!("Error: {}", e);
+                    self.status_is_error = true;
+                    self.progress = 0.0;
+                }
+            }
+        }
+
+        if !self.file_info_text.is_empty() {
+            ui.add_space(16.0);
+            egui::Frame::group(ui.style())
+                .inner_margin(12.0)
+                .show(ui, |ui| {
+                    ui.label(
+                        egui::RichText::new("AU79 File Information")
+                            .strong()
+                            .size(16.0)
+                            .color(GOLD),
+                    );
+                    ui.add_space(6.0);
+                    ui.label(
+                        egui::RichText::new(&self.file_info_text)
+                            .monospace(),
+                    );
+                });
+        }
+    }
+
+    // ── Shared: Password Fields ────────────────────────────────────────────────
+
+    fn render_password_fields(&mut self, ui: &mut egui::Ui) {
+        ui.label(egui::RichText::new("Password").strong());
+        ui.horizontal(|ui| {
+            let mut edit = egui::TextEdit::singleline(&mut self.password)
+                .desired_width(ui.available_width() - 80.0)
+                .hint_text("Enter password...");
+            if !self.show_password {
+                edit = edit.password(true);
+            }
+            ui.add(edit);
+
+            let toggle_label = if self.show_password { "Hide" } else { "Show" };
+            if ui.button(toggle_label).clicked() {
+                self.show_password = !self.show_password;
+            }
+        });
+
+        // Password strength
+        let strength = evaluate_password_strength(&self.password);
+        if strength != PasswordStrength::Empty {
+            render_password_strength(ui, strength);
+        }
+
+        // Confirm password (encrypt only)
+        if self.mode == Mode::Encrypt {
+            ui.add_space(6.0);
+            ui.label(egui::RichText::new("Confirm Password").strong());
+            let mut edit = egui::TextEdit::singleline(&mut self.confirm_password)
+                .desired_width(ui.available_width())
+                .hint_text("Confirm password...");
+            if !self.show_password {
+                edit = edit.password(true);
+            }
+            ui.add(edit);
+
+            if !self.password.is_empty() && !self.confirm_password.is_empty() {
+                if self.password == self.confirm_password {
+                    ui.colored_label(SUCCESS_GREEN, "Passwords match");
+                } else {
+                    ui.colored_label(ERROR_RED, "Passwords do not match");
+                }
+            }
+        }
+    }
+
+    // ── Drag and Drop ──────────────────────────────────────────────────────────
+
+    fn handle_dropped_files(&mut self, ctx: &egui::Context) {
+        let dropped: Vec<egui::DroppedFile> = ctx.input(|i| i.raw.dropped_files.clone());
+        if dropped.is_empty() {
+            return;
+        }
+
+        if self.batch_mode && self.mode != Mode::Info {
+            for file in &dropped {
+                if let Some(path) = &file.path {
+                    let size = fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+                    let output_path = self.compute_output_path(path);
+                    self.batch_files.push(BatchFileEntry {
+                        path: path.clone(),
+                        size,
+                        status: BatchFileStatus::Pending,
+                        output_path,
+                        error: None,
+                    });
+                }
+            }
+        } else if let Some(first) = dropped.first() {
+            if let Some(path) = &first.path {
+                self.input_path = path.to_string_lossy().to_string();
+                self.output_path = self
+                    .compute_output_path(path)
+                    .to_string_lossy()
+                    .to_string();
+            }
+        }
+    }
+
+    // ── File Browsing ──────────────────────────────────────────────────────────
+
+    fn browse_input(&mut self) {
+        let mut dialog = rfd::FileDialog::new().set_title("Select Input File");
+        if self.mode == Mode::Decrypt || self.mode == Mode::Info {
+            dialog = dialog.add_filter("AU79 Encrypted", &["au79"]);
+        }
+        dialog = dialog.add_filter("All Files", &["*"]);
+        if let Some(path) = dialog.pick_file() {
+            self.output_path = self
+                .compute_output_path(&path)
+                .to_string_lossy()
+                .to_string();
+            self.input_path = path.to_string_lossy().to_string();
+        }
+    }
+
+    fn browse_output(&mut self) {
+        let dialog = rfd::FileDialog::new().set_title("Select Output File");
+        if let Some(path) = dialog.save_file() {
+            self.output_path = path.to_string_lossy().to_string();
+        }
+    }
+
+    fn browse_batch_files(&mut self) {
+        let mut dialog = rfd::FileDialog::new().set_title("Select Files");
+        if self.mode == Mode::Decrypt {
+            dialog = dialog.add_filter("AU79 Encrypted", &["au79"]);
+        }
+        dialog = dialog.add_filter("All Files", &["*"]);
+        if let Some(paths) = dialog.pick_files() {
+            for path in paths {
+                let size = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+                let output_path = self.compute_output_path(&path);
+                self.batch_files.push(BatchFileEntry {
+                    path,
+                    size,
+                    status: BatchFileStatus::Pending,
+                    output_path,
+                    error: None,
+                });
+            }
+        }
+    }
+
+    // ── Path Helpers ───────────────────────────────────────────────────────────
+
+    fn compute_output_path(&self, input: &Path) -> PathBuf {
+        let mut out = input.to_path_buf();
         match self.mode {
             Mode::Encrypt => {
-                !self.output_path.is_empty() &&
-                !self.password.is_empty() &&
-                self.password == self.confirm_password
-            },
+                let mut name = input
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string();
+                name.push_str(".au79");
+                out.set_file_name(name);
+            }
             Mode::Decrypt => {
-                !self.output_path.is_empty() &&
-                !self.password.is_empty()
-            },
-            Mode::Info => {
-                true
-            },
+                if out.extension().map(|e| e == "au79").unwrap_or(false) {
+                    out.set_extension("");
+                }
+            }
+            Mode::Info => {}
+        }
+        out
+    }
+
+    // ── Validation ─────────────────────────────────────────────────────────────
+
+    fn can_process(&self) -> bool {
+        if self.processing {
+            return false;
+        }
+
+        match self.mode {
+            Mode::Info => !self.input_path.is_empty(),
+            Mode::Encrypt => {
+                let has_files = if self.batch_mode {
+                    !self.batch_files.is_empty()
+                } else {
+                    !self.input_path.is_empty() && !self.output_path.is_empty()
+                };
+                has_files
+                    && !self.password.is_empty()
+                    && self.password == self.confirm_password
+            }
+            Mode::Decrypt => {
+                let has_files = if self.batch_mode {
+                    !self.batch_files.is_empty()
+                } else {
+                    !self.input_path.is_empty() && !self.output_path.is_empty()
+                };
+                has_files && !self.password.is_empty()
+            }
+        }
+    }
+
+    // ── Background Operations ──────────────────────────────────────────────────
+
+    fn start_single_operation(&mut self, ctx: egui::Context) {
+        let (tx, rx) = mpsc::channel();
+        self.worker_rx = Some(rx);
+        self.processing = true;
+        self.progress = 0.05;
+        self.status_message = "Processing...".into();
+        self.status_is_error = false;
+        self.file_info_text.clear();
+        self.operation_start = Some(Instant::now());
+
+        let mode = self.mode;
+        let input_path = PathBuf::from(&self.input_path);
+        let output_path = PathBuf::from(&self.output_path);
+        let password = self.password.clone();
+
+        std::thread::spawn(move || {
+            let result = match mode {
+                Mode::Encrypt => encrypt_file(&input_path, &output_path, &password),
+                Mode::Decrypt => decrypt_file(&input_path, &output_path, &password),
+                Mode::Info => show_file_info(&input_path),
+            };
+            let _ = tx.send(WorkerMessage::FileComplete { index: 0, result });
+            let _ = tx.send(WorkerMessage::AllDone);
+            ctx.request_repaint();
+        });
+    }
+
+    fn start_batch_operation(&mut self, ctx: egui::Context) {
+        let (tx, rx) = mpsc::channel();
+        self.worker_rx = Some(rx);
+        self.processing = true;
+        self.progress = 0.0;
+        self.status_message = "Processing batch...".into();
+        self.status_is_error = false;
+        self.operation_start = Some(Instant::now());
+
+        for entry in &mut self.batch_files {
+            if entry.status != BatchFileStatus::Complete {
+                entry.status = BatchFileStatus::Processing;
+                entry.error = None;
+            }
+        }
+
+        let files: Vec<(usize, PathBuf, PathBuf)> = self
+            .batch_files
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| e.status == BatchFileStatus::Processing)
+            .map(|(i, e)| (i, e.path.clone(), e.output_path.clone()))
+            .collect();
+        let total = files.len();
+        let mode = self.mode;
+        let password = self.password.clone();
+
+        std::thread::spawn(move || {
+            for (completed, (index, input, output)) in files.into_iter().enumerate() {
+                let result = match mode {
+                    Mode::Encrypt => encrypt_file(&input, &output, &password),
+                    Mode::Decrypt => decrypt_file(&input, &output, &password),
+                    Mode::Info => show_file_info(&input),
+                };
+                let _ = tx.send(WorkerMessage::FileComplete { index, result });
+                let _ = tx.send(WorkerMessage::BatchProgress {
+                    completed: completed + 1,
+                    total,
+                });
+                ctx.request_repaint();
+            }
+            let _ = tx.send(WorkerMessage::AllDone);
+            ctx.request_repaint();
+        });
+    }
+
+    fn poll_worker(&mut self) {
+        let Some(rx) = &self.worker_rx else { return };
+
+        while let Ok(msg) = rx.try_recv() {
+            match msg {
+                WorkerMessage::FileComplete { index, result } => match result {
+                    Ok(msg) => {
+                        if self.batch_mode {
+                            if let Some(entry) = self.batch_files.get_mut(index) {
+                                entry.status = BatchFileStatus::Complete;
+                            }
+                        }
+                        self.status_message = msg;
+                        self.status_is_error = false;
+                    }
+                    Err(err) => {
+                        if self.batch_mode {
+                            if let Some(entry) = self.batch_files.get_mut(index) {
+                                entry.status = BatchFileStatus::Failed;
+                                entry.error = Some(err.clone());
+                            }
+                        }
+                        self.status_message = err;
+                        self.status_is_error = true;
+                    }
+                },
+                WorkerMessage::BatchProgress { completed, total } => {
+                    self.progress = completed as f32 / total as f32;
+                }
+                WorkerMessage::AllDone => {
+                    self.processing = false;
+                    if !self.status_is_error {
+                        self.progress = 1.0;
+                    }
+                    self.worker_rx = None;
+                    return;
+                }
+            }
         }
     }
 }
 
-async fn browse_file(title: &str, save: bool) -> Option<String> {
-    let dialog = if save {
-        rfd::AsyncFileDialog::new().set_title(title).save_file().await
-    } else {
-        rfd::AsyncFileDialog::new().set_title(title).pick_file().await
-    };
-    
-    dialog.map(|handle| handle.path().to_string_lossy().to_string())
-}
+// ── Crypto Helpers (framework-independent) ─────────────────────────────────────
 
 fn encrypt_file(input_path: &Path, output_path: &Path, password: &str) -> Result<String, String> {
-    let data = fs::read(input_path).map_err(|e| format!("Failed to read input file: {}", e))?;
-    
+    let data = fs::read(input_path).map_err(|e| format!("Failed to read input: {}", e))?;
     let result = encrypt(&data, password, &input_path.to_string_lossy())
         .map_err(|e| format!("Encryption failed: {}", e))?;
-        
-    fs::write(output_path, result).map_err(|e| format!("Failed to write output file: {}", e))?;
-    
-    Ok(format!("File encrypted successfully: {}", output_path.to_string_lossy()))
+    fs::write(output_path, result).map_err(|e| format!("Failed to write output: {}", e))?;
+    Ok(format!(
+        "Encrypted successfully: {}",
+        output_path.to_string_lossy()
+    ))
 }
 
 fn decrypt_file(input_path: &Path, output_path: &Path, password: &str) -> Result<String, String> {
-    let data = fs::read(input_path).map_err(|e| format!("Failed to read input file: {}", e))?;
-    
-    let (result, extension) = decrypt(&data, password)
-        .map_err(|e| match e {
-            CryptoError::IntegrityCheckFailed => "Wrong password or file is corrupted.".to_string(),
-            _ => format!("Decryption failed: {}", e),
-        })?;
-        
+    let data = fs::read(input_path).map_err(|e| format!("Failed to read input: {}", e))?;
+    let (result, extension) = decrypt(&data, password).map_err(|e| match e {
+        CryptoError::IntegrityCheckFailed => {
+            "Wrong password or file is corrupted.".to_string()
+        }
+        _ => format!("Decryption failed: {}", e),
+    })?;
+
     let mut final_output = output_path.to_path_buf();
     if !extension.is_empty() {
         final_output.set_extension(&extension);
     }
-        
-    fs::write(&final_output, result).map_err(|e| format!("Failed to write output file: {}", e))?;
-    
-    Ok(format!("File decrypted successfully: {}", final_output.to_string_lossy()))
+
+    fs::write(&final_output, result)
+        .map_err(|e| format!("Failed to write output: {}", e))?;
+    Ok(format!(
+        "Decrypted successfully: {}",
+        final_output.to_string_lossy()
+    ))
 }
 
 fn show_file_info(input_path: &Path) -> Result<String, String> {
     let data = fs::read(input_path).map_err(|e| format!("Failed to read file: {}", e))?;
-    
-    // First check if this is actually an AU79 file
+
     if data.len() < 4 || &data[0..4] != b"AU79" {
-        return Err("This is not a valid AU79 encrypted file.".to_string());
+        return Err("Not a valid AU79 encrypted file.".into());
     }
-    
-    // Capture the output of display_file_info in a string
-    let mut buffer = Vec::new();
-    
-    buffer.extend_from_slice(b"----- File Info -----\n");
-    buffer.extend_from_slice(b"Magic: AU79\n");
-    buffer.extend_from_slice(format!("Version: {}\n", data[4]).as_bytes());
-    buffer.extend_from_slice(format!("Flags: {}\n", data[5]).as_bytes());
-    
-    let timestamp_start = 6 + 16; // SALT_LEN = 16
-    let timestamp = u64::from_le_bytes(data[timestamp_start..timestamp_start+8].try_into().unwrap());
-    buffer.extend_from_slice(format!("Timestamp (Unix Epoch): {}\n", timestamp).as_bytes());
-    
-    let tent_seed = f64::from_le_bytes(data[timestamp_start+8+12..timestamp_start+8+12+8].try_into().unwrap());
-    buffer.extend_from_slice(format!("Tent Map Seed: {:.6}\n", tent_seed).as_bytes());
-    
-    let ext_len = data[timestamp_start+8+12+8];
-    let ext_start = timestamp_start+8+12+8+1;
-    let extension = String::from_utf8_lossy(&data[ext_start..ext_start+(ext_len as usize)]);
-    buffer.extend_from_slice(format!("Original Extension: .{}\n", extension).as_bytes());
-    buffer.extend_from_slice(b"----------------------\n");
-    
-    Ok(String::from_utf8_lossy(&buffer).to_string())
+
+    let version = data[4];
+    let flags = data[5];
+    let ts_start = 6 + 16; // SALT_LEN
+    if data.len() < ts_start + 8 + 12 + 8 + 1 {
+        return Err("File too short to parse header.".into());
+    }
+    let timestamp =
+        u64::from_le_bytes(data[ts_start..ts_start + 8].try_into().unwrap());
+    let tent_seed = f64::from_le_bytes(
+        data[ts_start + 8 + 12..ts_start + 8 + 12 + 8]
+            .try_into()
+            .unwrap(),
+    );
+    let ext_len = data[ts_start + 8 + 12 + 8] as usize;
+    let ext_start = ts_start + 8 + 12 + 8 + 1;
+    let extension = if data.len() >= ext_start + ext_len {
+        String::from_utf8_lossy(&data[ext_start..ext_start + ext_len]).to_string()
+    } else {
+        "???".into()
+    };
+
+    let total_size = format_file_size(data.len() as u64);
+
+    Ok(format!(
+        "Magic:              AU79\n\
+         Version:            {}\n\
+         Flags:              {}\n\
+         Timestamp:          {}\n\
+         Tent Map Seed:      {:.6}\n\
+         Original Extension: .{}\n\
+         File Size:          {}",
+        version, flags, timestamp, tent_seed, extension, total_size
+    ))
 }
 
+// ── Utility Functions ──────────────────────────────────────────────────────────
+
+fn format_file_size(bytes: u64) -> String {
+    const KB: f64 = 1024.0;
+    const MB: f64 = 1024.0 * 1024.0;
+    const GB: f64 = 1024.0 * 1024.0 * 1024.0;
+    let b = bytes as f64;
+    if b < KB {
+        format!("{} B", bytes)
+    } else if b < MB {
+        format!("{:.1} KB", b / KB)
+    } else if b < GB {
+        format!("{:.2} MB", b / MB)
+    } else {
+        format!("{:.2} GB", b / GB)
+    }
+}
+
+fn evaluate_password_strength(password: &str) -> PasswordStrength {
+    if password.is_empty() {
+        return PasswordStrength::Empty;
+    }
+    let len = password.len();
+    let has_lower = password.chars().any(|c| c.is_ascii_lowercase());
+    let has_upper = password.chars().any(|c| c.is_ascii_uppercase());
+    let has_digit = password.chars().any(|c| c.is_ascii_digit());
+    let has_special = password.chars().any(|c| !c.is_alphanumeric());
+    let variety = [has_lower, has_upper, has_digit, has_special]
+        .iter()
+        .filter(|&&x| x)
+        .count();
+
+    if len < 6 {
+        PasswordStrength::Weak
+    } else if len < 10 {
+        if variety >= 3 {
+            PasswordStrength::Strong
+        } else {
+            PasswordStrength::Fair
+        }
+    } else if variety >= 3 {
+        PasswordStrength::VeryStrong
+    } else {
+        PasswordStrength::Strong
+    }
+}
+
+fn render_password_strength(ui: &mut egui::Ui, strength: PasswordStrength) {
+    let (ratio, color, label) = match strength {
+        PasswordStrength::Empty => return,
+        PasswordStrength::Weak => (0.25, ERROR_RED, "Weak"),
+        PasswordStrength::Fair => (0.5, egui::Color32::YELLOW, "Fair"),
+        PasswordStrength::Strong => (0.75, egui::Color32::LIGHT_GREEN, "Strong"),
+        PasswordStrength::VeryStrong => (1.0, SUCCESS_GREEN, "Very Strong"),
+    };
+    ui.horizontal(|ui| {
+        ui.label(
+            egui::RichText::new("Strength:")
+                .small()
+                .color(egui::Color32::GRAY),
+        );
+        ui.add(
+            egui::ProgressBar::new(ratio)
+                .desired_width(100.0)
+                .fill(color),
+        );
+        ui.colored_label(color, egui::RichText::new(label).small());
+    });
+}
+
+// ── Entry Point ────────────────────────────────────────────────────────────────
+
 pub fn run_gui() -> Result<(), String> {
-    let settings = Settings {
-        window: iced::window::Settings {
-            size: (600, 500),
-            ..Default::default()
-        },
+    let options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size([700.0, 550.0])
+            .with_min_inner_size([500.0, 400.0])
+            .with_drag_and_drop(true),
         ..Default::default()
     };
-    
-    Au79Gui::run(settings).map_err(|e| format!("Error running GUI: {}", e))
+
+    eframe::run_native(
+        "AU79-Crypto",
+        options,
+        Box::new(|cc| {
+            // Dark theme
+            cc.egui_ctx.set_visuals(egui::Visuals::dark());
+            Ok(Box::new(Au79Gui::default()))
+        }),
+    )
+    .map_err(|e| format!("Error running GUI: {}", e))
 }
