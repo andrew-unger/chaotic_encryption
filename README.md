@@ -9,11 +9,14 @@ Available as both a command-line tool and a cross-platform graphical application
 ## Features
 
 - **Chaotic Keystream Cipher** — Logistic and tent maps in integer arithmetic generate the encryption keystream directly
+- **Double-Round Diffusion** — Two chaotic rounds per output word for stronger mixing
 - **Chaotic Permutation** — Fisher-Yates shuffle driven by the chaotic keystream reorders data before encryption
 - **BLAKE3 Integrity** — Keyed MAC covering all header fields and ciphertext
-- **Argon2id Key Derivation** — Memory-hard password hashing with explicit, tunable parameters
+- **Argon2id Key Derivation** — Memory-hard password hashing with explicit, tunable parameters (256 MB / 4 iterations)
 - **Separate Subkeys** — BLAKE3 `derive_key` produces independent keys for cipher and MAC
-- **Automatic Compression** — Zlib compression before encryption
+- **Memory-Locked Keys** — VirtualLock prevents key material from being swapped to disk; zeroized on drop
+- **Privacy Options** — Optional metadata stripping and compression bypass to minimize information leakage
+- **Automatic Compression** — Zlib compression before encryption (can be disabled)
 - **File Extension Preservation** — Original file extension is restored on decryption
 - **Auto-Detection** — Automatically switches between Encrypt/Decrypt mode based on selected file
 - **Cross-Platform GUI** — Native desktop application built with egui/eframe
@@ -69,10 +72,15 @@ The GUI provides:
 #### Encrypt
 
 ```bash
-au79-crypto encrypt <input_file> <output_file>
+au79-crypto encrypt <input_file> <output_file> [--no-metadata] [--no-compress]
 ```
 
 You will be prompted for a password.
+
+| Flag | Effect |
+|------|--------|
+| `--no-metadata` | Strips timestamp and file extension from the header |
+| `--no-compress` | Skips compression (prevents pattern-based fingerprinting) |
 
 #### Decrypt
 
@@ -95,6 +103,9 @@ Displays metadata about an encrypted `.au79` file without decrypting it (version
 ```bash
 # Encrypt a document
 au79-crypto encrypt report.pdf report.au79
+
+# Encrypt with privacy options (no timestamp, no compression)
+au79-crypto encrypt report.pdf report.au79 --no-metadata --no-compress
 
 # Decrypt it (original .pdf extension is restored automatically)
 au79-crypto decrypt report.au79 report
@@ -124,7 +135,7 @@ password + random salt + timestamp
 chaos_key  mac_key          (BLAKE3 derive_key with distinct context strings)
      |         |
      v         |
-ChaoticKeystream             (256-bit state: logistic + tent maps)
+ChaoticKeystream             (256-bit state: logistic + tent maps, double-round)
      |         |
      v         |
  permutation   |             (Fisher-Yates shuffle driven by keystream)
@@ -136,17 +147,19 @@ ChaoticKeystream             (256-bit state: logistic + tent maps)
  ciphertext → BLAKE3 MAC     (keyed hash over full header + ciphertext)
 ```
 
-1. **Compress** plaintext with zlib
+1. **Compress** plaintext with zlib (unless `--no-compress`)
 2. **Derive** master key from password via Argon2id (parameters stored in header)
 3. **Split** master key into `chaos_key` and `mac_key` using BLAKE3 `derive_key`
-4. **Initialize** the chaotic keystream generator from `chaos_key` + random nonce
-5. **Permute** compressed data via Fisher-Yates shuffle driven by the keystream
-6. **Encrypt** permuted data by XOR with the continuing chaotic keystream
-7. **MAC** all header fields and ciphertext with BLAKE3 keyed hash using `mac_key`
+4. **Lock** key material in memory via VirtualLock (prevents paging to disk)
+5. **Initialize** the chaotic keystream generator from `chaos_key` + random nonce
+6. **Permute** data via Fisher-Yates shuffle driven by the keystream
+7. **Encrypt** permuted data by XOR with the continuing chaotic keystream
+8. **MAC** all header fields and ciphertext with BLAKE3 keyed hash using `mac_key`
+9. **Zeroize** and unlock all key material on drop
 
 ### Chaotic Keystream Generator
 
-The `ChaoticKeystream` struct maintains a 256-bit state (4 x u64) updated each round through four stages:
+The `ChaoticKeystream` struct maintains a 256-bit state (4 x u64). Two rounds are executed per output word for stronger diffusion. Each round applies four stages:
 
 | Stage | Operation | Purpose |
 |-------|-----------|---------|
@@ -159,20 +172,20 @@ The `ChaoticKeystream` struct maintains a 256-bit state (4 x u64) updated each r
 
 All arithmetic uses `u64`/`u128` wrapping operations, guaranteeing identical results on every platform.
 
-### File Format (v4)
+### File Format (v5)
 
 | Field | Size | Description |
 |-------|------|-------------|
 | Magic | 4 bytes | `AU79` |
-| Version | 1 byte | `4` |
-| Flags | 1 byte | Reserved (0) |
+| Version | 1 byte | `5` |
+| Flags | 1 byte | Bit 0: STRIP_METADATA, Bit 1: NO_COMPRESS |
 | Salt | 16 bytes | Random, used in Argon2id |
-| Timestamp | 8 bytes | Unix epoch seconds (LE) |
+| Timestamp | 8 bytes | Unix epoch seconds (LE), or zero if metadata stripped |
 | Nonce | 16 bytes | Random, mixed into chaotic state |
 | Argon2 m_cost | 1 byte | log2 of memory in KiB (default: 18 = 256 MB) |
 | Argon2 t_cost | 1 byte | Iteration count (default: 4) |
 | Argon2 p_cost | 1 byte | Parallelism lanes (default: 1) |
-| Extension length | 1 byte | Length of original file extension |
+| Extension length | 1 byte | Length of original file extension (0 if metadata stripped) |
 | Extension | variable | Original file extension |
 | Ciphertext | variable | Encrypted data |
 | MAC | 32 bytes | BLAKE3 keyed hash |
@@ -208,17 +221,31 @@ The strength meter provides real-time feedback:
 | 24 – 31 | Strong |
 | 32+ | Very Strong |
 
+## Statistical Validation
+
+The chaotic keystream has been validated with:
+
+- **PractRand** — 256 GB, 369 tests, zero anomalies
+- **Multi-seed CI tests** — 50 seeds x 1 MB each: chi-squared byte frequency, monobit, and serial correlation
+- **Single-seed suite** — 10 statistical tests including avalanche, gap, runs, compression ratio, and byte-pair frequency
+
+A multi-seed PractRand batch script (`tools/practrand_multi_seed.bat`) is included for extended validation across 10 seeds at 16 GB each.
+
 ## Security Considerations
 
 - The chaotic keystream cipher is experimental and has not undergone formal cryptographic review
 - Key derivation uses Argon2id (256 MB, 4 iterations) — each brute-force guess costs ~1 second and 256 MB of RAM
+- Double-round diffusion: two chaotic rounds per output word to strengthen mixing
 - Separate subkeys prevent related-key interactions between cipher and MAC
-- Decompression is capped at 4 GB to prevent zip-bomb attacks
+- Key material is page-locked via VirtualLock (Windows) to prevent swapping to disk
 - All key material, chaotic state, and GUI password fields are zeroized after use
 - MAC is verified before any decryption (encrypt-then-MAC)
 - Constant-time MAC comparison prevents timing side-channels
 - Branchless tent map implementation prevents timing side-channel leakage of internal state
 - Fisher-Yates permutation uses Lemire's rejection sampling for unbiased random selection
+- Optional `--no-compress` flag prevents compression oracle attacks
+- Optional `--no-metadata` flag strips timestamp and file extension from the header
+- Decompression is capped at 4 GB to prevent zip-bomb attacks
 - Archive extraction strips path components to prevent directory traversal attacks
 
 ## License
