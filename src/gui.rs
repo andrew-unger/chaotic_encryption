@@ -914,27 +914,14 @@ fn evaluate_password_strength(password: &str) -> PasswordStrength {
         return PasswordStrength::Empty;
     }
     let len = password.len();
-    let has_lower = password.chars().any(|c| c.is_ascii_lowercase());
-    let has_upper = password.chars().any(|c| c.is_ascii_uppercase());
-    let has_digit = password.chars().any(|c| c.is_ascii_digit());
-    let has_special = password.chars().any(|c| !c.is_alphanumeric());
-    let variety = [has_lower, has_upper, has_digit, has_special]
-        .iter()
-        .filter(|&&x| x)
-        .count();
-
-    if len < 6 {
+    if len < 8 {
         PasswordStrength::Weak
-    } else if len < 10 {
-        if variety >= 3 {
-            PasswordStrength::Strong
-        } else {
-            PasswordStrength::Fair
-        }
-    } else if variety >= 3 {
-        PasswordStrength::VeryStrong
-    } else {
+    } else if len < 16 {
+        PasswordStrength::Fair
+    } else if len < 24 {
         PasswordStrength::Strong
+    } else {
+        PasswordStrength::VeryStrong
     }
 }
 
