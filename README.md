@@ -48,8 +48,10 @@ cargo build --release --no-default-features
 
 ### GUI Mode
 
+Launch the application without arguments (or double-click the executable):
+
 ```bash
-au79-crypto --gui
+au79-crypto
 ```
 
 The GUI provides:
@@ -101,7 +103,7 @@ au79-crypto decrypt report.au79 report
 au79-crypto info report.au79
 
 # Launch the GUI
-au79-crypto --gui
+au79-crypto
 ```
 
 ## Technical Details
@@ -195,9 +197,12 @@ All arithmetic uses `u64`/`u128` wrapping operations, guaranteeing identical res
 - Key derivation uses Argon2id with configurable, explicitly stored parameters
 - Separate subkeys prevent related-key interactions between cipher and MAC
 - Decompression is capped at 4 GB to prevent zip-bomb attacks
-- All key material and chaotic state is zeroized after use
+- All key material, chaotic state, and GUI password fields are zeroized after use
 - MAC is verified before any decryption (encrypt-then-MAC)
 - Constant-time MAC comparison prevents timing side-channels
+- Branchless tent map implementation prevents timing side-channel leakage of internal state
+- Fisher-Yates permutation uses Lemire's rejection sampling for unbiased random selection
+- Archive extraction strips path components to prevent directory traversal attacks
 
 ## License
 
