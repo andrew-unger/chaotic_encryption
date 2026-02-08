@@ -10,8 +10,62 @@ use crate::chaos::{ChaoticKeystream, apply_permutation, apply_inverse_permutatio
 use crate::error::CryptoError;
 use crate::utils::{compress_data, decompress_data};
 
+// ── Platform-specific memory locking (best-effort) ──────────────────────────
+
+#[cfg(target_os = "windows")]
+extern "system" {
+    fn VirtualLock(lpAddress: *const u8, dwSize: usize) -> i32;
+    fn VirtualUnlock(lpAddress: *const u8, dwSize: usize) -> i32;
+}
+
+#[cfg(target_os = "windows")]
+fn lock_memory(ptr: *const u8, size: usize) -> bool {
+    unsafe { VirtualLock(ptr, size) != 0 }
+}
+
+#[cfg(target_os = "windows")]
+fn unlock_memory(ptr: *const u8, size: usize) {
+    unsafe { let _ = VirtualUnlock(ptr, size); }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn lock_memory(_ptr: *const u8, _size: usize) -> bool { true }
+
+#[cfg(not(target_os = "windows"))]
+fn unlock_memory(_ptr: *const u8, _size: usize) {}
+
+/// RAII wrapper that locks memory pages, then unlocks and zeroizes on drop.
+/// If VirtualLock fails (quota exceeded), continues without locking.
+struct LockedBuffer {
+    data: [u8; 32],
+    locked: bool,
+}
+
+impl LockedBuffer {
+    fn new(data: [u8; 32]) -> Self {
+        let ptr = data.as_ptr();
+        let locked = lock_memory(ptr, 32);
+        Self { data, locked }
+    }
+
+    fn get(&self) -> &[u8; 32] {
+        &self.data
+    }
+}
+
+impl Drop for LockedBuffer {
+    fn drop(&mut self) {
+        self.data.zeroize();
+        if self.locked {
+            unlock_memory(self.data.as_ptr(), 32);
+        }
+    }
+}
+
+// ── Constants ────────────────────────────────────────────────────────────────
+
 pub mod constants {
-    pub const VERSION: u8 = 4;
+    pub const VERSION: u8 = 5;
     pub const MAGIC: &[u8; 4] = b"AU79";
     pub const SALT_LEN: usize = 16;
     pub const HASH_LEN: usize = 32;
@@ -27,11 +81,37 @@ pub mod constants {
     pub const MIN_PASSWORD_LEN: usize = 18;
     pub const MAX_CONSECUTIVE_REPEAT: usize = 3;
 
+    // Flags byte bit definitions
+    pub const FLAG_STRIP_METADATA: u8 = 0x01;
+    pub const FLAG_NO_COMPRESS: u8 = 0x02;
+
     // Minimum header size: magic(4) + ver(1) + flags(1) + salt(16) + ts(8) + nonce(16) + argon(3) + ext_len(1) + mac(32)
     pub const MIN_HEADER_LEN: usize = 4 + 1 + 1 + SALT_LEN + TIMESTAMP_LEN + NONCE_LEN + 3 + 1 + HASH_LEN;
 }
 
 use constants::*;
+
+// ── Encrypt Options ──────────────────────────────────────────────────────────
+
+/// Options controlling encryption behavior.
+#[derive(Debug, Clone, Copy)]
+pub struct EncryptOptions {
+    /// Strip timestamp and file extension from header (flags bit 0).
+    pub strip_metadata: bool,
+    /// Skip compression — encrypt raw plaintext (flags bit 1).
+    pub skip_compression: bool,
+}
+
+impl Default for EncryptOptions {
+    fn default() -> Self {
+        Self {
+            strip_metadata: false,
+            skip_compression: false,
+        }
+    }
+}
+
+// ── Key Derivation ───────────────────────────────────────────────────────────
 
 fn derive_key(
     password: &str,
@@ -60,10 +140,12 @@ fn derive_key(
 }
 
 fn derive_subkeys(master_key: &[u8; 32]) -> ([u8; 32], [u8; 32]) {
-    let chaos_key = blake3::derive_key("au79-crypto.v4.chaos", master_key);
-    let mac_key = blake3::derive_key("au79-crypto.v4.mac", master_key);
+    let chaos_key = blake3::derive_key("au79-crypto.v5.chaos", master_key);
+    let mac_key = blake3::derive_key("au79-crypto.v5.mac", master_key);
     (chaos_key, mac_key)
 }
+
+// ── Password Validation ──────────────────────────────────────────────────────
 
 /// Validate that a password meets minimum complexity requirements.
 ///
@@ -90,8 +172,20 @@ pub fn validate_password(password: &str) -> Result<(), &'static str> {
     Ok(())
 }
 
-pub fn encrypt(plaintext: &[u8], password: &str, input_filename: &str) -> Result<Vec<u8>, CryptoError> {
-    let compressed = compress_data(plaintext)?;
+// ── Encrypt ──────────────────────────────────────────────────────────────────
+
+pub fn encrypt(
+    plaintext: &[u8],
+    password: &str,
+    input_filename: &str,
+    options: &EncryptOptions,
+) -> Result<Vec<u8>, CryptoError> {
+    // Optionally skip compression
+    let data = if options.skip_compression {
+        plaintext.to_vec()
+    } else {
+        compress_data(plaintext)?
+    };
 
     // Generate random salt and nonce
     let mut salt = [0u8; SALT_LEN];
@@ -100,47 +194,67 @@ pub fn encrypt(plaintext: &[u8], password: &str, input_filename: &str) -> Result
     let mut nonce = [0u8; NONCE_LEN];
     rand::thread_rng().fill(&mut nonce);
 
-    let timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|_| CryptoError::SystemTimeError)?
-        .as_secs()
-        .to_le_bytes();
+    // Optionally strip timestamp
+    let timestamp = if options.strip_metadata {
+        [0u8; 8]
+    } else {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| CryptoError::SystemTimeError)?
+            .as_secs()
+            .to_le_bytes()
+    };
 
     // Key derivation with explicit Argon2id parameters
     let m_log2 = ARGON2_M_LOG2;
     let t_cost = ARGON2_T_COST;
     let p_cost = ARGON2_P_COST;
 
-    let mut master_key = derive_key(password, &salt, &timestamp, m_log2, t_cost, p_cost)?;
-    let (mut chaos_key, mac_key) = derive_subkeys(&master_key);
-    master_key.zeroize();
+    let master_key = LockedBuffer::new(
+        derive_key(password, &salt, &timestamp, m_log2, t_cost, p_cost)?
+    );
+    let (chaos_key_raw, mac_key_raw) = derive_subkeys(master_key.get());
+    let chaos_key = LockedBuffer::new(chaos_key_raw);
+    let mac_key = LockedBuffer::new(mac_key_raw);
 
     // Initialize chaotic keystream
-    let mut keystream = ChaoticKeystream::new(&chaos_key, &nonce);
-    chaos_key.zeroize();
+    let mut keystream = ChaoticKeystream::new(chaos_key.get(), &nonce);
 
     // Chaotic permutation (Fisher-Yates driven by keystream)
-    let perm = keystream.generate_permutation(compressed.len());
-    let permuted = apply_permutation(&compressed, &perm);
+    let perm = keystream.generate_permutation(data.len());
+    let permuted = apply_permutation(&data, &perm);
 
     // Chaotic XOR encryption
     let mut ciphertext = permuted;
     keystream.apply_keystream(&mut ciphertext);
 
-    // Original file extension
-    let extension = Path::new(input_filename)
-        .extension()
-        .and_then(|ext| ext.to_str())
-        .unwrap_or("")
-        .as_bytes()
-        .to_vec();
+    // Original file extension (optionally stripped)
+    let extension = if options.strip_metadata {
+        Vec::new()
+    } else {
+        Path::new(input_filename)
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .unwrap_or("")
+            .as_bytes()
+            .to_vec()
+    };
     let ext_len = extension.len() as u8;
 
+    // Build flags byte
+    let mut flags: u8 = 0;
+    if options.strip_metadata {
+        flags |= FLAG_STRIP_METADATA;
+    }
+    if options.skip_compression {
+        flags |= FLAG_NO_COMPRESS;
+    }
+
     // MAC over ALL header fields and ciphertext
-    let mut mac = blake3::Hasher::new_keyed(&mac_key);
+    let mut mac = blake3::Hasher::new_keyed(mac_key.get());
     mac.update(MAGIC);
     mac.update(&[VERSION]);
-    mac.update(&[0]); // flags
+    mac.update(&[flags]);
     mac.update(&salt);
     mac.update(&timestamp);
     mac.update(&nonce);
@@ -158,7 +272,7 @@ pub fn encrypt(plaintext: &[u8], password: &str, input_filename: &str) -> Result
     );
     result.extend_from_slice(MAGIC);
     result.push(VERSION);
-    result.push(0); // flags reserved
+    result.push(flags);
     result.extend_from_slice(&salt);
     result.extend_from_slice(&timestamp);
     result.extend_from_slice(&nonce);
@@ -172,6 +286,8 @@ pub fn encrypt(plaintext: &[u8], password: &str, input_filename: &str) -> Result
 
     Ok(result)
 }
+
+// ── Decrypt ──────────────────────────────────────────────────────────────────
 
 pub fn decrypt(ciphertext_bundle: &[u8], password: &str) -> Result<(Vec<u8>, String), CryptoError> {
     if ciphertext_bundle.len() < MIN_HEADER_LEN {
@@ -189,7 +305,7 @@ pub fn decrypt(ciphertext_bundle: &[u8], password: &str) -> Result<(Vec<u8>, Str
         return Err(CryptoError::InvalidVersion);
     }
 
-    // let _flags = ciphertext_bundle[5]; // reserved
+    let flags = ciphertext_bundle[5];
 
     let salt_start = 6;
     let ts_start = salt_start + SALT_LEN;
@@ -218,15 +334,18 @@ pub fn decrypt(ciphertext_bundle: &[u8], password: &str) -> Result<(Vec<u8>, Str
     let stored_mac = &ciphertext_bundle[mac_start..];
 
     // Key derivation using stored Argon2 parameters
-    let mut master_key = derive_key(password, salt, timestamp, m_log2, t_cost, p_cost)?;
-    let (mut chaos_key, mac_key) = derive_subkeys(&master_key);
-    master_key.zeroize();
+    let master_key = LockedBuffer::new(
+        derive_key(password, salt, timestamp, m_log2, t_cost, p_cost)?
+    );
+    let (chaos_key_raw, mac_key_raw) = derive_subkeys(master_key.get());
+    let chaos_key = LockedBuffer::new(chaos_key_raw);
+    let mac_key = LockedBuffer::new(mac_key_raw);
 
     // Verify MAC before any decryption
-    let mut mac = blake3::Hasher::new_keyed(&mac_key);
+    let mut mac = blake3::Hasher::new_keyed(mac_key.get());
     mac.update(magic);
     mac.update(&[version]);
-    mac.update(&[0]); // flags
+    mac.update(&[flags]);
     mac.update(salt);
     mac.update(timestamp);
     mac.update(nonce_bytes);
@@ -239,7 +358,6 @@ pub fn decrypt(ciphertext_bundle: &[u8], password: &str) -> Result<(Vec<u8>, Str
     let expected_mac = mac.finalize();
 
     if expected_mac.as_bytes().ct_eq(stored_mac).unwrap_u8() != 1 {
-        chaos_key.zeroize();
         return Err(CryptoError::IntegrityCheckFailed);
     }
 
@@ -247,8 +365,7 @@ pub fn decrypt(ciphertext_bundle: &[u8], password: &str) -> Result<(Vec<u8>, Str
     let nonce: [u8; NONCE_LEN] = nonce_bytes
         .try_into()
         .map_err(|_| CryptoError::InvalidCiphertextLength)?;
-    let mut keystream = ChaoticKeystream::new(&chaos_key, &nonce);
-    chaos_key.zeroize();
+    let mut keystream = ChaoticKeystream::new(chaos_key.get(), &nonce);
 
     // Generate same permutation (advances keystream identically to encrypt)
     let perm = keystream.generate_permutation(encrypted.len());
@@ -260,7 +377,14 @@ pub fn decrypt(ciphertext_bundle: &[u8], password: &str) -> Result<(Vec<u8>, Str
     // Inverse permutation
     let unpermuted = apply_inverse_permutation(&decrypted, &perm);
 
-    // Decompress
+    // Optionally skip decompression based on flags
+    let no_compress = (flags & FLAG_NO_COMPRESS) != 0;
+    let plaintext = if no_compress {
+        unpermuted
+    } else {
+        decompress_data(&unpermuted)?
+    };
+
     let extension_str = String::from_utf8_lossy(extension).to_string();
-    Ok((decompress_data(&unpermuted)?, extension_str))
+    Ok((plaintext, extension_str))
 }

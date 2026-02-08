@@ -1,4 +1,9 @@
-use au79_crypto::crypto::{encrypt, decrypt};
+use au79_crypto::crypto::{encrypt, decrypt, EncryptOptions};
+
+const DEFAULT_OPTS: EncryptOptions = EncryptOptions {
+    strip_metadata: false,
+    skip_compression: false,
+};
 
 #[test]
 fn round_trip_basic() {
@@ -6,11 +11,11 @@ fn round_trip_basic() {
     let password = "testpassword123";
     let filename = "test.txt";
 
-    let encrypted = encrypt(plaintext, password, filename).expect("encryption failed");
+    let encrypted = encrypt(plaintext, password, filename, &DEFAULT_OPTS).expect("encryption failed");
 
     // Verify magic bytes and version
     assert_eq!(&encrypted[..4], b"AU79");
-    assert_eq!(encrypted[4], 4); // version 4
+    assert_eq!(encrypted[4], 5); // version 5
 
     let (decrypted, ext) = decrypt(&encrypted, password).expect("decryption failed");
 
@@ -24,7 +29,7 @@ fn round_trip_empty() {
     let password = "pass";
     let filename = "empty.bin";
 
-    let encrypted = encrypt(plaintext, password, filename).expect("encryption failed");
+    let encrypted = encrypt(plaintext, password, filename, &DEFAULT_OPTS).expect("encryption failed");
     let (decrypted, ext) = decrypt(&encrypted, password).expect("decryption failed");
 
     assert_eq!(decrypted, plaintext);
@@ -38,7 +43,7 @@ fn round_trip_large() {
     let password = "strong_password!@#$%";
     let filename = "data.dat";
 
-    let encrypted = encrypt(&plaintext, password, filename).expect("encryption failed");
+    let encrypted = encrypt(&plaintext, password, filename, &DEFAULT_OPTS).expect("encryption failed");
     let (decrypted, ext) = decrypt(&encrypted, password).expect("decryption failed");
 
     assert_eq!(decrypted, plaintext);
@@ -51,7 +56,7 @@ fn wrong_password_fails() {
     let password = "correct_password";
     let filename = "secret.txt";
 
-    let encrypted = encrypt(plaintext, password, filename).expect("encryption failed");
+    let encrypted = encrypt(plaintext, password, filename, &DEFAULT_OPTS).expect("encryption failed");
 
     let result = decrypt(&encrypted, "wrong_password");
     assert!(result.is_err(), "decryption with wrong password should fail");
@@ -63,7 +68,7 @@ fn tampered_ciphertext_fails() {
     let password = "integrity_pass";
     let filename = "test.txt";
 
-    let mut encrypted = encrypt(plaintext, password, filename).expect("encryption failed");
+    let mut encrypted = encrypt(plaintext, password, filename, &DEFAULT_OPTS).expect("encryption failed");
 
     // Tamper with a byte in the ciphertext region (past the header, before MAC)
     let tamper_pos = encrypted.len() - 33; // one byte before the 32-byte MAC
@@ -79,8 +84,8 @@ fn different_encryptions_differ() {
     let password = "same_password";
     let filename = "test.txt";
 
-    let enc1 = encrypt(plaintext, password, filename).expect("encryption 1 failed");
-    let enc2 = encrypt(plaintext, password, filename).expect("encryption 2 failed");
+    let enc1 = encrypt(plaintext, password, filename, &DEFAULT_OPTS).expect("encryption 1 failed");
+    let enc2 = encrypt(plaintext, password, filename, &DEFAULT_OPTS).expect("encryption 2 failed");
 
     // Different salt/nonce means different ciphertext
     assert_ne!(enc1, enc2);
@@ -90,4 +95,57 @@ fn different_encryptions_differ() {
     let (dec2, _) = decrypt(&enc2, password).expect("decryption 2 failed");
     assert_eq!(dec1, dec2);
     assert_eq!(dec1, plaintext);
+}
+
+#[test]
+fn round_trip_no_metadata() {
+    let plaintext = b"metadata stripped test";
+    let password = "strip_meta_pass";
+    let filename = "document.pdf";
+
+    let opts = EncryptOptions { strip_metadata: true, skip_compression: false };
+    let encrypted = encrypt(plaintext, password, filename, &opts).expect("encryption failed");
+
+    // Flags byte should have bit 0 set
+    assert_eq!(encrypted[5] & 0x01, 0x01);
+    // Timestamp should be zero
+    assert_eq!(&encrypted[22..30], &[0u8; 8]);
+
+    let (decrypted, ext) = decrypt(&encrypted, password).expect("decryption failed");
+    assert_eq!(decrypted, plaintext);
+    assert_eq!(ext, ""); // extension stripped
+}
+
+#[test]
+fn round_trip_no_compress() {
+    let plaintext = b"uncompressed test data here";
+    let password = "no_compress_pass";
+    let filename = "raw.bin";
+
+    let opts = EncryptOptions { strip_metadata: false, skip_compression: true };
+    let encrypted = encrypt(plaintext, password, filename, &opts).expect("encryption failed");
+
+    // Flags byte should have bit 1 set
+    assert_eq!(encrypted[5] & 0x02, 0x02);
+
+    let (decrypted, ext) = decrypt(&encrypted, password).expect("decryption failed");
+    assert_eq!(decrypted, plaintext);
+    assert_eq!(ext, "bin");
+}
+
+#[test]
+fn round_trip_both_flags() {
+    let plaintext = b"both flags enabled";
+    let password = "both_flags_pass";
+    let filename = "secret.docx";
+
+    let opts = EncryptOptions { strip_metadata: true, skip_compression: true };
+    let encrypted = encrypt(plaintext, password, filename, &opts).expect("encryption failed");
+
+    // Both flag bits set
+    assert_eq!(encrypted[5] & 0x03, 0x03);
+
+    let (decrypted, ext) = decrypt(&encrypted, password).expect("decryption failed");
+    assert_eq!(decrypted, plaintext);
+    assert_eq!(ext, "");
 }

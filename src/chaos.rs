@@ -134,6 +134,7 @@ impl ChaoticKeystream {
     /// observations, which a simple XOR-fold would leak.
     pub fn next_u64(&mut self) -> u64 {
         self.round();
+        self.round();
         let lo = self.state[0].wrapping_mul(self.state[1] | 1);
         let hi = self.state[2].wrapping_mul(self.state[3] | 1);
         lo ^ hi

@@ -9,7 +9,7 @@ use zeroize::Zeroize;
 use zip::write::SimpleFileOptions;
 
 extern crate au79_crypto;
-use au79_crypto::crypto::{encrypt, decrypt, validate_password};
+use au79_crypto::crypto::{encrypt, decrypt, validate_password, EncryptOptions};
 use au79_crypto::error::CryptoError;
 
 const ARCHIVE_EXTENSION: &str = "au79archive";
@@ -66,6 +66,8 @@ pub struct Au79Gui {
 
     // Batch mode
     batch_mode: bool,
+    strip_metadata: bool,
+    skip_compression: bool,
     batch_files: Vec<BatchFileEntry>,
     batch_output_path: String,
 
@@ -93,6 +95,8 @@ impl Default for Au79Gui {
             confirm_password: String::new(),
             show_password: false,
             batch_mode: false,
+            strip_metadata: false,
+            skip_compression: false,
             batch_files: Vec::new(),
             batch_output_path: String::new(),
             status_message: "Ready".into(),
@@ -508,6 +512,13 @@ impl Au79Gui {
                     ui.colored_label(ERROR_RED, "Passwords do not match");
                 }
             }
+
+            ui.add_space(10.0);
+            ui.separator();
+            ui.add_space(6.0);
+            ui.label(egui::RichText::new("Privacy Options").strong());
+            ui.checkbox(&mut self.strip_metadata, "Strip Metadata (no timestamp/extension)");
+            ui.checkbox(&mut self.skip_compression, "Skip Compression (no pattern fingerprinting)");
         }
     }
 
@@ -675,10 +686,14 @@ impl Au79Gui {
         let input_path = PathBuf::from(&self.input_path);
         let output_path = PathBuf::from(&self.output_path);
         let password = self.password.clone();
+        let options = EncryptOptions {
+            strip_metadata: self.strip_metadata,
+            skip_compression: self.skip_compression,
+        };
 
         std::thread::spawn(move || {
             let result = match mode {
-                Mode::Encrypt => encrypt_file(&input_path, &output_path, &password),
+                Mode::Encrypt => encrypt_file(&input_path, &output_path, &password, &options),
                 Mode::Decrypt => decrypt_file(&input_path, &output_path, &password),
                 Mode::Info => show_file_info(&input_path),
             };
@@ -700,9 +715,13 @@ impl Au79Gui {
         let files: Vec<PathBuf> = self.batch_files.iter().map(|e| e.path.clone()).collect();
         let output_path = PathBuf::from(&self.batch_output_path);
         let password = self.password.clone();
+        let options = EncryptOptions {
+            strip_metadata: self.strip_metadata,
+            skip_compression: self.skip_compression,
+        };
 
         std::thread::spawn(move || {
-            let result = encrypt_archive(&files, &output_path, &password);
+            let result = encrypt_archive(&files, &output_path, &password, &options);
             let _ = tx.send(WorkerMessage::Complete(result));
             let _ = tx.send(WorkerMessage::AllDone);
             ctx.request_repaint();
@@ -746,9 +765,9 @@ impl Drop for Au79Gui {
 
 // ── Crypto Helpers (framework-independent) ─────────────────────────────────────
 
-fn encrypt_file(input_path: &Path, output_path: &Path, password: &str) -> Result<String, String> {
+fn encrypt_file(input_path: &Path, output_path: &Path, password: &str, options: &EncryptOptions) -> Result<String, String> {
     let data = fs::read(input_path).map_err(|e| format!("Failed to read input: {}", e))?;
-    let result = encrypt(&data, password, &input_path.to_string_lossy())
+    let result = encrypt(&data, password, &input_path.to_string_lossy(), options)
         .map_err(|e| format!("Encryption failed: {}", e))?;
     fs::write(output_path, result).map_err(|e| format!("Failed to write output: {}", e))?;
     Ok(format!(
@@ -790,10 +809,10 @@ fn decrypt_file(input_path: &Path, output_path: &Path, password: &str) -> Result
     ))
 }
 
-fn encrypt_archive(files: &[PathBuf], output_path: &Path, password: &str) -> Result<String, String> {
+fn encrypt_archive(files: &[PathBuf], output_path: &Path, password: &str, options: &EncryptOptions) -> Result<String, String> {
     let archive = create_archive(files)?;
     let filename = format!("archive.{}", ARCHIVE_EXTENSION);
-    let result = encrypt(&archive, password, &filename)
+    let result = encrypt(&archive, password, &filename, options)
         .map_err(|e| format!("Encryption failed: {}", e))?;
     fs::write(output_path, result)
         .map_err(|e| format!("Failed to write output: {}", e))?;
@@ -869,8 +888,12 @@ fn show_file_info(input_path: &Path) -> Result<String, String> {
 
     let version = data[4];
     let flags = data[5];
+    let mut flag_strs = Vec::new();
+    if flags & 0x01 != 0 { flag_strs.push("STRIP_METADATA"); }
+    if flags & 0x02 != 0 { flag_strs.push("NO_COMPRESS"); }
+    let flags_display = if flag_strs.is_empty() { "none".to_string() } else { flag_strs.join(", ") };
 
-    // v4 header: magic(4) + ver(1) + flags(1) + salt(16) + ts(8) + nonce(16) + argon(3) + ext_len(1) + mac(32)
+    // v5 header: magic(4) + ver(1) + flags(1) + salt(16) + ts(8) + nonce(16) + argon(3) + ext_len(1) + mac(32)
     let min_header = 4 + 1 + 1 + 16 + 8 + 16 + 3 + 1 + 32;
     if data.len() < min_header {
         return Err("File too short to parse header.".into());
@@ -896,14 +919,14 @@ fn show_file_info(input_path: &Path) -> Result<String, String> {
     Ok(format!(
         "Magic:              AU79\n\
          Version:            {}\n\
-         Flags:              {}\n\
+         Flags:              {} ({})\n\
          Timestamp:          {}\n\
          Argon2 Memory:      {} MB (2^{} KiB)\n\
          Argon2 Iterations:  {}\n\
          Argon2 Parallelism: {}\n\
          Original Extension: .{}\n\
          File Size:          {}",
-        version, flags, timestamp, m_cost_mb, m_log2, t_cost, p_cost, extension, total_size
+        version, flags, flags_display, timestamp, m_cost_mb, m_log2, t_cost, p_cost, extension, total_size
     ))
 }
 

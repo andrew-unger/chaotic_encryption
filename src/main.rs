@@ -5,7 +5,7 @@ use std::path::Path;
 use rpassword::prompt_password;
 
 // Import the library crate explicitly
-use au79_crypto::crypto::{encrypt, decrypt, validate_password};
+use au79_crypto::crypto::{encrypt, decrypt, validate_password, EncryptOptions};
 use au79_crypto::error::CryptoError;
 use au79_crypto::utils::display_file_info;
 
@@ -31,7 +31,7 @@ fn main() -> Result<(), CryptoError> {
     // CLI mode requires at least a command + input file
     if args.len() < 3 {
         eprintln!("Usage:");
-        eprintln!("  {} encrypt <input_file> <output_file>", args[0]);
+        eprintln!("  {} encrypt <input_file> <output_file> [--no-metadata] [--no-compress]", args[0]);
         eprintln!("  {} decrypt <input_file> <output_file> [--force]", args[0]);
         eprintln!("  {} info <input_file>", args[0]);
         return Ok(());
@@ -58,7 +58,17 @@ fn main() -> Result<(), CryptoError> {
                 return Ok(());
             }
             let output_file = &args[3];
-            let result = encrypt(&data, password.as_ref().unwrap(), input_file)?;
+
+            let mut options = EncryptOptions::default();
+            for arg in &args[4..] {
+                match arg.as_str() {
+                    "--no-metadata" => options.strip_metadata = true,
+                    "--no-compress" => options.skip_compression = true,
+                    _ => eprintln!("Warning: unknown flag {}", arg),
+                }
+            }
+
+            let result = encrypt(&data, password.as_ref().unwrap(), input_file, &options)?;
             let mut file = fs::File::create(output_file)?;
             file.write_all(&result)?;
             println!("Encryption completed successfully.");
