@@ -19,7 +19,7 @@ Available as both a command-line tool and a cross-platform graphical application
 - **Cross-Platform GUI** — Native desktop application built with egui/eframe
 - **Batch Archive Mode** — Bundle multiple files into a single encrypted `.au79` archive
 - **Drag-and-Drop** — Drop files directly onto the GUI window
-- **Password Strength Indicator** — Real-time feedback on password quality
+- **Password Policy Enforcement** — Minimum 18 characters, consecutive repeat detection, real-time strength feedback
 
 ## Installation
 
@@ -114,7 +114,7 @@ au79-crypto
 password + random salt + timestamp
         |
         v
-    Argon2id (64 MB, 3 iterations)
+    Argon2id (256 MB, 4 iterations)
         |
         v
     master_key (32 bytes)
@@ -169,8 +169,8 @@ All arithmetic uses `u64`/`u128` wrapping operations, guaranteeing identical res
 | Salt | 16 bytes | Random, used in Argon2id |
 | Timestamp | 8 bytes | Unix epoch seconds (LE) |
 | Nonce | 16 bytes | Random, mixed into chaotic state |
-| Argon2 m_cost | 1 byte | log2 of memory in KiB (default: 16 = 64 MB) |
-| Argon2 t_cost | 1 byte | Iteration count (default: 3) |
+| Argon2 m_cost | 1 byte | log2 of memory in KiB (default: 18 = 256 MB) |
+| Argon2 t_cost | 1 byte | Iteration count (default: 4) |
 | Argon2 p_cost | 1 byte | Parallelism lanes (default: 1) |
 | Extension length | 1 byte | Length of original file extension |
 | Extension | variable | Original file extension |
@@ -191,10 +191,27 @@ All arithmetic uses `u64`/`u128` wrapping operations, guaranteeing identical res
 | `rfd` | Native file dialogs (optional) |
 | `zip` | Archive creation for batch mode (optional) |
 
+## Password Policy
+
+Passwords are validated on both the GUI and CLI before encryption is allowed:
+
+- **Minimum 18 characters** — shorter passwords are rejected
+- **Max 3 consecutive identical characters** — e.g. `aaa` is allowed, `aaaa` is not
+- No requirements for uppercase, lowercase, numbers, or special characters
+
+The strength meter provides real-time feedback:
+
+| Length | Rating |
+|--------|--------|
+| < 18 | Weak (blocked) |
+| 18 – 23 | Fair |
+| 24 – 31 | Strong |
+| 32+ | Very Strong |
+
 ## Security Considerations
 
 - The chaotic keystream cipher is experimental and has not undergone formal cryptographic review
-- Key derivation uses Argon2id with configurable, explicitly stored parameters
+- Key derivation uses Argon2id (256 MB, 4 iterations) — each brute-force guess costs ~1 second and 256 MB of RAM
 - Separate subkeys prevent related-key interactions between cipher and MAC
 - Decompression is capped at 4 GB to prevent zip-bomb attacks
 - All key material, chaotic state, and GUI password fields are zeroized after use
