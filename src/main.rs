@@ -16,9 +16,9 @@ mod gui;
 fn main() -> Result<(), CryptoError> {
     let args: Vec<String> = env::args().collect();
     
-    // Check if GUI mode is requested
+    // Launch GUI when no arguments are provided, or when --gui is passed
     #[cfg(feature = "gui")]
-    if args.len() > 1 && args[1] == "--gui" {
+    if args.len() <= 1 || args[1] == "--gui" {
         match gui::run_gui() {
             Ok(_) => return Ok(()),
             Err(e) => {
@@ -27,17 +27,13 @@ fn main() -> Result<(), CryptoError> {
             }
         }
     }
-    
-    // Continue with CLI mode if not GUI
+
+    // CLI mode requires at least a command + input file
     if args.len() < 3 {
         eprintln!("Usage:");
         eprintln!("  {} encrypt <input_file> <output_file>", args[0]);
         eprintln!("  {} decrypt <input_file> <output_file> [--force]", args[0]);
         eprintln!("  {} info <input_file>", args[0]);
-        
-        #[cfg(feature = "gui")]
-        eprintln!("  {} --gui", args[0]);
-        
         return Ok(());
     }
 
