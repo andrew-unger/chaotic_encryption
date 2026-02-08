@@ -9,7 +9,7 @@ use zeroize::Zeroize;
 use zip::write::SimpleFileOptions;
 
 extern crate au79_crypto;
-use au79_crypto::crypto::{encrypt, decrypt};
+use au79_crypto::crypto::{encrypt, decrypt, validate_password};
 use au79_crypto::error::CryptoError;
 
 const ARCHIVE_EXTENSION: &str = "au79archive";
@@ -484,6 +484,9 @@ impl Au79Gui {
         let strength = evaluate_password_strength(&self.password);
         if strength != PasswordStrength::Empty {
             render_password_strength(ui, strength);
+            if let Err(reason) = validate_password(&self.password) {
+                ui.colored_label(ERROR_RED, egui::RichText::new(reason).small());
+            }
         }
 
         // Confirm password (encrypt only)
@@ -645,7 +648,7 @@ impl Au79Gui {
                     !self.input_path.is_empty() && !self.output_path.is_empty()
                 };
                 has_files
-                    && !self.password.is_empty()
+                    && validate_password(&self.password).is_ok()
                     && self.password == self.confirm_password
             }
             Mode::Decrypt => {
@@ -926,12 +929,13 @@ fn evaluate_password_strength(password: &str) -> PasswordStrength {
     if password.is_empty() {
         return PasswordStrength::Empty;
     }
+    if validate_password(password).is_err() {
+        return PasswordStrength::Weak;
+    }
     let len = password.len();
-    if len < 8 {
-        PasswordStrength::Weak
-    } else if len < 16 {
+    if len < 24 {
         PasswordStrength::Fair
-    } else if len < 24 {
+    } else if len < 32 {
         PasswordStrength::Strong
     } else {
         PasswordStrength::VeryStrong

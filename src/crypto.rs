@@ -19,9 +19,13 @@ pub mod constants {
     pub const TIMESTAMP_LEN: usize = 8;
 
     // Argon2id defaults
-    pub const ARGON2_M_LOG2: u8 = 16; // 2^16 = 65536 KiB = 64 MB
-    pub const ARGON2_T_COST: u8 = 3;  // 3 iterations
+    pub const ARGON2_M_LOG2: u8 = 18; // 2^18 = 262144 KiB = 256 MB
+    pub const ARGON2_T_COST: u8 = 4;  // 4 iterations
     pub const ARGON2_P_COST: u8 = 1;  // 1 lane
+
+    // Password policy
+    pub const MIN_PASSWORD_LEN: usize = 18;
+    pub const MAX_CONSECUTIVE_REPEAT: usize = 3;
 
     // Minimum header size: magic(4) + ver(1) + flags(1) + salt(16) + ts(8) + nonce(16) + argon(3) + ext_len(1) + mac(32)
     pub const MIN_HEADER_LEN: usize = 4 + 1 + 1 + SALT_LEN + TIMESTAMP_LEN + NONCE_LEN + 3 + 1 + HASH_LEN;
@@ -59,6 +63,31 @@ fn derive_subkeys(master_key: &[u8; 32]) -> ([u8; 32], [u8; 32]) {
     let chaos_key = blake3::derive_key("au79-crypto.v4.chaos", master_key);
     let mac_key = blake3::derive_key("au79-crypto.v4.mac", master_key);
     (chaos_key, mac_key)
+}
+
+/// Validate that a password meets minimum complexity requirements.
+///
+/// Rules:
+/// - Minimum 18 characters
+/// - No more than 3 consecutive identical characters
+pub fn validate_password(password: &str) -> Result<(), &'static str> {
+    if password.len() < MIN_PASSWORD_LEN {
+        return Err("Password must be at least 18 characters");
+    }
+    let mut run: usize = 1;
+    let mut prev: Option<char> = None;
+    for ch in password.chars() {
+        if Some(ch) == prev {
+            run += 1;
+            if run > MAX_CONSECUTIVE_REPEAT {
+                return Err("Too many consecutive repeating characters (max 3)");
+            }
+        } else {
+            run = 1;
+        }
+        prev = Some(ch);
+    }
+    Ok(())
 }
 
 pub fn encrypt(plaintext: &[u8], password: &str, input_filename: &str) -> Result<Vec<u8>, CryptoError> {

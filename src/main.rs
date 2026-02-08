@@ -5,7 +5,7 @@ use std::path::Path;
 use rpassword::prompt_password;
 
 // Import the library crate explicitly
-use au79_crypto::crypto::{encrypt, decrypt};
+use au79_crypto::crypto::{encrypt, decrypt, validate_password};
 use au79_crypto::error::CryptoError;
 use au79_crypto::utils::display_file_info;
 
@@ -51,6 +51,10 @@ fn main() -> Result<(), CryptoError> {
         "encrypt" => {
             if args.len() < 4 {
                 eprintln!("Output file required for encryption.");
+                return Ok(());
+            }
+            if let Err(reason) = validate_password(password.as_ref().unwrap()) {
+                eprintln!("Password rejected: {}", reason);
                 return Ok(());
             }
             let output_file = &args[3];
