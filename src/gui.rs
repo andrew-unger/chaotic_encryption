@@ -853,25 +853,28 @@ fn show_file_info(input_path: &Path) -> Result<String, String> {
 
     let version = data[4];
     let flags = data[5];
-    let ts_start = 6 + 16; // SALT_LEN
-    if data.len() < ts_start + 8 + 12 + 8 + 1 {
+
+    // v4 header: magic(4) + ver(1) + flags(1) + salt(16) + ts(8) + nonce(16) + argon(3) + ext_len(1) + mac(32)
+    let min_header = 4 + 1 + 1 + 16 + 8 + 16 + 3 + 1 + 32;
+    if data.len() < min_header {
         return Err("File too short to parse header.".into());
     }
-    let timestamp =
-        u64::from_le_bytes(data[ts_start..ts_start + 8].try_into().unwrap());
-    let tent_seed = f64::from_le_bytes(
-        data[ts_start + 8 + 12..ts_start + 8 + 12 + 8]
-            .try_into()
-            .unwrap(),
-    );
-    let ext_len = data[ts_start + 8 + 12 + 8] as usize;
-    let ext_start = ts_start + 8 + 12 + 8 + 1;
+
+    let ts_start = 22; // 6 + SALT_LEN(16)
+    let timestamp = u64::from_le_bytes(data[ts_start..ts_start + 8].try_into().unwrap());
+    let argon_start = 46; // ts_start + 8 + NONCE_LEN(16)
+    let m_log2 = data[argon_start];
+    let t_cost = data[argon_start + 1];
+    let p_cost = data[argon_start + 2];
+    let ext_len = data[49] as usize;
+    let ext_start = 50;
     let extension = if data.len() >= ext_start + ext_len {
         String::from_utf8_lossy(&data[ext_start..ext_start + ext_len]).to_string()
     } else {
         "???".into()
     };
 
+    let m_cost_mb = (1u64 << m_log2) / 1024;
     let total_size = format_file_size(data.len() as u64);
 
     Ok(format!(
@@ -879,10 +882,12 @@ fn show_file_info(input_path: &Path) -> Result<String, String> {
          Version:            {}\n\
          Flags:              {}\n\
          Timestamp:          {}\n\
-         Tent Map Seed:      {:.6}\n\
+         Argon2 Memory:      {} MB (2^{} KiB)\n\
+         Argon2 Iterations:  {}\n\
+         Argon2 Parallelism: {}\n\
          Original Extension: .{}\n\
          File Size:          {}",
-        version, flags, timestamp, tent_seed, extension, total_size
+        version, flags, timestamp, m_cost_mb, m_log2, t_cost, p_cost, extension, total_size
     ))
 }
 

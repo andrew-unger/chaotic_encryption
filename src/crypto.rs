@@ -1,174 +1,155 @@
-use argon2::Argon2;
+use argon2::{Algorithm, Argon2, Params, Version};
 use blake3;
-use chacha20::cipher::{KeyIvInit, StreamCipher};
-use chacha20::ChaCha20;
-use rand::rngs::StdRng;
-use rand::{Rng, SeedableRng};
+use rand::Rng;
 use subtle::ConstantTimeEq;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 use zeroize::Zeroize;
 
-use crate::chaos::{ChenSystem, TentMap, RabinovichFabrikantSystem, chen_warmup,
-                   tent_warmup, rf_warmup, interlaced_chaos_sequence,
-                   chaotic_permutation, inverse_chaotic_permutation};
+use crate::chaos::{ChaoticKeystream, apply_permutation, apply_inverse_permutation};
 use crate::error::CryptoError;
 use crate::utils::{compress_data, decompress_data};
 
 pub mod constants {
-    pub const VERSION: u8 = 3;
+    pub const VERSION: u8 = 4;
     pub const MAGIC: &[u8; 4] = b"AU79";
     pub const SALT_LEN: usize = 16;
     pub const HASH_LEN: usize = 32;
-    pub const TENT_SEED_LEN: usize = 8;
+    pub const NONCE_LEN: usize = 16;
     pub const TIMESTAMP_LEN: usize = 8;
-    pub const WARMUP_ITERATIONS: usize = 100;
-    pub const CHACHA_NONCE_LEN: usize = 12;
-    
-    // Chen system parameters
-    pub const CHEN_DT: f64 = 0.01;
-    
-    // Rabinovich-Fabrikant parameters
-    pub const RF_DT: f64 = 0.01;
+
+    // Argon2id defaults
+    pub const ARGON2_M_LOG2: u8 = 16; // 2^16 = 65536 KiB = 64 MB
+    pub const ARGON2_T_COST: u8 = 3;  // 3 iterations
+    pub const ARGON2_P_COST: u8 = 1;  // 1 lane
+
+    // Minimum header size: magic(4) + ver(1) + flags(1) + salt(16) + ts(8) + nonce(16) + argon(3) + ext_len(1) + mac(32)
+    pub const MIN_HEADER_LEN: usize = 4 + 1 + 1 + SALT_LEN + TIMESTAMP_LEN + NONCE_LEN + 3 + 1 + HASH_LEN;
 }
 
 use constants::*;
 
-fn derive_key(password: &str, salt: &[u8], timestamp: &[u8]) -> Result<[u8; 32], CryptoError> {
-    let argon2 = Argon2::default();
+fn derive_key(
+    password: &str,
+    salt: &[u8],
+    timestamp: &[u8],
+    m_log2: u8,
+    t_cost: u8,
+    p_cost: u8,
+) -> Result<[u8; 32], CryptoError> {
+    let m_cost = 1u32
+        .checked_shl(m_log2 as u32)
+        .ok_or(CryptoError::KeyDerivationFailed)?;
+    let params = Params::new(m_cost, t_cost as u32, p_cost as u32, Some(32))
+        .map_err(|_| CryptoError::KeyDerivationFailed)?;
+    let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
+
     let mut key = [0u8; 32];
-    let mut combined_salt = Vec::new();
+    let mut combined_salt = Vec::with_capacity(salt.len() + timestamp.len());
     combined_salt.extend_from_slice(salt);
     combined_salt.extend_from_slice(timestamp);
+
     argon2
         .hash_password_into(password.as_bytes(), &combined_salt, &mut key)
         .map_err(|_| CryptoError::KeyDerivationFailed)?;
     Ok(key)
 }
 
-fn generate_unique_nonce(key: &[u8], timestamp: &[u8]) -> [u8; CHACHA_NONCE_LEN] {
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(key);
-    hasher.update(timestamp);
-    hasher.update(&rand::thread_rng().gen::<[u8; 16]>());
-    let hash = hasher.finalize();
-    let mut nonce = [0u8; CHACHA_NONCE_LEN];
-    nonce.copy_from_slice(&hash.as_bytes()[..CHACHA_NONCE_LEN]);
-    nonce
+fn derive_subkeys(master_key: &[u8; 32]) -> ([u8; 32], [u8; 32]) {
+    let chaos_key = blake3::derive_key("au79-crypto.v4.chaos", master_key);
+    let mac_key = blake3::derive_key("au79-crypto.v4.mac", master_key);
+    (chaos_key, mac_key)
 }
 
 pub fn encrypt(plaintext: &[u8], password: &str, input_filename: &str) -> Result<Vec<u8>, CryptoError> {
     let compressed = compress_data(plaintext)?;
 
-    let mut salt_bytes = [0u8; SALT_LEN];
-    rand::thread_rng().fill(&mut salt_bytes);
+    // Generate random salt and nonce
+    let mut salt = [0u8; SALT_LEN];
+    rand::thread_rng().fill(&mut salt);
 
-    let timestamp = SystemTime::now().duration_since(UNIX_EPOCH)
+    let mut nonce = [0u8; NONCE_LEN];
+    rand::thread_rng().fill(&mut nonce);
+
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
         .map_err(|_| CryptoError::SystemTimeError)?
         .as_secs()
         .to_le_bytes();
 
-    let mut key = derive_key(password, &salt_bytes, &timestamp)?;
-    let hash = blake3::hash(&key);
+    // Key derivation with explicit Argon2id parameters
+    let m_log2 = ARGON2_M_LOG2;
+    let t_cost = ARGON2_T_COST;
+    let p_cost = ARGON2_P_COST;
 
-    // Extract parameters for Chen system
-    let chen_a = 35.0 + (hash.as_bytes()[0] as f64) / 255.0;
-    let chen_b = 3.0 + (hash.as_bytes()[1] as f64) / 255.0;
-    let chen_c = 28.0 + (hash.as_bytes()[2] as f64) / 255.0;
-    
-    // Extract parameters for Tent Map
-    let tent_mu = 1.5 + (hash.as_bytes()[3] as f64) / 255.0;
-    
-    // Extract parameters for Rabinovich-Fabrikant system
-    let rf_alpha = 0.1 + (hash.as_bytes()[4] as f64) / 255.0;
-    let rf_gamma = 0.1 + (hash.as_bytes()[5] as f64) / 255.0;
+    let mut master_key = derive_key(password, &salt, &timestamp, m_log2, t_cost, p_cost)?;
+    let (mut chaos_key, mac_key) = derive_subkeys(&master_key);
+    master_key.zeroize();
 
-    let mut rng = StdRng::from_seed(key);
-    
-    // Initialize chaotic systems
-    let chen_x0 = rng.gen_range(-10.0..10.0);
-    let chen_y0 = rng.gen_range(-10.0..10.0);
-    let chen_z0 = rng.gen_range(0.0..30.0);
-    
-    let tent_x0 = rng.gen_range(0.1..0.9); // Avoid fixed points at 0 and 1
-    
-    let rf_x0 = rng.gen_range(-1.0..1.0);
-    let rf_y0 = rng.gen_range(-1.0..1.0);
-    let rf_z0 = rng.gen_range(0.0..1.0);
-    
-    // Create chaotic systems
-    let mut chen = ChenSystem::new(chen_x0, chen_y0, chen_z0, chen_a, chen_b, chen_c, CHEN_DT);
-    let mut tent = TentMap::new(tent_x0, tent_mu);
-    let mut rf = RabinovichFabrikantSystem::new(rf_x0, rf_y0, rf_z0, rf_alpha, rf_gamma, RF_DT);
+    // Initialize chaotic keystream
+    let mut keystream = ChaoticKeystream::new(&chaos_key, &nonce);
+    chaos_key.zeroize();
 
-    // Warm up the chaotic systems
-    chen_warmup(&mut chen, WARMUP_ITERATIONS);
-    tent_warmup(&mut tent, WARMUP_ITERATIONS);
-    rf_warmup(&mut rf, WARMUP_ITERATIONS);
-    
-    // Evolve the systems to make them more unpredictable
-    chen.evolve();
-    tent.evolve();
-    rf.evolve();
+    // Chaotic permutation (Fisher-Yates driven by keystream)
+    let perm = keystream.generate_permutation(compressed.len());
+    let permuted = apply_permutation(&compressed, &perm);
 
-    // Generate interlaced chaos sequence
-    let chaos_sequence = interlaced_chaos_sequence(&mut chen, &mut tent, &mut rf, compressed.len());
-    
-    // Perform permutation
-    let permuted_plaintext = chaotic_permutation(&compressed, &chaos_sequence);
+    // Chaotic XOR encryption
+    let mut ciphertext = permuted;
+    keystream.apply_keystream(&mut ciphertext);
 
-    // Continue with ChaCha20 encryption
-    let nonce = generate_unique_nonce(&key, &timestamp);
-
-    let mut cipher = ChaCha20::new((&key).into(), (&nonce).into());
-    let mut ciphertext = permuted_plaintext;
-    cipher.apply_keystream(&mut ciphertext);
-
+    // Original file extension
     let extension = Path::new(input_filename)
         .extension()
         .and_then(|ext| ext.to_str())
         .unwrap_or("")
         .as_bytes()
         .to_vec();
-    let extension_len = extension.len() as u8;
+    let ext_len = extension.len() as u8;
 
-    let mut mac = blake3::Hasher::new_keyed(&key);
+    // MAC over ALL header fields and ciphertext
+    let mut mac = blake3::Hasher::new_keyed(&mac_key);
     mac.update(MAGIC);
     mac.update(&[VERSION]);
-    mac.update(&[0]); // Flags reserved
-    mac.update(&salt_bytes);
+    mac.update(&[0]); // flags
+    mac.update(&salt);
     mac.update(&timestamp);
     mac.update(&nonce);
-    mac.update(&ciphertext);
-    mac.update(&[extension_len]);
+    mac.update(&[m_log2]);
+    mac.update(&[t_cost]);
+    mac.update(&[p_cost]);
+    mac.update(&[ext_len]);
     mac.update(&extension);
+    mac.update(&ciphertext);
     let final_mac = mac.finalize();
 
-    // Store the tent map's initial value for decryption
-    let tent_bytes = tent_x0.to_le_bytes();
-
-    key[..].zeroize();
-
-    let mut result = Vec::with_capacity(4 + 1 + 1 + SALT_LEN + TIMESTAMP_LEN + CHACHA_NONCE_LEN + TENT_SEED_LEN + 1 + extension.len() + ciphertext.len() + 32);
+    // Assemble output
+    let mut result = Vec::with_capacity(
+        MIN_HEADER_LEN + extension.len() + ciphertext.len(),
+    );
     result.extend_from_slice(MAGIC);
     result.push(VERSION);
-    result.push(0); // Flags
-    result.extend_from_slice(&salt_bytes);
+    result.push(0); // flags reserved
+    result.extend_from_slice(&salt);
     result.extend_from_slice(&timestamp);
     result.extend_from_slice(&nonce);
-    result.extend_from_slice(&tent_bytes);
-    result.push(extension_len);
+    result.push(m_log2);
+    result.push(t_cost);
+    result.push(p_cost);
+    result.push(ext_len);
     result.extend_from_slice(&extension);
     result.extend_from_slice(&ciphertext);
     result.extend_from_slice(final_mac.as_bytes());
+
     Ok(result)
 }
 
 pub fn decrypt(ciphertext_bundle: &[u8], password: &str) -> Result<(Vec<u8>, String), CryptoError> {
-    if ciphertext_bundle.len() < 4 + 1 + 1 + SALT_LEN + TIMESTAMP_LEN + CHACHA_NONCE_LEN + TENT_SEED_LEN + 1 + HASH_LEN {
+    if ciphertext_bundle.len() < MIN_HEADER_LEN {
         return Err(CryptoError::InvalidCiphertextLength);
     }
 
+    // Parse header
     let magic = &ciphertext_bundle[..4];
     if magic != MAGIC {
         return Err(CryptoError::InvalidMagicBytes);
@@ -179,102 +160,78 @@ pub fn decrypt(ciphertext_bundle: &[u8], password: &str) -> Result<(Vec<u8>, Str
         return Err(CryptoError::InvalidVersion);
     }
 
-    let salt_start = 6;
-    let timestamp_start = salt_start + SALT_LEN;
-    let nonce_start = timestamp_start + TIMESTAMP_LEN;
-    let tent_start = nonce_start + CHACHA_NONCE_LEN;
-    let ext_len_start = tent_start + TENT_SEED_LEN;
+    // let _flags = ciphertext_bundle[5]; // reserved
 
-    let extension_len = ciphertext_bundle[ext_len_start] as usize;
-    let ext_start = ext_len_start + 1;
-    let cipher_start = ext_start + extension_len;
+    let salt_start = 6;
+    let ts_start = salt_start + SALT_LEN;
+    let nonce_start = ts_start + TIMESTAMP_LEN;
+    let argon_start = nonce_start + NONCE_LEN;
+    let ext_len_pos = argon_start + 3;
+
+    let salt = &ciphertext_bundle[salt_start..ts_start];
+    let timestamp = &ciphertext_bundle[ts_start..nonce_start];
+    let nonce_bytes = &ciphertext_bundle[nonce_start..argon_start];
+    let m_log2 = ciphertext_bundle[argon_start];
+    let t_cost = ciphertext_bundle[argon_start + 1];
+    let p_cost = ciphertext_bundle[argon_start + 2];
+
+    let ext_len = ciphertext_bundle[ext_len_pos] as usize;
+    let ext_start = ext_len_pos + 1;
+    let cipher_start = ext_start + ext_len;
     let mac_start = ciphertext_bundle.len() - HASH_LEN;
 
     if cipher_start > mac_start {
         return Err(CryptoError::InvalidCiphertextLength);
     }
 
-    let salt_bytes = &ciphertext_bundle[salt_start..timestamp_start];
-    let timestamp = &ciphertext_bundle[timestamp_start..nonce_start];
-    let nonce = &ciphertext_bundle[nonce_start..tent_start];
-    let tent_bytes = &ciphertext_bundle[tent_start..ext_len_start];
     let extension = &ciphertext_bundle[ext_start..cipher_start];
     let encrypted = &ciphertext_bundle[cipher_start..mac_start];
-    let mac_bytes = &ciphertext_bundle[mac_start..];
+    let stored_mac = &ciphertext_bundle[mac_start..];
 
-    let mut key = derive_key(password, salt_bytes, timestamp)?;
+    // Key derivation using stored Argon2 parameters
+    let mut master_key = derive_key(password, salt, timestamp, m_log2, t_cost, p_cost)?;
+    let (mut chaos_key, mac_key) = derive_subkeys(&master_key);
+    master_key.zeroize();
 
-    let mut mac = blake3::Hasher::new_keyed(&key);
+    // Verify MAC before any decryption
+    let mut mac = blake3::Hasher::new_keyed(&mac_key);
     mac.update(magic);
     mac.update(&[version]);
-    mac.update(&[0]); // Flags
-    mac.update(salt_bytes);
+    mac.update(&[0]); // flags
+    mac.update(salt);
     mac.update(timestamp);
-    mac.update(nonce);
-    mac.update(encrypted);
-    mac.update(&[extension_len as u8]);
+    mac.update(nonce_bytes);
+    mac.update(&[m_log2]);
+    mac.update(&[t_cost]);
+    mac.update(&[p_cost]);
+    mac.update(&[ext_len as u8]);
     mac.update(extension);
+    mac.update(encrypted);
     let expected_mac = mac.finalize();
 
-    if expected_mac.as_bytes().ct_eq(mac_bytes).unwrap_u8() != 1 {
+    if expected_mac.as_bytes().ct_eq(stored_mac).unwrap_u8() != 1 {
+        chaos_key.zeroize();
         return Err(CryptoError::IntegrityCheckFailed);
     }
 
-    let hash = blake3::hash(&key);
+    // Initialize chaotic keystream with same key and nonce
+    let nonce: [u8; NONCE_LEN] = nonce_bytes
+        .try_into()
+        .map_err(|_| CryptoError::InvalidCiphertextLength)?;
+    let mut keystream = ChaoticKeystream::new(&chaos_key, &nonce);
+    chaos_key.zeroize();
 
-    // Extract parameters for Chen system - matching the encrypt function
-    let chen_a = 35.0 + (hash.as_bytes()[0] as f64) / 255.0;
-    let chen_b = 3.0 + (hash.as_bytes()[1] as f64) / 255.0;
-    let chen_c = 28.0 + (hash.as_bytes()[2] as f64) / 255.0;
-    
-    // Extract parameters for Tent Map
-    let tent_mu = 1.5 + (hash.as_bytes()[3] as f64) / 255.0;
-    
-    // Extract parameters for Rabinovich-Fabrikant system
-    let rf_alpha = 0.1 + (hash.as_bytes()[4] as f64) / 255.0;
-    let rf_gamma = 0.1 + (hash.as_bytes()[5] as f64) / 255.0;
+    // Generate same permutation (advances keystream identically to encrypt)
+    let perm = keystream.generate_permutation(encrypted.len());
 
-    let mut rng = StdRng::from_seed(key);
-    
-    // Initialize chaotic systems with identical parameters
-    let chen_x0 = rng.gen_range(-10.0..10.0);
-    let chen_y0 = rng.gen_range(-10.0..10.0);
-    let chen_z0 = rng.gen_range(0.0..30.0);
-    
-    let tent_x0 = f64::from_le_bytes(tent_bytes.try_into().unwrap());
-    let _ = rng.gen_range(0.1..0.9_f64); // advance RNG to stay in sync with encrypt
-
-    let rf_x0 = rng.gen_range(-1.0..1.0);
-    let rf_y0 = rng.gen_range(-1.0..1.0);
-    let rf_z0 = rng.gen_range(0.0..1.0);
-    
-    // Create chaotic systems
-    let mut chen = ChenSystem::new(chen_x0, chen_y0, chen_z0, chen_a, chen_b, chen_c, CHEN_DT);
-    let mut tent = TentMap::new(tent_x0, tent_mu);
-    let mut rf = RabinovichFabrikantSystem::new(rf_x0, rf_y0, rf_z0, rf_alpha, rf_gamma, RF_DT);
-
-    // Warm up the chaotic systems
-    chen_warmup(&mut chen, WARMUP_ITERATIONS);
-    tent_warmup(&mut tent, WARMUP_ITERATIONS);
-    rf_warmup(&mut rf, WARMUP_ITERATIONS);
-    
-    // Evolve the systems
-    chen.evolve();
-    tent.evolve();
-    rf.evolve();
-
-    // First decrypt with ChaCha20
-    let mut cipher = ChaCha20::new((&key).into(), (nonce).into());
+    // Chaotic XOR decryption
     let mut decrypted = encrypted.to_vec();
-    cipher.apply_keystream(&mut decrypted);
+    keystream.apply_keystream(&mut decrypted);
 
-    // Generate the same interlaced chaos sequence
-    let chaos_sequence = interlaced_chaos_sequence(&mut chen, &mut tent, &mut rf, decrypted.len());
-    
-    // Reverse the permutation
-    let unpermuted = inverse_chaotic_permutation(&decrypted, &chaos_sequence);
+    // Inverse permutation
+    let unpermuted = apply_inverse_permutation(&decrypted, &perm);
 
-    key[..].zeroize();
+    // Decompress
     let extension_str = String::from_utf8_lossy(extension).to_string();
     Ok((decompress_data(&unpermuted)?, extension_str))
 }

@@ -8,6 +8,7 @@ pub enum CryptoError {
     InvalidMagicBytes,
     InvalidVersion,
     SystemTimeError,
+    DecompressionTooLarge,
     IoError(io::Error),
 }
 
@@ -26,6 +27,7 @@ impl std::fmt::Display for CryptoError {
             CryptoError::InvalidMagicBytes => write!(f, "Invalid magic bytes. Not an AU79 file."),
             CryptoError::InvalidVersion => write!(f, "Unsupported file version."),
             CryptoError::SystemTimeError => write!(f, "System time error."),
+            CryptoError::DecompressionTooLarge => write!(f, "Decompressed data exceeds maximum allowed size."),
             CryptoError::IoError(e) => write!(f, "IO Error: {}", e),
         }
     }
