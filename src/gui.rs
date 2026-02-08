@@ -5,6 +5,7 @@ use std::time::Instant;
 use std::fs;
 
 use eframe::egui;
+use zeroize::Zeroize;
 use zip::write::SimpleFileOptions;
 
 extern crate au79_crypto;
@@ -733,6 +734,13 @@ impl Au79Gui {
     }
 }
 
+impl Drop for Au79Gui {
+    fn drop(&mut self) {
+        self.password.zeroize();
+        self.confirm_password.zeroize();
+    }
+}
+
 // ── Crypto Helpers (framework-independent) ─────────────────────────────────────
 
 fn encrypt_file(input_path: &Path, output_path: &Path, password: &str) -> Result<String, String> {
@@ -829,16 +837,21 @@ fn extract_archive(data: &[u8], output_dir: &Path) -> Result<usize, String> {
         let mut file = archive
             .by_index(i)
             .map_err(|e| format!("Archive error: {}", e))?;
-        let name = file.name().to_string();
-        // Prevent path traversal
-        if name.contains("..") {
+        let raw_name = file.name().to_string();
+        // Sanitize: strip all path components, keep only the filename.
+        // This prevents path traversal (../../etc/passwd) and absolute paths.
+        let safe_name = Path::new(&raw_name)
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+        if safe_name.is_empty() || safe_name.contains("..") {
             continue;
         }
-        let out_path = output_dir.join(&name);
+        let out_path = output_dir.join(&safe_name);
         let mut out_file = fs::File::create(&out_path)
-            .map_err(|e| format!("Failed to create {}: {}", name, e))?;
+            .map_err(|e| format!("Failed to create {}: {}", safe_name, e))?;
         std::io::copy(&mut file, &mut out_file)
-            .map_err(|e| format!("Failed to extract {}: {}", name, e))?;
+            .map_err(|e| format!("Failed to extract {}: {}", safe_name, e))?;
     }
 
     Ok(count)

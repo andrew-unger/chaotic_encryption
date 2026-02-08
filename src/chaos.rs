@@ -16,24 +16,26 @@ fn logistic_map(x: u64) -> u64 {
 
 /// Fixed-point tent map: approximates mu*min(x, 1-x) with mu=2.
 ///
-/// For x < midpoint: result = 2*x. For x >= midpoint: result = 2*(MAX-x).
-/// Both branches use wrapping multiplication for deterministic overflow.
+/// Branchless implementation to prevent timing side-channels. Uses the MSB
+/// of x to select between ascending (2*x) and descending (2*(MAX-x)) branches
+/// via bitwise masking rather than a conditional branch.
 #[inline]
 fn tent_map(x: u64) -> u64 {
-    let half = u64::MAX / 2;
-    if x <= half {
-        x.wrapping_mul(2)
-    } else {
-        (u64::MAX.wrapping_sub(x)).wrapping_mul(2)
-    }
+    // MSB=0 → ascending branch (x * 2), MSB=1 → descending branch ((MAX-x) * 2)
+    let mask = (x >> 63).wrapping_neg(); // 0x00..00 if MSB=0, 0xFF..FF if MSB=1
+    let ascending = x;
+    let descending = u64::MAX.wrapping_sub(x);
+    let selected = ascending ^ (mask & (ascending ^ descending));
+    selected.wrapping_mul(2)
 }
 
 /// Chaotic keystream generator using integer-arithmetic chaotic maps.
 ///
 /// State consists of 4 x u64 words (256-bit total), updated each round by:
-/// 1. Nonlinear layer: logistic map on words 0,2; tent map on words 1,3
-/// 2. Counter injection to prevent degenerate cycles
-/// 3. Cross-coupling diffusion via wrapping add/XOR with rotated neighbors
+/// 1. Nonlinear substitution: logistic map on words 0,2; tent map on words 1,3
+/// 2. Counter injection on multiple state words to prevent degenerate cycles
+/// 3. ARX cross-coupling for linear diffusion
+/// 4. Multiplicative mixing for quadratic nonlinearity
 ///
 /// All arithmetic is u64/u128 wrapping — results are identical on every platform.
 pub struct ChaoticKeystream {
@@ -55,7 +57,7 @@ impl ChaoticKeystream {
     ///
     /// The key populates the 4 state words directly. The nonce is mixed in
     /// via XOR (both straight and rotated) to provide per-message variation.
-    /// After initialization, 20 warmup rounds are run to thoroughly diffuse
+    /// After initialization, 40 warmup rounds are run to thoroughly diffuse
     /// the key/nonce material through the state.
     pub fn new(key: &[u8; 32], nonce: &[u8; 16]) -> Self {
         let mut state = [
@@ -165,12 +167,26 @@ impl ChaoticKeystream {
         }
     }
 
+    /// Generate an unbiased random value in [0, bound) using rejection sampling.
+    ///
+    /// Uses Lemire's method: reject values below `(2^64 - bound) % bound` to
+    /// eliminate modulo bias entirely. Expected iterations < 2 for any bound.
+    fn bounded_random(&mut self, bound: u64) -> u64 {
+        let threshold = bound.wrapping_neg() % bound;
+        loop {
+            let r = self.next_u64();
+            if r >= threshold {
+                return r % bound;
+            }
+        }
+    }
+
     /// Generate a permutation of `len` elements using Fisher-Yates shuffle
-    /// driven by chaotic keystream output.
+    /// driven by chaotic keystream output with unbiased random selection.
     pub fn generate_permutation(&mut self, len: usize) -> Vec<usize> {
         let mut indices: Vec<usize> = (0..len).collect();
         for i in (1..len).rev() {
-            let j = (self.next_u64() as usize) % (i + 1);
+            let j = self.bounded_random((i + 1) as u64) as usize;
             indices.swap(i, j);
         }
         indices
