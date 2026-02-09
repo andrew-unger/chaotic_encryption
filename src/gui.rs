@@ -11,6 +11,7 @@ use zip::write::SimpleFileOptions;
 extern crate au79_crypto;
 use au79_crypto::crypto::{encrypt, decrypt, validate_password, EncryptOptions, ProgressFn};
 use au79_crypto::error::CryptoError;
+use au79_crypto::utils::{parse_file_info, format_byte_size};
 
 const ARCHIVE_EXTENSION: &str = "au79archive";
 
@@ -241,7 +242,7 @@ impl Au79Gui {
         if !self.input_path.is_empty() {
             if let Ok(meta) = fs::metadata(&self.input_path) {
                 ui.label(
-                    egui::RichText::new(format!("Size: {}", format_file_size(meta.len())))
+                    egui::RichText::new(format!("Size: {}", format_byte_size(meta.len())))
                         .small()
                         .color(egui::Color32::GRAY),
                 );
@@ -309,7 +310,7 @@ impl Au79Gui {
                 egui::RichText::new(format!(
                     "{} file(s)  ({})",
                     self.batch_files.len(),
-                    format_file_size(total_size)
+                    format_byte_size(total_size)
                 ))
                 .color(egui::Color32::GRAY),
             );
@@ -352,7 +353,7 @@ impl Au79Gui {
                                         .map(|n| n.to_string_lossy().to_string())
                                         .unwrap_or_else(|| "???".into());
                                     ui.label(&name);
-                                    ui.label(format_file_size(entry.size));
+                                    ui.label(format_byte_size(entry.size));
                                     if !self.processing {
                                         if ui.small_button("Remove").clicked() {
                                             remove_idx = Some(i);
@@ -905,72 +906,11 @@ fn extract_archive(data: &[u8], output_dir: &Path) -> Result<usize, String> {
 
 fn show_file_info(input_path: &Path) -> Result<String, String> {
     let data = fs::read(input_path).map_err(|e| format!("Failed to read file: {}", e))?;
-
-    if data.len() < 4 || &data[0..4] != b"AU79" {
-        return Err("Not a valid AU79 encrypted file.".into());
-    }
-
-    let version = data[4];
-    let flags = data[5];
-    let mut flag_strs = Vec::new();
-    if flags & 0x01 != 0 { flag_strs.push("STRIP_METADATA"); }
-    if flags & 0x02 != 0 { flag_strs.push("NO_COMPRESS"); }
-    let flags_display = if flag_strs.is_empty() { "none".to_string() } else { flag_strs.join(", ") };
-
-    // v5 header: magic(4) + ver(1) + flags(1) + salt(16) + ts(8) + nonce(16) + argon(3) + ext_len(1) + mac(32)
-    let min_header = 4 + 1 + 1 + 16 + 8 + 16 + 3 + 1 + 32;
-    if data.len() < min_header {
-        return Err("File too short to parse header.".into());
-    }
-
-    let ts_start = 22; // 6 + SALT_LEN(16)
-    let timestamp = u64::from_le_bytes(data[ts_start..ts_start + 8].try_into().unwrap());
-    let argon_start = 46; // ts_start + 8 + NONCE_LEN(16)
-    let m_log2 = data[argon_start];
-    let t_cost = data[argon_start + 1];
-    let p_cost = data[argon_start + 2];
-    let ext_len = data[49] as usize;
-    let ext_start = 50;
-    let extension = if data.len() >= ext_start + ext_len {
-        String::from_utf8_lossy(&data[ext_start..ext_start + ext_len]).to_string()
-    } else {
-        "???".into()
-    };
-
-    let m_cost_mb = (1u64 << m_log2) / 1024;
-    let total_size = format_file_size(data.len() as u64);
-
-    Ok(format!(
-        "Magic:              AU79\n\
-         Version:            {}\n\
-         Flags:              {} ({})\n\
-         Timestamp:          {}\n\
-         Argon2 Memory:      {} MB (2^{} KiB)\n\
-         Argon2 Iterations:  {}\n\
-         Argon2 Parallelism: {}\n\
-         Original Extension: .{}\n\
-         File Size:          {}",
-        version, flags, flags_display, timestamp, m_cost_mb, m_log2, t_cost, p_cost, extension, total_size
-    ))
+    let info = parse_file_info(&data).map_err(|e| format!("{}", e))?;
+    Ok(format!("{}", info))
 }
 
 // ── Utility Functions ──────────────────────────────────────────────────────────
-
-fn format_file_size(bytes: u64) -> String {
-    const KB: f64 = 1024.0;
-    const MB: f64 = 1024.0 * 1024.0;
-    const GB: f64 = 1024.0 * 1024.0 * 1024.0;
-    let b = bytes as f64;
-    if b < KB {
-        format!("{} B", bytes)
-    } else if b < MB {
-        format!("{:.1} KB", b / KB)
-    } else if b < GB {
-        format!("{:.2} MB", b / MB)
-    } else {
-        format!("{:.2} GB", b / GB)
-    }
-}
 
 fn evaluate_password_strength(password: &str) -> PasswordStrength {
     if password.is_empty() {
