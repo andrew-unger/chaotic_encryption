@@ -9,7 +9,7 @@ use zeroize::Zeroize;
 use zip::write::SimpleFileOptions;
 
 extern crate au79_crypto;
-use au79_crypto::crypto::{encrypt, decrypt, validate_password, EncryptOptions};
+use au79_crypto::crypto::{encrypt, decrypt, validate_password, EncryptOptions, ProgressFn};
 use au79_crypto::error::CryptoError;
 
 const ARCHIVE_EXTENSION: &str = "au79archive";
@@ -46,6 +46,7 @@ pub enum PasswordStrength {
 }
 
 pub enum WorkerMessage {
+    Progress(f32),
     Complete(Result<String, String>),
     AllDone,
 }
@@ -676,7 +677,7 @@ impl Au79Gui {
         let (tx, rx) = mpsc::channel();
         self.worker_rx = Some(rx);
         self.processing = true;
-        self.progress = 0.05;
+        self.progress = 0.0;
         self.status_message = "Processing...".into();
         self.status_is_error = false;
         self.file_info_text.clear();
@@ -691,10 +692,17 @@ impl Au79Gui {
             skip_compression: self.skip_compression,
         };
 
+        let progress_tx = tx.clone();
+        let progress_ctx = ctx.clone();
+        let progress_cb: ProgressFn = Box::new(move |v: f32| {
+            let _ = progress_tx.send(WorkerMessage::Progress(v));
+            progress_ctx.request_repaint();
+        });
+
         std::thread::spawn(move || {
             let result = match mode {
-                Mode::Encrypt => encrypt_file(&input_path, &output_path, &password, &options),
-                Mode::Decrypt => decrypt_file(&input_path, &output_path, &password),
+                Mode::Encrypt => encrypt_file(&input_path, &output_path, &password, &options, Some(&progress_cb)),
+                Mode::Decrypt => decrypt_file(&input_path, &output_path, &password, Some(&progress_cb)),
                 Mode::Info => show_file_info(&input_path),
             };
             let _ = tx.send(WorkerMessage::Complete(result));
@@ -707,7 +715,7 @@ impl Au79Gui {
         let (tx, rx) = mpsc::channel();
         self.worker_rx = Some(rx);
         self.processing = true;
-        self.progress = 0.05;
+        self.progress = 0.0;
         self.status_message = "Creating archive...".into();
         self.status_is_error = false;
         self.operation_start = Some(Instant::now());
@@ -720,8 +728,15 @@ impl Au79Gui {
             skip_compression: self.skip_compression,
         };
 
+        let progress_tx = tx.clone();
+        let progress_ctx = ctx.clone();
+        let progress_cb: ProgressFn = Box::new(move |v: f32| {
+            let _ = progress_tx.send(WorkerMessage::Progress(v));
+            progress_ctx.request_repaint();
+        });
+
         std::thread::spawn(move || {
-            let result = encrypt_archive(&files, &output_path, &password, &options);
+            let result = encrypt_archive(&files, &output_path, &password, &options, Some(&progress_cb));
             let _ = tx.send(WorkerMessage::Complete(result));
             let _ = tx.send(WorkerMessage::AllDone);
             ctx.request_repaint();
@@ -733,6 +748,9 @@ impl Au79Gui {
 
         while let Ok(msg) = rx.try_recv() {
             match msg {
+                WorkerMessage::Progress(v) => {
+                    self.progress = v;
+                }
                 WorkerMessage::Complete(result) => match result {
                     Ok(msg) => {
                         self.status_message = msg;
@@ -765,20 +783,22 @@ impl Drop for Au79Gui {
 
 // ── Crypto Helpers (framework-independent) ─────────────────────────────────────
 
-fn encrypt_file(input_path: &Path, output_path: &Path, password: &str, options: &EncryptOptions) -> Result<String, String> {
+fn encrypt_file(input_path: &Path, output_path: &Path, password: &str, options: &EncryptOptions, progress: Option<&ProgressFn>) -> Result<String, String> {
     let data = fs::read(input_path).map_err(|e| format!("Failed to read input: {}", e))?;
-    let result = encrypt(&data, password, &input_path.to_string_lossy(), options)
+    let result = encrypt(&data, password, &input_path.to_string_lossy(), options, progress)
         .map_err(|e| format!("Encryption failed: {}", e))?;
-    fs::write(output_path, result).map_err(|e| format!("Failed to write output: {}", e))?;
+    if let Some(cb) = &progress { cb(0.90); }
+    fs::write(output_path, &result).map_err(|e| format!("Failed to write output: {}", e))?;
+    if let Some(cb) = &progress { cb(1.0); }
     Ok(format!(
         "Encrypted successfully: {}",
         output_path.to_string_lossy()
     ))
 }
 
-fn decrypt_file(input_path: &Path, output_path: &Path, password: &str) -> Result<String, String> {
+fn decrypt_file(input_path: &Path, output_path: &Path, password: &str, progress: Option<&ProgressFn>) -> Result<String, String> {
     let data = fs::read(input_path).map_err(|e| format!("Failed to read input: {}", e))?;
-    let (result, extension) = decrypt(&data, password).map_err(|e| match e {
+    let (result, extension) = decrypt(&data, password, progress).map_err(|e| match e {
         CryptoError::IntegrityCheckFailed => {
             "Wrong password or file is corrupted.".to_string()
         }
@@ -801,21 +821,25 @@ fn decrypt_file(input_path: &Path, output_path: &Path, password: &str) -> Result
         final_output.set_extension(&extension);
     }
 
+    if let Some(cb) = &progress { cb(0.90); }
     fs::write(&final_output, result)
         .map_err(|e| format!("Failed to write output: {}", e))?;
+    if let Some(cb) = &progress { cb(1.0); }
     Ok(format!(
         "Decrypted successfully: {}",
         final_output.to_string_lossy()
     ))
 }
 
-fn encrypt_archive(files: &[PathBuf], output_path: &Path, password: &str, options: &EncryptOptions) -> Result<String, String> {
+fn encrypt_archive(files: &[PathBuf], output_path: &Path, password: &str, options: &EncryptOptions, progress: Option<&ProgressFn>) -> Result<String, String> {
     let archive = create_archive(files)?;
     let filename = format!("archive.{}", ARCHIVE_EXTENSION);
-    let result = encrypt(&archive, password, &filename, options)
+    let result = encrypt(&archive, password, &filename, options, progress)
         .map_err(|e| format!("Encryption failed: {}", e))?;
-    fs::write(output_path, result)
+    if let Some(cb) = &progress { cb(0.90); }
+    fs::write(output_path, &result)
         .map_err(|e| format!("Failed to write output: {}", e))?;
+    if let Some(cb) = &progress { cb(1.0); }
     Ok(format!(
         "Encrypted {} file(s) into {}",
         files.len(),

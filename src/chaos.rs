@@ -184,11 +184,27 @@ impl ChaoticKeystream {
 
     /// Generate a permutation of `len` elements using Fisher-Yates shuffle
     /// driven by chaotic keystream output with unbiased random selection.
-    pub fn generate_permutation(&mut self, len: usize) -> Vec<usize> {
+    ///
+    /// If `progress` is provided, it is called with values in [0.0, 1.0]
+    /// every ~64K iterations to report progress within this phase.
+    pub fn generate_permutation(
+        &mut self,
+        len: usize,
+        progress: Option<&dyn Fn(f32)>,
+    ) -> Vec<usize> {
         let mut indices: Vec<usize> = (0..len).collect();
+        let total = if len > 1 { len - 1 } else { 1 };
         for i in (1..len).rev() {
             let j = self.bounded_random((i + 1) as u64) as usize;
             indices.swap(i, j);
+            if let Some(cb) = &progress {
+                if i % 65536 == 0 {
+                    cb(1.0 - (i as f32 / total as f32));
+                }
+            }
+        }
+        if let Some(cb) = &progress {
+            cb(1.0);
         }
         indices
     }

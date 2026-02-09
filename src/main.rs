@@ -68,7 +68,7 @@ fn main() -> Result<(), CryptoError> {
                 }
             }
 
-            let result = encrypt(&data, password.as_ref().unwrap(), input_file, &options)?;
+            let result = encrypt(&data, password.as_ref().unwrap(), input_file, &options, None)?;
             let mut file = fs::File::create(output_file)?;
             file.write_all(&result)?;
             println!("Encryption completed successfully.");
@@ -86,7 +86,7 @@ fn main() -> Result<(), CryptoError> {
                 return Ok(());
             }
 
-            let (result, extension) = decrypt(&data, password.as_ref().unwrap())?;
+            let (result, extension) = decrypt(&data, password.as_ref().unwrap(), None)?;
             let mut final_output = output_file.clone();
             if !extension.is_empty() {
                 println!("Original file extension detected: .{}", extension);

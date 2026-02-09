@@ -10,6 +10,17 @@ use crate::chaos::{ChaoticKeystream, apply_permutation, apply_inverse_permutatio
 use crate::error::CryptoError;
 use crate::utils::{compress_data, decompress_data};
 
+/// Progress callback type: receives a value in [0.0, 1.0].
+pub type ProgressFn = Box<dyn Fn(f32) + Send>;
+
+/// Call the progress callback if present.
+#[inline]
+fn report(progress: &Option<&ProgressFn>, value: f32) {
+    if let Some(cb) = progress {
+        cb(value);
+    }
+}
+
 // ── Platform-specific memory locking (best-effort) ──────────────────────────
 
 #[cfg(target_os = "windows")]
@@ -179,13 +190,18 @@ pub fn encrypt(
     password: &str,
     input_filename: &str,
     options: &EncryptOptions,
+    progress: Option<&ProgressFn>,
 ) -> Result<Vec<u8>, CryptoError> {
-    // Optionally skip compression
+    let progress = &progress;
+
+    // Phase 1: Compression (0.00 → 0.05)
+    report(progress, 0.0);
     let data = if options.skip_compression {
         plaintext.to_vec()
     } else {
         compress_data(plaintext)?
     };
+    report(progress, 0.05);
 
     // Generate random salt and nonce
     let mut salt = [0u8; SALT_LEN];
@@ -205,7 +221,7 @@ pub fn encrypt(
             .to_le_bytes()
     };
 
-    // Key derivation with explicit Argon2id parameters
+    // Phase 2: Argon2id KDF (0.05 → 0.35)
     let m_log2 = ARGON2_M_LOG2;
     let t_cost = ARGON2_T_COST;
     let p_cost = ARGON2_P_COST;
@@ -216,17 +232,46 @@ pub fn encrypt(
     let (chaos_key_raw, mac_key_raw) = derive_subkeys(master_key.get());
     let chaos_key = LockedBuffer::new(chaos_key_raw);
     let mac_key = LockedBuffer::new(mac_key_raw);
+    report(progress, 0.35);
 
     // Initialize chaotic keystream
     let mut keystream = ChaoticKeystream::new(chaos_key.get(), &nonce);
 
-    // Chaotic permutation (Fisher-Yates driven by keystream)
-    let perm = keystream.generate_permutation(data.len());
+    // Phase 3: Permutation generation (0.35 → 0.60)
+    let perm_progress: Option<Box<dyn Fn(f32)>> = progress.as_ref().map(|cb| {
+        let cb_ref = &**cb;
+        // Safety: the closure borrows cb_ref for the duration of generate_permutation,
+        // which completes before encrypt returns (cb outlives this closure).
+        let cb_ptr = cb_ref as *const dyn Fn(f32);
+        Box::new(move |frac: f32| {
+            (unsafe { &*cb_ptr })(0.35 + frac * 0.25);
+        }) as Box<dyn Fn(f32)>
+    });
+    let perm = keystream.generate_permutation(
+        data.len(),
+        perm_progress.as_ref().map(|b| b.as_ref()),
+    );
     let permuted = apply_permutation(&data, &perm);
+    report(progress, 0.60);
 
-    // Chaotic XOR encryption
+    // Phase 4: XOR keystream (0.60 → 0.85) — process in 64 KB chunks
     let mut ciphertext = permuted;
-    keystream.apply_keystream(&mut ciphertext);
+    const CHUNK: usize = 65536;
+    let total_len = ciphertext.len();
+    if total_len == 0 {
+        // nothing to XOR
+    } else {
+        let mut offset = 0;
+        while offset < total_len {
+            let end = (offset + CHUNK).min(total_len);
+            keystream.apply_keystream(&mut ciphertext[offset..end]);
+            offset = end;
+            if progress.is_some() {
+                let frac = offset as f32 / total_len as f32;
+                report(progress, 0.60 + frac * 0.25);
+            }
+        }
+    }
 
     // Original file extension (optionally stripped)
     let extension = if options.strip_metadata {
@@ -250,7 +295,7 @@ pub fn encrypt(
         flags |= FLAG_NO_COMPRESS;
     }
 
-    // MAC over ALL header fields and ciphertext
+    // Phase 5: MAC + assembly (0.85 → 0.90)
     let mut mac = blake3::Hasher::new_keyed(mac_key.get());
     mac.update(MAGIC);
     mac.update(&[VERSION]);
@@ -284,12 +329,21 @@ pub fn encrypt(
     result.extend_from_slice(&ciphertext);
     result.extend_from_slice(final_mac.as_bytes());
 
+    report(progress, 0.90);
     Ok(result)
 }
 
 // ── Decrypt ──────────────────────────────────────────────────────────────────
 
-pub fn decrypt(ciphertext_bundle: &[u8], password: &str) -> Result<(Vec<u8>, String), CryptoError> {
+pub fn decrypt(
+    ciphertext_bundle: &[u8],
+    password: &str,
+    progress: Option<&ProgressFn>,
+) -> Result<(Vec<u8>, String), CryptoError> {
+    let progress = &progress;
+
+    report(progress, 0.0);
+
     if ciphertext_bundle.len() < MIN_HEADER_LEN {
         return Err(CryptoError::InvalidCiphertextLength);
     }
@@ -333,13 +387,14 @@ pub fn decrypt(ciphertext_bundle: &[u8], password: &str) -> Result<(Vec<u8>, Str
     let encrypted = &ciphertext_bundle[cipher_start..mac_start];
     let stored_mac = &ciphertext_bundle[mac_start..];
 
-    // Key derivation using stored Argon2 parameters
+    // Phase 2: Argon2id KDF (0.05 → 0.35)
     let master_key = LockedBuffer::new(
         derive_key(password, salt, timestamp, m_log2, t_cost, p_cost)?
     );
     let (chaos_key_raw, mac_key_raw) = derive_subkeys(master_key.get());
     let chaos_key = LockedBuffer::new(chaos_key_raw);
     let mac_key = LockedBuffer::new(mac_key_raw);
+    report(progress, 0.35);
 
     // Verify MAC before any decryption
     let mut mac = blake3::Hasher::new_keyed(mac_key.get());
@@ -367,23 +422,50 @@ pub fn decrypt(ciphertext_bundle: &[u8], password: &str) -> Result<(Vec<u8>, Str
         .map_err(|_| CryptoError::InvalidCiphertextLength)?;
     let mut keystream = ChaoticKeystream::new(chaos_key.get(), &nonce);
 
-    // Generate same permutation (advances keystream identically to encrypt)
-    let perm = keystream.generate_permutation(encrypted.len());
+    // Phase 3: Permutation generation (0.35 → 0.60)
+    let perm_progress: Option<Box<dyn Fn(f32)>> = progress.as_ref().map(|cb| {
+        let cb_ref = &**cb;
+        let cb_ptr = cb_ref as *const dyn Fn(f32);
+        Box::new(move |frac: f32| {
+            (unsafe { &*cb_ptr })(0.35 + frac * 0.25);
+        }) as Box<dyn Fn(f32)>
+    });
+    let perm = keystream.generate_permutation(
+        encrypted.len(),
+        perm_progress.as_ref().map(|b| b.as_ref()),
+    );
+    report(progress, 0.60);
 
-    // Chaotic XOR decryption
+    // Phase 4: XOR decryption (0.60 → 0.85) — process in 64 KB chunks
     let mut decrypted = encrypted.to_vec();
-    keystream.apply_keystream(&mut decrypted);
+    const CHUNK: usize = 65536;
+    let total_len = decrypted.len();
+    if total_len == 0 {
+        // nothing to XOR
+    } else {
+        let mut offset = 0;
+        while offset < total_len {
+            let end = (offset + CHUNK).min(total_len);
+            keystream.apply_keystream(&mut decrypted[offset..end]);
+            offset = end;
+            if progress.is_some() {
+                let frac = offset as f32 / total_len as f32;
+                report(progress, 0.60 + frac * 0.25);
+            }
+        }
+    }
 
     // Inverse permutation
     let unpermuted = apply_inverse_permutation(&decrypted, &perm);
 
-    // Optionally skip decompression based on flags
+    // Phase 5: Decompression (0.85 → 0.90)
     let no_compress = (flags & FLAG_NO_COMPRESS) != 0;
     let plaintext = if no_compress {
         unpermuted
     } else {
         decompress_data(&unpermuted)?
     };
+    report(progress, 0.90);
 
     let extension_str = String::from_utf8_lossy(extension).to_string();
     Ok((plaintext, extension_str))
