@@ -2,7 +2,7 @@
 name = "au79-crypto"
 version = "0.1.0"
 edition = "2021"
-authors = ["Andrew Unger"]
+authors = ["Your Name <your.email@example.com>"]
 description = "A custom encryption algorithm with chaotic cryptography"
 
 [lib]
