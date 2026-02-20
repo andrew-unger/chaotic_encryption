@@ -6,7 +6,7 @@ use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 use zeroize::Zeroize;
 
-use crate::chaos::{ChaoticKeystream, apply_permutation, apply_inverse_permutation};
+use crate::chaos::{ChaoticKeystream, apply_permutation_in_place, apply_inverse_permutation_in_place};
 use crate::error::CryptoError;
 use crate::utils::{compress_data, decompress_data};
 
@@ -251,11 +251,12 @@ pub fn encrypt(
         data.len(),
         perm_progress.as_ref().map(|b| b.as_ref()),
     );
-    let permuted = apply_permutation(&data, &perm);
+    let mut ciphertext = data;
+    apply_permutation_in_place(&mut ciphertext, &perm);
+    drop(perm); // Free 8*n bytes immediately
     report(progress, 0.60);
 
     // Phase 4: XOR keystream (0.60 → 0.85) — process in 64 KB chunks
-    let mut ciphertext = permuted;
     const CHUNK: usize = 65536;
     let total_len = ciphertext.len();
     if total_len == 0 {
@@ -455,15 +456,16 @@ pub fn decrypt(
         }
     }
 
-    // Inverse permutation
-    let unpermuted = apply_inverse_permutation(&decrypted, &perm);
+    // Inverse permutation (in-place)
+    apply_inverse_permutation_in_place(&mut decrypted, &perm);
+    drop(perm); // Free 8*n bytes immediately
 
     // Phase 5: Decompression (0.85 → 0.90)
     let no_compress = (flags & FLAG_NO_COMPRESS) != 0;
     let plaintext = if no_compress {
-        unpermuted
+        decrypted
     } else {
-        decompress_data(&unpermuted)?
+        decompress_data(&decrypted)?
     };
     report(progress, 0.90);
 

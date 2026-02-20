@@ -141,28 +141,50 @@ impl ChaoticKeystream {
     }
 
     /// XOR the chaotic keystream onto `data` in place.
+    ///
+    /// Uses u64-wide XOR with 4x loop unrolling for better instruction
+    /// pipelining. Keystream consumption order is identical to byte-by-byte
+    /// XOR, so output is bit-for-bit identical.
     pub fn apply_keystream(&mut self, data: &mut [u8]) {
-        // Process 8 bytes at a time for efficiency
-        let chunks = data.len() / 8;
-        let remainder = data.len() % 8;
+        let len = data.len();
+        let full_blocks = len / 32; // 4 x u64 = 32 bytes per iteration
+        let remaining_u64s = (len % 32) / 8;
+        let tail_bytes = len % 8;
 
-        for i in 0..chunks {
-            let ks = self.next_u64().to_le_bytes();
-            let offset = i * 8;
-            data[offset] ^= ks[0];
-            data[offset + 1] ^= ks[1];
-            data[offset + 2] ^= ks[2];
-            data[offset + 3] ^= ks[3];
-            data[offset + 4] ^= ks[4];
-            data[offset + 5] ^= ks[5];
-            data[offset + 6] ^= ks[6];
-            data[offset + 7] ^= ks[7];
+        let mut offset = 0;
+
+        // Main loop: 32 bytes (4 x u64) per iteration
+        for _ in 0..full_blocks {
+            let ks0 = self.next_u64();
+            let ks1 = self.next_u64();
+            let ks2 = self.next_u64();
+            let ks3 = self.next_u64();
+
+            let b0 = u64::from_le_bytes(data[offset..offset + 8].try_into().unwrap());
+            let b1 = u64::from_le_bytes(data[offset + 8..offset + 16].try_into().unwrap());
+            let b2 = u64::from_le_bytes(data[offset + 16..offset + 24].try_into().unwrap());
+            let b3 = u64::from_le_bytes(data[offset + 24..offset + 32].try_into().unwrap());
+
+            data[offset..offset + 8].copy_from_slice(&(b0 ^ ks0).to_le_bytes());
+            data[offset + 8..offset + 16].copy_from_slice(&(b1 ^ ks1).to_le_bytes());
+            data[offset + 16..offset + 24].copy_from_slice(&(b2 ^ ks2).to_le_bytes());
+            data[offset + 24..offset + 32].copy_from_slice(&(b3 ^ ks3).to_le_bytes());
+
+            offset += 32;
         }
 
-        if remainder > 0 {
+        // Handle remaining full u64s
+        for _ in 0..remaining_u64s {
+            let ks = self.next_u64();
+            let block = u64::from_le_bytes(data[offset..offset + 8].try_into().unwrap());
+            data[offset..offset + 8].copy_from_slice(&(block ^ ks).to_le_bytes());
+            offset += 8;
+        }
+
+        // Handle tail bytes (< 8)
+        if tail_bytes > 0 {
             let ks = self.next_u64().to_le_bytes();
-            let offset = chunks * 8;
-            for j in 0..remainder {
+            for j in 0..tail_bytes {
                 data[offset + j] ^= ks[j];
             }
         }
@@ -193,19 +215,26 @@ impl ChaoticKeystream {
         progress: Option<&dyn Fn(f32)>,
     ) -> Vec<usize> {
         let mut indices: Vec<usize> = (0..len).collect();
-        let total = if len > 1 { len - 1 } else { 1 };
-        for i in (1..len).rev() {
-            let j = self.bounded_random((i + 1) as u64) as usize;
-            indices.swap(i, j);
-            if let Some(cb) = &progress {
+
+        if let Some(cb) = progress {
+            // Hot path with progress reporting
+            let total = if len > 1 { len - 1 } else { 1 };
+            for i in (1..len).rev() {
+                let j = self.bounded_random((i + 1) as u64) as usize;
+                indices.swap(i, j);
                 if i % 65536 == 0 {
                     cb(1.0 - (i as f32 / total as f32));
                 }
             }
-        }
-        if let Some(cb) = &progress {
             cb(1.0);
+        } else {
+            // Hot path without progress — no Option check or modulo per iteration
+            for i in (1..len).rev() {
+                let j = self.bounded_random((i + 1) as u64) as usize;
+                indices.swap(i, j);
+            }
         }
+
         indices
     }
 }
@@ -230,4 +259,71 @@ pub fn apply_inverse_permutation(data: &[u8], perm: &[usize]) -> Vec<u8> {
         result[orig_idx] = data[i];
     }
     result
+}
+
+/// Apply a permutation in-place via cycle-following: result[i] = original[perm[i]].
+///
+/// Decomposes the permutation into disjoint cycles and rotates elements along
+/// each cycle using a single temporary byte. Allocates only a bitvec of n/8
+/// bytes to track visited indices, instead of a full n-byte copy.
+pub fn apply_permutation_in_place(data: &mut [u8], perm: &[usize]) {
+    let n = data.len();
+    debug_assert_eq!(n, perm.len());
+
+    let mut visited = vec![0u8; (n + 7) / 8];
+
+    for start in 0..n {
+        if visited[start / 8] & (1 << (start % 8)) != 0 || perm[start] == start {
+            visited[start / 8] |= 1 << (start % 8);
+            continue;
+        }
+
+        // Walk the cycle: data[dst] ← data[perm[dst]] until the cycle closes
+        let saved = data[start];
+        let mut dst = start;
+        loop {
+            let src = perm[dst];
+            visited[dst / 8] |= 1 << (dst % 8);
+            if src == start {
+                data[dst] = saved;
+                break;
+            }
+            data[dst] = data[src];
+            dst = src;
+        }
+    }
+}
+
+/// Apply the inverse of a permutation in-place via cycle-following.
+///
+/// For inverse permutation: result[perm[i]] = original[i]. In cycle notation,
+/// the inverse reverses the direction of element movement along each cycle.
+pub fn apply_inverse_permutation_in_place(data: &mut [u8], perm: &[usize]) {
+    let n = data.len();
+    debug_assert_eq!(n, perm.len());
+
+    let mut visited = vec![0u8; (n + 7) / 8];
+
+    for start in 0..n {
+        if visited[start / 8] & (1 << (start % 8)) != 0 || perm[start] == start {
+            visited[start / 8] |= 1 << (start % 8);
+            continue;
+        }
+
+        // Walk the cycle forward, moving values to their perm[i] targets
+        let mut saved = data[start];
+        let mut current = start;
+        loop {
+            visited[current / 8] |= 1 << (current % 8);
+            let target = perm[current];
+            if target == start {
+                data[start] = saved;
+                break;
+            }
+            let next_saved = data[target];
+            data[target] = saved;
+            saved = next_saved;
+            current = target;
+        }
+    }
 }
