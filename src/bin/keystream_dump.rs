@@ -20,10 +20,10 @@ fn main() {
         0
     };
 
-    let mut seed_material = b"chaotic keystream statistical evaluation seed v7".to_vec();
+    let mut seed_material = b"chaotic keystream statistical evaluation seed v8".to_vec();
     seed_material.push(seed_index);
 
-    let key = blake3::derive_key("au79-crypto.practrand.test.key.v7", &seed_material);
+    let key = blake3::derive_key("au79-crypto.practrand.test.key.v8", &seed_material);
     let nonce = [0u8; 16];
 
     let mut ks = ChaoticKeystream::new(&key, &nonce);

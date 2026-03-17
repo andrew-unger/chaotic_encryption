@@ -9,10 +9,10 @@ const SEED_COUNT: usize = 50;
 const SAMPLE_SIZE: usize = 1_000_000; // 1 MB per seed
 
 fn generate_keystream(seed_index: u8) -> Vec<u8> {
-    let mut seed_material = b"au79-crypto.ci.multi-seed.v7".to_vec();
+    let mut seed_material = b"au79-crypto.ci.multi-seed.v8".to_vec();
     seed_material.push(seed_index);
 
-    let key = blake3::derive_key("au79-crypto.multi-seed.test.v7", &seed_material);
+    let key = blake3::derive_key("au79-crypto.multi-seed.test.v8", &seed_material);
     let nonce = [0u8; 16];
     let mut ks = ChaoticKeystream::new(&key, &nonce);
 

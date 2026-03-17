@@ -26,6 +26,62 @@ fn tent_map(x: u64) -> u64 {
     selected.wrapping_mul(2)
 }
 
+/// One round of the 512-bit chaotic state update, operating on a borrowed
+/// state array and Weyl counter. Extracted as a free function so that
+/// `apply_keystream` can interleave two independent block computations
+/// with no data dependencies between them, enabling CPU-level parallelism.
+///
+/// See `ChaoticKeystream` for full round documentation.
+#[inline(always)]
+fn round_fn(s: &mut [u64; 8], counter: &mut u64) {
+    // 1. Nonlinear substitution — inverted map assignment between halves
+    s[0] = logistic_map(s[0]); // lower: logistic on even
+    s[1] = tent_map(s[1]);     // lower: tent on odd
+    s[2] = logistic_map(s[2]);
+    s[3] = tent_map(s[3]);
+    s[4] = tent_map(s[4]);     // upper: tent on even (inverted)
+    s[5] = logistic_map(s[5]); // upper: logistic on odd (inverted)
+    s[6] = tent_map(s[6]);
+    s[7] = logistic_map(s[7]);
+
+    // 2. Counter injection into all 4 even-indexed words
+    *counter = counter.wrapping_add(GOLDEN);
+    s[0] = s[0].wrapping_add(*counter);
+    s[2] = s[2].wrapping_add(counter.rotate_left(16));
+    s[4] = s[4].wrapping_add(counter.rotate_left(32));
+    s[6] = s[6].wrapping_add(counter.rotate_left(48));
+
+    // 3a. ARX Layer A — within each half
+    // Rotations (primes): lower half {17, 31, 47, 5}, upper half {13, 23, 37, 11}
+    s[0] = s[0].wrapping_add(s[1].rotate_left(17));
+    s[1] ^= s[2].rotate_left(31);
+    s[2] = s[2].wrapping_add(s[3].rotate_left(47));
+    s[3] ^= s[0].rotate_left(5);
+
+    s[4] = s[4].wrapping_add(s[5].rotate_left(13));
+    s[5] ^= s[6].rotate_left(23);
+    s[6] = s[6].wrapping_add(s[7].rotate_left(37));
+    s[7] ^= s[4].rotate_left(11);
+
+    // 3b. ARX Layer B — cross-half coupling
+    // After this step every word depends on all 512 state bits.
+    // Rotations (primes): {29, 43, 7, 19, 41, 53, 3, 61}
+    s[0] = s[0].wrapping_add(s[6].rotate_left(29));
+    s[1] ^= s[7].rotate_left(43);
+    s[2] = s[2].wrapping_add(s[4].rotate_left(7));
+    s[3] ^= s[5].rotate_left(19);
+    s[4] = s[4].wrapping_add(s[2].rotate_left(41));
+    s[5] ^= s[3].rotate_left(53);
+    s[6] = s[6].wrapping_add(s[0].rotate_left(3));
+    s[7] ^= s[1].rotate_left(61);
+
+    // 4. Multiplicative mixing — all 4 adjacent pairs
+    s[1] = s[1].wrapping_mul(s[0] | 1);
+    s[3] = s[3].wrapping_mul(s[2] | 1);
+    s[5] = s[5].wrapping_mul(s[4] | 1);
+    s[7] = s[7].wrapping_mul(s[6] | 1);
+}
+
 /// Chaotic keystream generator with integer-arithmetic logistic and tent maps.
 ///
 /// ## Design
@@ -35,6 +91,23 @@ fn tent_map(x: u64) -> u64 {
 /// sleeve constants (fractional parts of √2, √3, √5, √7 — same source as SHA-512's
 /// initial hash values) XOR'd with the nonce, providing a known, publicly-verifiable
 /// second half with no hidden trapdoors.
+///
+/// ## Counter-mode block generation
+///
+/// After the 80-round warmup, `state` and `counter` are frozen as the base state.
+/// Each block is generated independently:
+///
+/// 1. Copy base `state` to a local working copy.
+/// 2. Inject the block counter into `working[0]` and `working[4]` (wrapping_add),
+///    making each block's starting state unique.
+/// 3. Run 20 rounds with a block-local Weyl counter seeded from the base counter.
+/// 4. Output: `working[i] + pre[i]` for all i (ChaCha20-style).
+/// 5. Increment the block counter.
+///
+/// Because blocks are independent, `apply_keystream` processes two 64-byte blocks
+/// simultaneously by interleaving their round computations. The two streams have no
+/// data dependencies, so the CPU's out-of-order execution runs them in parallel,
+/// approximately halving keystream generation time.
 ///
 /// **Round function:** Each round applies:
 /// 1. Nonlinear chaotic maps (logistic/tent, inverted assignment between halves)
@@ -56,6 +129,7 @@ fn tent_map(x: u64) -> u64 {
 pub struct ChaoticKeystream {
     state: [u64; 8],
     counter: u64,
+    block_counter: u64,
 }
 
 /// Golden ratio constant (fractional part of φ×2^64) for the Weyl counter sequence.
@@ -84,7 +158,9 @@ impl ChaoticKeystream {
     /// The constants provide a non-zero, publicly-auditable upper half so that
     /// a zero key does not create a degenerate initial state.
     ///
-    /// After loading, 80 warmup rounds fully diffuse all 512 bits.
+    /// After loading, 80 warmup rounds fully diffuse all 512 bits. The resulting
+    /// `state` and `counter` are then frozen as the base state for all subsequent
+    /// block generation; only `block_counter` advances during keystream output.
     pub fn new(key: &[u8; 32], nonce: &[u8; 16]) -> Self {
         let n0 = u64::from_le_bytes(nonce[0..8].try_into().unwrap());
         let n1 = u64::from_le_bytes(nonce[8..16].try_into().unwrap());
@@ -110,13 +186,13 @@ impl ChaoticKeystream {
             }
         }
 
-        let mut ks = Self { state, counter: 0 };
+        let mut ks = Self { state, counter: 0, block_counter: 0 };
 
         // 80 warmup rounds — 4 full fill_block equivalents.
         // Full 512-bit avalanche is achieved in 1 round; 80 rounds erases all
         // initial state structure with a vast safety margin.
         for _ in 0..80 {
-            ks.round();
+            ks.warmup_round();
         }
 
         // Post-warmup zero guard. Uses counter to distinguish rescued positions.
@@ -126,149 +202,180 @@ impl ChaoticKeystream {
             }
         }
 
+        // state and counter are now frozen as the base state.
+        // block_counter starts at 0 and increments per block.
         ks
     }
 
-    /// One round of the 512-bit chaotic state update.
-    ///
-    /// ## Structure
-    ///
-    /// **Step 1 — Nonlinear substitution:**
-    /// Lower half (words 0–3): logistic on even indices, tent on odd.
-    /// Upper half (words 4–7): tent on even indices, logistic on odd.
-    /// Inverting the map assignment between halves ensures each word experiences
-    /// both maps across consecutive rounds, breaking any algebraic symmetry.
-    ///
-    /// **Step 2 — Counter injection (Weyl sequence):**
-    /// Additive injection into all 4 even-indexed words with distinct rotations
-    /// of the same counter value (0, 16, 32, 48 bits). `wrapping_add` is
-    /// strictly stronger than XOR: it is injective for all counter values and
-    /// cannot produce zero from a non-zero input.
-    ///
-    /// **Step 3 — Two-layer butterfly ARX:**
-    /// Layer A mixes within each half independently.
-    /// Layer B mixes across halves (cross-coupling).
-    /// After Layer B, every word depends on all 512 state bits (full avalanche
-    /// in a single round). The 16 rotation constants are the first 16 primes ≥ 3:
-    /// Layer A: {17, 31, 47, 5, 13, 23, 37, 11}
-    /// Layer B: {29, 43, 7, 19, 41, 53, 3, 61}
-    /// All are odd (full 64-bit cycle length) and coprime to 64.
-    ///
-    /// **Step 4 — Multiplicative mixing:**
-    /// All 4 adjacent pairs receive wrapping multiplication. `| 1` ensures odd
-    /// multipliers, preventing information collapse to zero.
+    /// One warmup round — mutates self.state and self.counter in place.
+    /// Only called during initialization; not used during keystream generation.
     #[inline(always)]
-    fn round(&mut self) {
-        // 1. Nonlinear substitution — inverted map assignment between halves
-        self.state[0] = logistic_map(self.state[0]); // lower: logistic on even
-        self.state[1] = tent_map(self.state[1]);      // lower: tent on odd
-        self.state[2] = logistic_map(self.state[2]);
-        self.state[3] = tent_map(self.state[3]);
-        self.state[4] = tent_map(self.state[4]);      // upper: tent on even
-        self.state[5] = logistic_map(self.state[5]);  // upper: logistic on odd
-        self.state[6] = tent_map(self.state[6]);
-        self.state[7] = logistic_map(self.state[7]);
-
-        // 2. Counter injection into all 4 even-indexed words
-        self.counter = self.counter.wrapping_add(GOLDEN);
-        self.state[0] = self.state[0].wrapping_add(self.counter);
-        self.state[2] = self.state[2].wrapping_add(self.counter.rotate_left(16));
-        self.state[4] = self.state[4].wrapping_add(self.counter.rotate_left(32));
-        self.state[6] = self.state[6].wrapping_add(self.counter.rotate_left(48));
-
-        // 3a. ARX Layer A — within each half
-        // Rotations (primes): lower half {17, 31, 47, 5}, upper half {13, 23, 37, 11}
-        self.state[0] = self.state[0].wrapping_add(self.state[1].rotate_left(17));
-        self.state[1] ^= self.state[2].rotate_left(31);
-        self.state[2] = self.state[2].wrapping_add(self.state[3].rotate_left(47));
-        self.state[3] ^= self.state[0].rotate_left(5);
-
-        self.state[4] = self.state[4].wrapping_add(self.state[5].rotate_left(13));
-        self.state[5] ^= self.state[6].rotate_left(23);
-        self.state[6] = self.state[6].wrapping_add(self.state[7].rotate_left(37));
-        self.state[7] ^= self.state[4].rotate_left(11);
-
-        // 3b. ARX Layer B — cross-half coupling
-        // After this step every word depends on all 512 state bits.
-        // Rotations (primes): {29, 43, 7, 19, 41, 53, 3, 61}
-        self.state[0] = self.state[0].wrapping_add(self.state[6].rotate_left(29));
-        self.state[1] ^= self.state[7].rotate_left(43);
-        self.state[2] = self.state[2].wrapping_add(self.state[4].rotate_left(7));
-        self.state[3] ^= self.state[5].rotate_left(19);
-        self.state[4] = self.state[4].wrapping_add(self.state[2].rotate_left(41));
-        self.state[5] ^= self.state[3].rotate_left(53);
-        self.state[6] = self.state[6].wrapping_add(self.state[0].rotate_left(3));
-        self.state[7] ^= self.state[1].rotate_left(61);
-
-        // 4. Multiplicative mixing — all 4 adjacent pairs
-        self.state[1] = self.state[1].wrapping_mul(self.state[0] | 1);
-        self.state[3] = self.state[3].wrapping_mul(self.state[2] | 1);
-        self.state[5] = self.state[5].wrapping_mul(self.state[4] | 1);
-        self.state[7] = self.state[7].wrapping_mul(self.state[6] | 1);
+    fn warmup_round(&mut self) {
+        round_fn(&mut self.state, &mut self.counter);
     }
 
-    /// Run 20 rounds and return 512 bits (8×u64) of keystream.
+    /// Generate one 64-byte block from the base state and the current block counter.
     ///
-    /// ChaCha20-style output: `block[i] = post_round[i] + pre_round[i]`.
-    /// The pre-round state (unknown to an adversary without the key) blinds the
-    /// output: solving `out = post + pre` requires knowing both terms independently,
-    /// making the output function one-way even given known keystream.
-    ///
-    /// Throughput: 64 bytes per 20 rounds = 3.2 bytes/round.
-    /// Same ratio as ChaCha20/20 (the standard for conservative stream ciphers).
+    /// Each block is fully independent: copying the base state, injecting the
+    /// block counter, running 20 rounds, then adding pre+post. This matches
+    /// ChaCha20's counter-mode construction and enables parallel block generation.
     #[inline(always)]
     fn fill_block(&mut self) -> [u64; 8] {
-        let s = self.state;
+        let bc = self.block_counter;
+        let mut s = self.state;
+        s[0] = s[0].wrapping_add(bc);
+        s[4] = s[4].wrapping_add(bc.rotate_left(32));
+        let pre = s;
+        let mut weyl = self.counter;
         for _ in 0..20 {
-            self.round();
+            round_fn(&mut s, &mut weyl);
         }
+        self.block_counter = self.block_counter.wrapping_add(1);
         [
-            self.state[0].wrapping_add(s[0]),
-            self.state[1].wrapping_add(s[1]),
-            self.state[2].wrapping_add(s[2]),
-            self.state[3].wrapping_add(s[3]),
-            self.state[4].wrapping_add(s[4]),
-            self.state[5].wrapping_add(s[5]),
-            self.state[6].wrapping_add(s[6]),
-            self.state[7].wrapping_add(s[7]),
+            s[0].wrapping_add(pre[0]),
+            s[1].wrapping_add(pre[1]),
+            s[2].wrapping_add(pre[2]),
+            s[3].wrapping_add(pre[3]),
+            s[4].wrapping_add(pre[4]),
+            s[5].wrapping_add(pre[5]),
+            s[6].wrapping_add(pre[6]),
+            s[7].wrapping_add(pre[7]),
         ]
+    }
+
+    /// Generate two 64-byte blocks simultaneously by interleaving round computations.
+    ///
+    /// Blocks A and B are independent (different block counter values), so their
+    /// round computations have no data dependencies. The CPU's out-of-order execution
+    /// can issue instructions from both streams simultaneously, approximately halving
+    /// the time compared to two sequential fill_block calls.
+    #[inline(always)]
+    fn fill_two_blocks(&mut self) -> ([u64; 8], [u64; 8]) {
+        let bc0 = self.block_counter;
+        let bc1 = self.block_counter.wrapping_add(1);
+
+        let mut a = self.state;
+        a[0] = a[0].wrapping_add(bc0);
+        a[4] = a[4].wrapping_add(bc0.rotate_left(32));
+        let pre_a = a;
+        let mut wa = self.counter;
+
+        let mut b = self.state;
+        b[0] = b[0].wrapping_add(bc1);
+        b[4] = b[4].wrapping_add(bc1.rotate_left(32));
+        let pre_b = b;
+        let mut wb = self.counter;
+
+        for _ in 0..20 {
+            round_fn(&mut a, &mut wa);
+            round_fn(&mut b, &mut wb);
+        }
+
+        self.block_counter = self.block_counter.wrapping_add(2);
+
+        (
+            [
+                a[0].wrapping_add(pre_a[0]),
+                a[1].wrapping_add(pre_a[1]),
+                a[2].wrapping_add(pre_a[2]),
+                a[3].wrapping_add(pre_a[3]),
+                a[4].wrapping_add(pre_a[4]),
+                a[5].wrapping_add(pre_a[5]),
+                a[6].wrapping_add(pre_a[6]),
+                a[7].wrapping_add(pre_a[7]),
+            ],
+            [
+                b[0].wrapping_add(pre_b[0]),
+                b[1].wrapping_add(pre_b[1]),
+                b[2].wrapping_add(pre_b[2]),
+                b[3].wrapping_add(pre_b[3]),
+                b[4].wrapping_add(pre_b[4]),
+                b[5].wrapping_add(pre_b[5]),
+                b[6].wrapping_add(pre_b[6]),
+                b[7].wrapping_add(pre_b[7]),
+            ],
+        )
     }
 
     /// XOR the chaotic keystream onto `data` in place.
     ///
-    /// Processes 64-byte blocks via u64-wide read-XOR-write (8 instructions per block).
-    /// The inner loop is structured for compiler auto-vectorization to SSE2/AVX2
-    /// where available.
+    /// Processes 128-byte pairs via `fill_two_blocks` (two independent blocks
+    /// interleaved for CPU-level parallelism), then handles any remaining
+    /// 64-byte block and final partial block.
     pub fn apply_keystream(&mut self, data: &mut [u8]) {
-        let mut chunks = data.chunks_exact_mut(64);
-        for chunk in chunks.by_ref() {
-            let [w0, w1, w2, w3, w4, w5, w6, w7] = self.fill_block();
-            let a0 = u64::from_le_bytes(chunk[0..8].try_into().unwrap()) ^ w0;
-            let a1 = u64::from_le_bytes(chunk[8..16].try_into().unwrap()) ^ w1;
-            let a2 = u64::from_le_bytes(chunk[16..24].try_into().unwrap()) ^ w2;
-            let a3 = u64::from_le_bytes(chunk[24..32].try_into().unwrap()) ^ w3;
-            let a4 = u64::from_le_bytes(chunk[32..40].try_into().unwrap()) ^ w4;
-            let a5 = u64::from_le_bytes(chunk[40..48].try_into().unwrap()) ^ w5;
-            let a6 = u64::from_le_bytes(chunk[48..56].try_into().unwrap()) ^ w6;
-            let a7 = u64::from_le_bytes(chunk[56..64].try_into().unwrap()) ^ w7;
-            chunk[0..8].copy_from_slice(&a0.to_le_bytes());
-            chunk[8..16].copy_from_slice(&a1.to_le_bytes());
-            chunk[16..24].copy_from_slice(&a2.to_le_bytes());
-            chunk[24..32].copy_from_slice(&a3.to_le_bytes());
-            chunk[32..40].copy_from_slice(&a4.to_le_bytes());
-            chunk[40..48].copy_from_slice(&a5.to_le_bytes());
-            chunk[48..56].copy_from_slice(&a6.to_le_bytes());
-            chunk[56..64].copy_from_slice(&a7.to_le_bytes());
+        // Process 128-byte (2-block) chunks with parallel block generation
+        let mut chunks128 = data.chunks_exact_mut(128);
+        for chunk in chunks128.by_ref() {
+            let ([a0, a1, a2, a3, a4, a5, a6, a7], [b0, b1, b2, b3, b4, b5, b6, b7]) =
+                self.fill_two_blocks();
+
+            let x0 = u64::from_le_bytes(chunk[0..8].try_into().unwrap()) ^ a0;
+            let x1 = u64::from_le_bytes(chunk[8..16].try_into().unwrap()) ^ a1;
+            let x2 = u64::from_le_bytes(chunk[16..24].try_into().unwrap()) ^ a2;
+            let x3 = u64::from_le_bytes(chunk[24..32].try_into().unwrap()) ^ a3;
+            let x4 = u64::from_le_bytes(chunk[32..40].try_into().unwrap()) ^ a4;
+            let x5 = u64::from_le_bytes(chunk[40..48].try_into().unwrap()) ^ a5;
+            let x6 = u64::from_le_bytes(chunk[48..56].try_into().unwrap()) ^ a6;
+            let x7 = u64::from_le_bytes(chunk[56..64].try_into().unwrap()) ^ a7;
+            chunk[0..8].copy_from_slice(&x0.to_le_bytes());
+            chunk[8..16].copy_from_slice(&x1.to_le_bytes());
+            chunk[16..24].copy_from_slice(&x2.to_le_bytes());
+            chunk[24..32].copy_from_slice(&x3.to_le_bytes());
+            chunk[32..40].copy_from_slice(&x4.to_le_bytes());
+            chunk[40..48].copy_from_slice(&x5.to_le_bytes());
+            chunk[48..56].copy_from_slice(&x6.to_le_bytes());
+            chunk[56..64].copy_from_slice(&x7.to_le_bytes());
+
+            let y0 = u64::from_le_bytes(chunk[64..72].try_into().unwrap()) ^ b0;
+            let y1 = u64::from_le_bytes(chunk[72..80].try_into().unwrap()) ^ b1;
+            let y2 = u64::from_le_bytes(chunk[80..88].try_into().unwrap()) ^ b2;
+            let y3 = u64::from_le_bytes(chunk[88..96].try_into().unwrap()) ^ b3;
+            let y4 = u64::from_le_bytes(chunk[96..104].try_into().unwrap()) ^ b4;
+            let y5 = u64::from_le_bytes(chunk[104..112].try_into().unwrap()) ^ b5;
+            let y6 = u64::from_le_bytes(chunk[112..120].try_into().unwrap()) ^ b6;
+            let y7 = u64::from_le_bytes(chunk[120..128].try_into().unwrap()) ^ b7;
+            chunk[64..72].copy_from_slice(&y0.to_le_bytes());
+            chunk[72..80].copy_from_slice(&y1.to_le_bytes());
+            chunk[80..88].copy_from_slice(&y2.to_le_bytes());
+            chunk[88..96].copy_from_slice(&y3.to_le_bytes());
+            chunk[96..104].copy_from_slice(&y4.to_le_bytes());
+            chunk[104..112].copy_from_slice(&y5.to_le_bytes());
+            chunk[112..120].copy_from_slice(&y6.to_le_bytes());
+            chunk[120..128].copy_from_slice(&y7.to_le_bytes());
         }
+
+        // Handle remaining 64-127 bytes: one full block
+        let rem = chunks128.into_remainder();
+        let mut chunks64 = rem.chunks_exact_mut(64);
+        if let Some(chunk) = chunks64.next() {
+            let [w0, w1, w2, w3, w4, w5, w6, w7] = self.fill_block();
+            let z0 = u64::from_le_bytes(chunk[0..8].try_into().unwrap()) ^ w0;
+            let z1 = u64::from_le_bytes(chunk[8..16].try_into().unwrap()) ^ w1;
+            let z2 = u64::from_le_bytes(chunk[16..24].try_into().unwrap()) ^ w2;
+            let z3 = u64::from_le_bytes(chunk[24..32].try_into().unwrap()) ^ w3;
+            let z4 = u64::from_le_bytes(chunk[32..40].try_into().unwrap()) ^ w4;
+            let z5 = u64::from_le_bytes(chunk[40..48].try_into().unwrap()) ^ w5;
+            let z6 = u64::from_le_bytes(chunk[48..56].try_into().unwrap()) ^ w6;
+            let z7 = u64::from_le_bytes(chunk[56..64].try_into().unwrap()) ^ w7;
+            chunk[0..8].copy_from_slice(&z0.to_le_bytes());
+            chunk[8..16].copy_from_slice(&z1.to_le_bytes());
+            chunk[16..24].copy_from_slice(&z2.to_le_bytes());
+            chunk[24..32].copy_from_slice(&z3.to_le_bytes());
+            chunk[32..40].copy_from_slice(&z4.to_le_bytes());
+            chunk[40..48].copy_from_slice(&z5.to_le_bytes());
+            chunk[48..56].copy_from_slice(&z6.to_le_bytes());
+            chunk[56..64].copy_from_slice(&z7.to_le_bytes());
+        }
+
         // Handle final partial block (0–63 bytes)
-        let rem = chunks.into_remainder();
-        if !rem.is_empty() {
+        let tail = chunks64.into_remainder();
+        if !tail.is_empty() {
             let block = self.fill_block();
             let mut keyblock = [0u8; 64];
             for (i, &word) in block.iter().enumerate() {
                 keyblock[i * 8..(i + 1) * 8].copy_from_slice(&word.to_le_bytes());
             }
-            for (d, k) in rem.iter_mut().zip(keyblock.iter()) {
+            for (d, k) in tail.iter_mut().zip(keyblock.iter()) {
                 *d ^= k;
             }
         }
@@ -279,5 +386,6 @@ impl Drop for ChaoticKeystream {
     fn drop(&mut self) {
         self.state.zeroize();
         self.counter.zeroize();
+        self.block_counter.zeroize();
     }
 }
