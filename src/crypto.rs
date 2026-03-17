@@ -85,7 +85,7 @@ impl Drop for LockedBuffer {
 // ── Constants ────────────────────────────────────────────────────────────────
 
 pub mod constants {
-    pub const VERSION: u8 = 6;
+    pub const VERSION: u8 = 7;
     pub const MAGIC: &[u8; 4] = b"AU79";
     pub const SALT_LEN: usize = 16;
     pub const HASH_LEN: usize = 32;
@@ -173,8 +173,8 @@ fn derive_key(
 
 fn derive_subkeys(master_key: &[u8; 32]) -> ([u8; 32], [u8; 32]) {
     // Version-locked context strings prevent cross-version key confusion
-    let chaos_key = blake3::derive_key("au79-crypto.v6.chaos", master_key);
-    let mac_key = blake3::derive_key("au79-crypto.v6.mac", master_key);
+    let chaos_key = blake3::derive_key("au79-crypto.v7.chaos", master_key);
+    let mac_key = blake3::derive_key("au79-crypto.v7.mac", master_key);
     (chaos_key, mac_key)
 }
 
