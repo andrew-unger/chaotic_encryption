@@ -9,6 +9,7 @@ pub enum CryptoError {
     InvalidVersion,
     SystemTimeError,
     DecompressionTooLarge,
+    WeakKdfParameters,
     IoError(io::Error),
 }
 
@@ -28,6 +29,7 @@ impl std::fmt::Display for CryptoError {
             CryptoError::InvalidVersion => write!(f, "Unsupported file version."),
             CryptoError::SystemTimeError => write!(f, "System time error."),
             CryptoError::DecompressionTooLarge => write!(f, "Decompressed data exceeds maximum allowed size."),
+            CryptoError::WeakKdfParameters => write!(f, "File header contains KDF parameters below the minimum security threshold."),
             CryptoError::IoError(e) => write!(f, "IO Error: {}", e),
         }
     }

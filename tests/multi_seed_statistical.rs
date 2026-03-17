@@ -109,7 +109,11 @@ fn multi_seed_serial_correlation() {
         }
 
         let correlation = if den.abs() < 1e-10 { 0.0 } else { num / den };
-        let pass = correlation.abs() < 0.002;
+        // 4σ Bonferroni-corrected bound for 50 simultaneous tests.
+        // σ = 1/sqrt(1_000_000) = 0.001; 4σ = 0.004.
+        // Using 2σ = 0.002 produces ~2.5 expected failures across 50 seeds
+        // purely from sampling variance — the same bound used by other tests here.
+        let pass = correlation.abs() < 0.004;
 
         if !pass {
             failures.push((seed_idx, correlation));
