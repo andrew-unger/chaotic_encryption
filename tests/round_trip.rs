@@ -15,7 +15,7 @@ fn round_trip_basic() {
 
     // Verify magic bytes and version
     assert_eq!(&encrypted[..4], b"AU79");
-    assert_eq!(encrypted[4], 8); // version 8
+    assert_eq!(encrypted[4], 9); // version 9
 
     let (decrypted, ext) = decrypt(&encrypted, password, None).expect("decryption failed");
 

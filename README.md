@@ -2,21 +2,22 @@
 
 ## Overview
 
-AU79-Crypto is a file encryption tool that uses chaotic dynamical systems as its primary cipher. Integer-arithmetic implementations of the logistic map and tent map generate a keystream for both data permutation and XOR encryption, with BLAKE3 for integrity verification and Argon2id for key derivation.
+AU79-Crypto is a file encryption tool built on a novel chaotic stream cipher. The v9 cipher (CML-Sponge) uses a 16-site Coupled Map Lattice operating as a cryptographic sponge — providing authenticated encryption natively without a separate MAC primitive. Key derivation is handled by Argon2id and all key material is memory-locked and zeroized after use.
 
 Available as both a command-line tool and a cross-platform graphical application.
 
 ## Features
 
-- **Chaotic Keystream Cipher** — Logistic and tent maps in integer arithmetic generate the encryption keystream directly
-- **Double-Round Diffusion** — Two chaotic rounds per output word for stronger mixing
-- **Chaotic Permutation** — Fisher-Yates shuffle driven by the chaotic keystream reorders data before encryption
-- **BLAKE3 Integrity** — Keyed MAC covering all header fields and ciphertext
-- **Argon2id Key Derivation** — Memory-hard password hashing with explicit, tunable parameters (256 MB / 4 iterations)
-- **Separate Subkeys** — BLAKE3 `derive_key` produces independent keys for cipher and MAC
-- **Memory-Locked Keys** — VirtualLock prevents key material from being swapped to disk; zeroized on drop
+- **CML-Sponge AEAD** — 16-site Coupled Map Lattice with 1024-bit state, 8-round permutation, SpongeWrap authenticated encryption
+- **Native Authentication** — AEAD tag produced by the sponge capacity; no separate MAC primitive required
+- **Domain Separation** — Absorb phases (key, IV, AAD, ciphertext, tag) use distinct domain constants for strict phase isolation
+- **Argon2id Key Derivation** — Memory-hard password hashing (256 MB / 4 iterations); parameters are authenticated in the AEAD header
+- **Single Subkey** — BLAKE3 `derive_key` produces one 256-bit cipher key; the sponge handles both encryption and authentication
+- **Streaming Encryption** — Data is processed in 64 KB chunks with no full-file keystream allocation
+- **Memory-Locked Keys** — Heap-allocated key buffers, VirtualLock prevents swapping to disk; zeroized on drop
+- **Backward Compatibility** — v8 files (ChaoticKeystream + BLAKE3 MAC) are automatically detected and decrypted
 - **Privacy Options** — Optional metadata stripping and compression bypass to minimize information leakage
-- **Automatic Compression** — Zlib compression before encryption (can be disabled)
+- **Argon2 Parameter Floor** — Decryption rejects artificially weak KDF parameters (prevents timing oracle attacks)
 - **File Extension Preservation** — Original file extension is restored on decryption
 - **Auto-Detection** — Automatically switches between Encrypt/Decrypt mode based on selected file
 - **Cross-Platform GUI** — Native desktop application built with egui/eframe
@@ -80,7 +81,7 @@ You will be prompted for a password.
 | Flag | Effect |
 |------|--------|
 | `--no-metadata` | Strips timestamp and file extension from the header |
-| `--no-compress` | Skips compression (prevents pattern-based fingerprinting) |
+| `--no-compress` | Skips compression (prevents compression oracle attacks) |
 
 #### Decrypt
 
@@ -119,7 +120,7 @@ au79-crypto
 
 ## Technical Details
 
-### Encryption Pipeline
+### Encryption Pipeline (v9)
 
 ```
 password + random salt + timestamp
@@ -129,76 +130,97 @@ password + random salt + timestamp
         |
         v
     master_key (32 bytes)
-       / \
-      /   \
-     v     v
-chaos_key  mac_key          (BLAKE3 derive_key with distinct context strings)
-     |         |
-     v         |
-ChaoticKeystream             (256-bit state: logistic + tent maps, double-round)
-     |         |
-     v         |
- permutation   |             (Fisher-Yates shuffle driven by keystream)
-     |         |
-     v         |
- XOR encrypt   |             (chaotic keystream applied to permuted data)
-     |         |
-     v         v
- ciphertext → BLAKE3 MAC     (keyed hash over full header + ciphertext)
+        |
+        v (BLAKE3 derive_key "au79-crypto.v9.cipher")
+    cipher_key (32 bytes)
+        |
+        v
+    CML-Sponge AEAD init (cipher_key + nonce)
+        |
+        |--- absorb header (AAD) --------+
+        |                                |
+        v                                |
+    stream encrypt plaintext             | authenticated
+    (64 KB chunks, XOR + absorb CT)      | but not encrypted
+        |                                |
+        v                                |
+    finalize → 32-byte AEAD tag ---------+
+        |
+        v
+    header ‖ ciphertext ‖ tag
 ```
 
 1. **Compress** plaintext with zlib (unless `--no-compress`)
 2. **Derive** master key from password via Argon2id (parameters stored in header)
-3. **Split** master key into `chaos_key` and `mac_key` using BLAKE3 `derive_key`
-4. **Lock** key material in memory via VirtualLock (prevents paging to disk)
-5. **Initialize** the chaotic keystream generator from `chaos_key` + random nonce
-6. **Permute** data via Fisher-Yates shuffle driven by the keystream
-7. **Encrypt** permuted data by XOR with the continuing chaotic keystream
-8. **MAC** all header fields and ciphertext with BLAKE3 keyed hash using `mac_key`
-9. **Zeroize** and unlock all key material on drop
+3. **Derive** single cipher key via BLAKE3 `derive_key` with version-locked context string
+4. **Lock** key material in heap-allocated buffer via VirtualLock (prevents paging to disk)
+5. **Build** header bytes (magic, version, flags, salt, timestamp, nonce, Argon2 params, extension)
+6. **Init** CML-Sponge state from cipher key and nonce
+7. **Absorb** header as authenticated associated data (DOMAIN_AAD)
+8. **Encrypt** data in 64 KB streaming chunks: XOR keystream, then absorb ciphertext (DOMAIN_CT)
+9. **Finalize** tag: absorb domain separator (DOMAIN_TAG), squeeze 32 bytes from capacity
+10. **Zeroize** and unlock all key material on drop
 
-### Chaotic Keystream Generator
+### CML-Sponge Cipher
 
-The `ChaoticKeystream` struct maintains a 256-bit state (4 x u64). Two rounds are executed per output word for stronger diffusion. Each round applies four stages:
+The `CmlSpongeState` is a 16-site Coupled Map Lattice (CML) operating as a cryptographic sponge.
+
+**State:** 16 × u64 = 1024-bit total
+- **Rate:** 512 bits (8 words) — absorb/squeeze interface
+- **Capacity:** 512 bits (8 words) — never exposed externally
+
+**Round function** (8 rounds per permutation):
 
 | Stage | Operation | Purpose |
 |-------|-----------|---------|
-| 1. Substitution | Logistic map on words 0,2; tent map on words 1,3 | Nonlinear confusion via chaotic dynamics |
-| 2. Counter injection | Golden-ratio counter added to words 0,2 | Prevents degenerate cycles and fixed points |
-| 3. ARX diffusion | Wrapping add/XOR with rotated neighbors | Linear cross-coupling between state words |
-| 4. Multiplicative mixing | `state[i] *= (state[j] \| 1)` | Quadratic nonlinearity resisting algebraic attacks |
+| 1. Counter injection | Weyl sequence (φ × 2⁶⁴) added to all 16 sites with prime rotations | Breaks complement symmetry, prevents fixed points |
+| 2. Local maps | Logistic map on even sites, tent map on odd sites | Nonlinear confusion via chaotic dynamics |
+| 3. Nearest-neighbor coupling | Each site XOR-mixed with left/right neighbors (rotated) | Spatial diffusion across the lattice |
+| 4. Global mixing | ARX cross-coupling across all 16 words | Full-state avalanche |
 
-**Output function:** `(s0 * (s1|1)) ^ (s2 * (s3|1))` — a non-linear, quadratic combination that prevents attackers from learning linear equations over the internal state.
+**Output finalizer:** Each squeezed word passes through Stafford Mix13 (the bijective finalizer used by SplitMix64 / PCG), eliminating the low-bit structural bias inherent to the tent map. Stafford Mix13 is fully invertible — no entropy is lost.
+
+**Sponge construction (SpongeWrap AEAD):**
+- Multi-rate padding with domain constants (KEY=0x01, IV=0x02, AAD=0x03, CT=0x04, TAG=0x05)
+- State evolution is identical for encryption and decryption (both absorb ciphertext bytes), enabling tag verification from the sponge capacity without a separate MAC
+- Encryption: `keystream_word XOR plaintext_word → ciphertext; absorb(ciphertext)`
+- Decryption: `absorb(ciphertext); keystream_word XOR ciphertext_word → plaintext`
 
 All arithmetic uses `u64`/`u128` wrapping operations, guaranteeing identical results on every platform.
 
-### File Format (v5)
+### File Format (v9)
 
 | Field | Size | Description |
 |-------|------|-------------|
 | Magic | 4 bytes | `AU79` |
-| Version | 1 byte | `5` |
+| Version | 1 byte | `9` |
 | Flags | 1 byte | Bit 0: STRIP_METADATA, Bit 1: NO_COMPRESS |
-| Salt | 16 bytes | Random, used in Argon2id |
+| Salt | 16 bytes | Random, used as Argon2id salt prefix |
 | Timestamp | 8 bytes | Unix epoch seconds (LE), or zero if metadata stripped |
-| Nonce | 16 bytes | Random, mixed into chaotic state |
-| Argon2 m_cost | 1 byte | log2 of memory in KiB (default: 18 = 256 MB) |
+| Nonce | 16 bytes | Random, mixed into sponge initial state |
+| Argon2 m_cost | 1 byte | log₂ of memory in KiB (default: 18 = 256 MB) |
 | Argon2 t_cost | 1 byte | Iteration count (default: 4) |
 | Argon2 p_cost | 1 byte | Parallelism lanes (default: 1) |
 | Extension length | 1 byte | Length of original file extension (0 if metadata stripped) |
 | Extension | variable | Original file extension |
 | Ciphertext | variable | Encrypted data |
-| MAC | 32 bytes | BLAKE3 keyed hash |
+| AEAD Tag | 32 bytes | CML-Sponge authentication tag (covers all header fields + ciphertext) |
+
+All fields from Magic through Extension are authenticated as associated data (absorbed but not encrypted).
+
+### Backward Compatibility
+
+v8 files (ChaoticKeystream + BLAKE3 MAC) are automatically detected via the version byte and decrypted using the legacy path. v9 is the default for all new encryptions.
 
 ## Dependencies
 
 | Crate | Purpose |
 |-------|---------|
 | `argon2` | Argon2id key derivation |
-| `blake3` | Subkey derivation and keyed MAC |
+| `blake3` | Subkey derivation via `derive_key` |
 | `flate2` | Zlib compression |
 | `rand` | Random salt/nonce generation |
-| `subtle` | Constant-time MAC comparison |
+| `subtle` | Constant-time tag comparison |
 | `zeroize` | Secure memory wiping for keys and state |
 | `eframe` / `egui` | Cross-platform GUI (optional) |
 | `rfd` | Native file dialogs (optional) |
@@ -223,28 +245,25 @@ The strength meter provides real-time feedback:
 
 ## Statistical Validation
 
-The chaotic keystream has been validated with:
+The CML-Sponge keystream (8 rounds, seed 0) has been validated with:
 
-- **PractRand** — 256 GB, 369 tests, zero anomalies
-- **Multi-seed CI tests** — 50 seeds x 1 MB each: chi-squared byte frequency, monobit, and serial correlation
-- **Single-seed suite** — 10 statistical tests including avalanche, gap, runs, compression ratio, and byte-pair frequency
-
-A multi-seed PractRand batch script (`tools/practrand_multi_seed.bat`) is included for extended validation across 10 seeds at 16 GB each.
+- **PractRand** — 128 GB+, 355+ tests, zero anomalies (ongoing)
+- **Reduced-round analysis** — 1-round, 4-round, and 8-round variants each pass PractRand to 1 GB, 16 GB, and 32 GB+ respectively before the first anomaly (none found yet)
+- **Multi-seed CI tests** — 50 seeds × 1 MB each: chi-squared byte frequency (Bonferroni-corrected), monobit, and serial correlation
+- **Single-seed suite** — 10 statistical tests including avalanche (single-bit key and IV sensitivity), gap, runs, compression ratio, and byte-pair frequency
+- **Complement symmetry test** — All-zero and all-0xFF keys produce distinct, independent keystreams
 
 ## Security Considerations
 
-- The chaotic keystream cipher is experimental and has not undergone formal cryptographic review
+- The CML-Sponge cipher is experimental and has not undergone formal cryptographic review
 - Key derivation uses Argon2id (256 MB, 4 iterations) — each brute-force guess costs ~1 second and 256 MB of RAM
-- Double-round diffusion: two chaotic rounds per output word to strengthen mixing
-- Separate subkeys prevent related-key interactions between cipher and MAC
-- Key material is page-locked via VirtualLock (Windows) to prevent swapping to disk
-- All key material, chaotic state, and GUI password fields are zeroized after use
-- MAC is verified before any decryption (encrypt-then-MAC)
-- Constant-time MAC comparison prevents timing side-channels
-- Branchless tent map implementation prevents timing side-channel leakage of internal state
-- Fisher-Yates permutation uses Lemire's rejection sampling for unbiased random selection
-- Optional `--no-compress` flag prevents compression oracle attacks
-- Optional `--no-metadata` flag strips timestamp and file extension from the header
+- Argon2 parameter floor: decryption rejects `m_log2 < 16` or `t_cost < 2` to prevent KDF downgrade timing attacks
+- Authentication tag is produced natively by the sponge capacity — bound to cipher key, nonce, all header fields, and every ciphertext byte
+- Constant-time tag comparison prevents timing side-channels during verification
+- Key material is heap-allocated for reliable VirtualLock page-alignment (Windows), preventing swap to disk
+- All key material and sponge state are zeroized on drop
+- Compression oracle protection: `--no-compress` skips zlib (or set `skip_compression: true` in code); this is the safe default
+- Optional `--no-metadata` strips timestamp and file extension from the header
 - Decompression is capped at 4 GB to prevent zip-bomb attacks
 - Archive extraction strips path components to prevent directory traversal attacks
 
