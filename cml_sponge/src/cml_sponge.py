@@ -80,6 +80,16 @@ DOMAIN_KEY: int = 0x01
 DOMAIN_IV: int = 0x02
 """Domain separation byte for IV absorption."""
 
+# First 16 primes >= 3.  All odd, all coprime to 64, publicly verifiable as
+# nothing-up-my-sleeve numbers.  Each site gets a distinct rotation so that
+# the Weyl counter produces a different additive contribution per site,
+# breaking the logistic/tent complement symmetry:
+#   local_map(x) == local_map(MAX ^ x)  for all x
+# Without per-site counter injection BEFORE the map step, any lattice state
+# and its bitwise complement collapse to the same mapped values, causing
+# catastrophic key-equivalence (e.g. all-0 key == all-FF key).
+INJECTION_ROTATIONS: tuple = (3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47, 53, 61)
+
 
 # ---------------------------------------------------------------------------
 # Low-level arithmetic helpers
@@ -220,26 +230,32 @@ def cml_round(lattice: list, counter: int) -> tuple:
     N = NUM_SITES  # 16
 
     # ------------------------------------------------------------------
-    # Step 1: Snapshot all mapped values before any state changes.
+    # Step 1: Weyl counter injection into ALL 16 sites (prime rotations).
+    #
+    # This step MUST come first.  The logistic and tent maps both satisfy
+    # f(x) == f(MAX ^ x), so without prior perturbation any state and its
+    # bitwise complement produce identical mapped values, collapsing
+    # distinct keys to the same keystream.  Injecting the Weyl counter
+    # with site-specific prime rotations breaks this symmetry: after
+    # injection, s[i] and (MAX ^ s[i]) receive the same additive offset
+    # but are no longer each other's complement, so the maps diverge.
+    # ------------------------------------------------------------------
+    counter = (counter + GOLDEN) & U64_MAX
+    for i in range(N):
+        lattice[i] = (lattice[i] + rotate64(counter, INJECTION_ROTATIONS[i])) & U64_MAX
+
+    # ------------------------------------------------------------------
+    # Step 2: Snapshot all mapped values (post-injection).
     # ------------------------------------------------------------------
     m = [local_map(lattice[i], i) for i in range(N)]
 
     # ------------------------------------------------------------------
-    # Step 2: Additive CML coupling with distances {1, 7, 8}.
+    # Step 3: Additive CML coupling with distances {1, 7, 8}.
     # ------------------------------------------------------------------
     new_lattice = [
         (m[i] + m[(i + 1) % N] + m[(i + 7) % N] + m[(i + 8) % N]) & U64_MAX
         for i in range(N)
     ]
-
-    # ------------------------------------------------------------------
-    # Step 3: Weyl counter injection at sites 0, 4, 8, 12.
-    # ------------------------------------------------------------------
-    counter = (counter + GOLDEN) & U64_MAX
-    new_lattice[0]  = (new_lattice[0]  + counter) & U64_MAX
-    new_lattice[4]  = (new_lattice[4]  + rotate64(counter, 16)) & U64_MAX
-    new_lattice[8]  = (new_lattice[8]  + rotate64(counter, 32)) & U64_MAX
-    new_lattice[12] = (new_lattice[12] + rotate64(counter, 48)) & U64_MAX
 
     # ------------------------------------------------------------------
     # Step 4: Multiplicative mixing of adjacent pairs (s[2k], s[2k+1]).
@@ -451,10 +467,32 @@ def _absorb(state: CMLSpongeState, data: bytes, domain: int) -> None:
 # Sponge squeeze
 # ---------------------------------------------------------------------------
 
+def _stafford_mix13(x: int) -> int:
+    """
+    Stafford Mix13 bijective finalizer (64-bit).
+
+    Applied to each rate word before output to ensure full bit avalanche.
+    Required because tent_map always returns an even value (bit 0 = 0),
+    which would otherwise create a low-bit linear dependency detectable
+    by PractRand's BRank/Low1 tests.  Mix13 is invertible (bijective),
+    so no entropy is lost — it purely re-distributes internal state bits
+    across all output positions.  Used by SplitMix64 and PCG for the same
+    reason.
+    """
+    x ^= (x >> 30)
+    x = (x * 0xBF58476D1CE4E5B9) & U64_MAX
+    x ^= (x >> 27)
+    x = (x * 0x94D049BB133111EB) & U64_MAX
+    x ^= (x >> 31)
+    return x
+
+
 def _squeeze_block(state: CMLSpongeState) -> bytes:
     """
     Squeeze one 64-byte block from the rate portion then permute.
 
+    Each rate word is passed through the Stafford Mix13 finalizer before
+    serialisation to eliminate the low-bit bias introduced by tent_map.
     The capacity portion (sites 8–15) is never output directly.
 
     Args:
@@ -465,7 +503,7 @@ def _squeeze_block(state: CMLSpongeState) -> bytes:
     """
     out = bytearray(BLOCK_BYTES)
     for i in range(RATE_SITES):
-        struct.pack_into("<Q", out, i * 8, state.lattice[i])
+        struct.pack_into("<Q", out, i * 8, _stafford_mix13(state.lattice[i]))
     cml_permute(state)
     return bytes(out)
 
