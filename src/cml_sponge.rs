@@ -58,6 +58,15 @@ const DOMAIN_KEY: u8 = 0x01;
 /// Domain separation byte for IV absorption.
 const DOMAIN_IV: u8 = 0x02;
 
+/// Domain separation byte for associated data (authenticated, not encrypted).
+const DOMAIN_AAD: u8 = 0x03;
+
+/// Domain separation byte for ciphertext absorption during AEAD authentication.
+const DOMAIN_CT: u8 = 0x04;
+
+/// Domain separation byte for AEAD tag finalization.
+const DOMAIN_TAG: u8 = 0x05;
+
 /// Rate size in bytes.
 const BLOCK_BYTES: usize = N_RATE * 8; // 64
 
@@ -285,6 +294,92 @@ pub fn encrypt_in_place(state: &mut CmlSpongeState, data: &mut [u8]) {
 /// Decrypt is identical to encrypt for a stream cipher.
 pub fn decrypt_in_place(state: &mut CmlSpongeState, data: &mut [u8]) {
     encrypt_in_place(state, data);
+}
+
+// ── AEAD construction ─────────────────────────────────────────────────────────
+//
+// SpongeWrap-style authenticated encryption.  After `cipher_init`, the caller:
+//   1. Calls `absorb_aad` with associated data (authenticated, not encrypted).
+//   2. Calls `aead_encrypt_chunk` / `aead_decrypt_chunk` for each data chunk.
+//   3. Calls `aead_finalize` to produce / verify a 32-byte authentication tag.
+//
+// State evolution is identical in both encrypt and decrypt (both absorb the
+// ciphertext with DOMAIN_CT), so the final tags match iff the same ciphertext
+// was processed, providing Encrypt-then-MAC semantics natively.
+
+/// Absorb associated data into the sponge (authenticated, not encrypted).
+///
+/// Call once after `cipher_init`, before any `aead_encrypt_chunk` calls.
+/// The caller typically passes the serialised file header here so it is
+/// bound into the authentication tag without being encrypted.
+pub fn absorb_aad(state: &mut CmlSpongeState, data: &[u8]) {
+    absorb(state, data, DOMAIN_AAD);
+}
+
+/// Encrypt `data` in place as one AEAD chunk, absorbing the resulting
+/// ciphertext for authentication.
+///
+/// Call in order for consecutive plaintext chunks, then call `aead_finalize`.
+/// Chunk sizes need not be multiples of 64; any size is accepted.
+pub fn aead_encrypt_chunk(state: &mut CmlSpongeState, data: &mut [u8]) {
+    if data.is_empty() {
+        return;
+    }
+    // Generate keystream and XOR plaintext → ciphertext in place.
+    let mut ks = vec![0u8; data.len()];
+    keystream(state, &mut ks);
+    for (d, k) in data.iter_mut().zip(ks.iter()) {
+        *d ^= k;
+    }
+    // Absorb the ciphertext for authentication.
+    absorb(state, data, DOMAIN_CT);
+}
+
+/// Decrypt `data` in place as one AEAD chunk, absorbing the ciphertext
+/// (the pre-XOR bytes) for authentication — matching `aead_encrypt_chunk`'s
+/// state evolution exactly.
+///
+/// Call in order for consecutive ciphertext chunks, then call `aead_finalize`
+/// and compare the returned tag against the stored tag in constant time.
+/// Only use the plaintext if the tags match.
+pub fn aead_decrypt_chunk(state: &mut CmlSpongeState, data: &mut [u8]) {
+    if data.is_empty() {
+        return;
+    }
+    // Generate keystream (same state evolution as encryption).
+    let mut ks = vec![0u8; data.len()];
+    keystream(state, &mut ks);
+    // Save original ciphertext before XOR-ing to plaintext.
+    let ct = data.to_vec();
+    // XOR to recover plaintext in place.
+    for (d, k) in data.iter_mut().zip(ks.iter()) {
+        *d ^= k;
+    }
+    // Absorb the ciphertext (not the plaintext) — must match encryption order.
+    absorb(state, &ct, DOMAIN_CT);
+}
+
+/// Finalise the AEAD session and return a 32-byte authentication tag.
+///
+/// After encryption: append this tag to the ciphertext.
+/// After decryption: compare this tag against the stored tag using a
+///   constant-time comparison (e.g. `subtle::ConstantTimeEq`) before
+///   trusting the decrypted plaintext.
+///
+/// The tag is derived from the sponge rate after a domain-separated
+/// empty absorption (DOMAIN_TAG = 0x05), ensuring it is bound to
+/// everything previously absorbed: key, IV, AAD, and all ciphertext blocks.
+pub fn aead_finalize(state: &mut CmlSpongeState) -> [u8; 32] {
+    // Empty absorption with TAG domain — domain-separated finalisation
+    // that commences a permute, mixing in all prior state.
+    absorb(state, &[], DOMAIN_TAG);
+    // Squeeze 32 bytes (4 rate words) with Mix13 output finaliser.
+    let mut tag = [0u8; 32];
+    for i in 0..4 {
+        let w = stafford_mix13(state.lattice[i]);
+        tag[i * 8..(i + 1) * 8].copy_from_slice(&w.to_le_bytes());
+    }
+    tag
 }
 
 // ── Reduced-round variant (for cryptanalysis) ─────────────────────────────────
