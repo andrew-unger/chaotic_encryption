@@ -15,12 +15,16 @@ pub fn compress_data(data: &[u8]) -> Result<Vec<u8>, CryptoError> {
 }
 
 pub fn decompress_data(data: &[u8]) -> Result<Vec<u8>, CryptoError> {
-    let decoder = ZlibDecoder::new(data);
-    let mut limited = decoder.take(MAX_DECOMPRESSED_SIZE + 1);
+    let mut decoder = ZlibDecoder::new(data);
     let mut decompressed = Vec::new();
-    limited.read_to_end(&mut decompressed)?;
-    if decompressed.len() as u64 > MAX_DECOMPRESSED_SIZE {
-        return Err(CryptoError::DecompressionTooLarge);
+    let mut buf = [0u8; 65536];
+    loop {
+        let n = decoder.read(&mut buf)?;
+        if n == 0 { break; }
+        if decompressed.len() as u64 + n as u64 > MAX_DECOMPRESSED_SIZE {
+            return Err(CryptoError::DecompressionTooLarge);
+        }
+        decompressed.extend_from_slice(&buf[..n]);
     }
     Ok(decompressed)
 }
@@ -84,7 +88,7 @@ pub fn parse_file_info(data: &[u8]) -> Result<FileInfo, CryptoError> {
     }
 
     let version = data[4];
-    if version != VERSION {
+    if version != 8 && version != VERSION {
         return Err(CryptoError::InvalidVersion);
     }
 

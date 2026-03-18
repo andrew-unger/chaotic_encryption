@@ -1,7 +1,7 @@
-/// Statistical tests for the chaotic keystream generator.
-///
-/// Implements key tests from NIST SP 800-22 and additional cipher-specific
-/// tests. Run with: cargo test --release --test statistical -- --nocapture
+//! Statistical tests for the chaotic keystream generator.
+//!
+//! Implements key tests from NIST SP 800-22 and additional cipher-specific
+//! tests. Run with: cargo test --release --test statistical -- --nocapture
 
 use au79_crypto::chaos::ChaoticKeystream;
 

@@ -1,14 +1,14 @@
-/// CML-Sponge reduced-round distinguisher analysis.
-///
-/// For each round count R in 1..=8, tests whether an R-round CML-Sponge
-/// keystream is statistically distinguishable from random using:
-///   1. Chi-squared byte frequency (256 df, bounds 175–350 at 4σ)
-///   2. Monobit test (|z| < 4.0)
-///   3. Serial byte correlation (|r| < 0.004, Bonferroni-safe)
-///   4. GF(2) rank of 8×8 matrices — expected full-rank fraction ~0.289;
-///      checks that observed fraction is within 5σ of expected.
-///
-/// Run with: cargo run --release --bin cml_reduced_round
+//! CML-Sponge reduced-round distinguisher analysis.
+//!
+//! For each round count R in 1..=8, tests whether an R-round CML-Sponge
+//! keystream is statistically distinguishable from random using:
+//!   1. Chi-squared byte frequency (256 df, bounds 175–350 at 4σ)
+//!   2. Monobit test (|z| < 4.0)
+//!   3. Serial byte correlation (|r| < 0.004, Bonferroni-safe)
+//!   4. GF(2) rank of 8×8 matrices — expected full-rank fraction ~0.289;
+//!      checks that observed fraction is within 5σ of expected.
+//!
+//! Run with: cargo run --release --bin cml_reduced_round
 
 use au79_crypto::cml_sponge::{cipher_init_r, keystream_r};
 
@@ -70,9 +70,9 @@ fn gf2_rank_8x8(rows: &[u8; 8]) -> usize {
         if let Some(p) = (rank..8).find(|&r| (m[r] >> col) & 1 == 1) {
             m.swap(rank, p);
             let prow = m[rank];
-            for r in 0..8 {
-                if r != rank && (m[r] >> col) & 1 == 1 {
-                    m[r] ^= prow;
+            for (r, row) in m.iter_mut().enumerate() {
+                if r != rank && (*row >> col) & 1 == 1 {
+                    *row ^= prow;
                 }
             }
             rank += 1;

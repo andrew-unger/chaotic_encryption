@@ -1,16 +1,16 @@
-/// CML Sponge cipher test suite.
-///
-/// Covers:
-///   - Cross-validation against canonical Python test vectors (TV1–TV4)
-///   - Complement symmetry: all-zero and all-FF keys must diverge
-///   - Encrypt / decrypt round-trip
-///   - IV sensitivity: 1-bit IV change → different keystream
-///   - Key sensitivity: 1-bit key change → different keystream
-///   - Stream consistency: two equal-length requests == one combined request
-///   - Empty keystream: no-op
-///   - Multi-block output: >64-byte keystream is contiguous and deterministic
-///   - Zeroize-on-drop: state is accessible before drop (compile-level sanity)
-///   - Reduced-round variant: same init, 1-round vs 8-round → different output
+//! CML Sponge cipher test suite.
+//!
+//! Covers:
+//!   - Cross-validation against canonical Python test vectors (TV1–TV4)
+//!   - Complement symmetry: all-zero and all-FF keys must diverge
+//!   - Encrypt / decrypt round-trip
+//!   - IV sensitivity: 1-bit IV change → different keystream
+//!   - Key sensitivity: 1-bit key change → different keystream
+//!   - Stream consistency: two equal-length requests == one combined request
+//!   - Empty keystream: no-op
+//!   - Multi-block output: >64-byte keystream is contiguous and deterministic
+//!   - Zeroize-on-drop: state is accessible before drop (compile-level sanity)
+//!   - Reduced-round variant: same init, 1-round vs 8-round → different output
 
 use au79_crypto::cml_sponge::{cipher_init, cipher_init_r, keystream, keystream_r,
                                encrypt_in_place, decrypt_in_place};
@@ -231,9 +231,9 @@ fn stream_consistency_byte_by_byte() {
 
     let mut state = cipher_init(&key, &iv);
     let mut out = vec![0u8; 1];
-    for i in 0..65 {
+    for (i, &expected) in combined.iter().enumerate().take(65) {
         keystream(&mut state, &mut out);
-        assert_eq!(out[0], combined[i], "byte {} mismatch in byte-by-byte stream", i);
+        assert_eq!(out[0], expected, "byte {} mismatch in byte-by-byte stream", i);
     }
 }
 

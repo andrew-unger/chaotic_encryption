@@ -381,6 +381,10 @@ pub fn decrypt(
 
     // Dispatch on file format version.
     if version == 8 {
+        eprintln!(
+            "Warning: this file uses the v8 legacy cipher (ChaoticKeystream + BLAKE3). \
+             Re-encrypt with the current version for best security."
+        );
         decrypt_v8(
             master_key.get(),
             nonce_bytes,
@@ -408,6 +412,7 @@ pub fn decrypt(
 
 // ── v9 decryption (CML-Sponge AEAD) ─────────────────────────────────────────
 
+#[allow(clippy::too_many_arguments)]
 fn decrypt_v9(
     master_key: &[u8; 32],
     nonce_bytes: &[u8],
@@ -464,6 +469,7 @@ fn decrypt_v9(
 
 // ── v8 decryption (ChaoticKeystream + BLAKE3 MAC — legacy) ──────────────────
 
+#[allow(clippy::too_many_arguments)]
 fn decrypt_v8(
     master_key: &[u8; 32],
     nonce_bytes: &[u8],

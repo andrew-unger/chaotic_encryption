@@ -1,7 +1,7 @@
-/// Multi-seed statistical validation.
-///
-/// Tests 50 different seeds with 1 MB each to catch weak key classes
-/// without requiring PractRand. Run with: cargo test --release --test multi_seed_statistical -- --nocapture
+//! Multi-seed statistical validation.
+//!
+//! Tests 50 different seeds with 1 MB each to catch weak key classes
+//! without requiring PractRand. Run with: cargo test --release --test multi_seed_statistical -- --nocapture
 
 use au79_crypto::chaos::ChaoticKeystream;
 
