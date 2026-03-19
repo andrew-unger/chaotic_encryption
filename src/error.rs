@@ -25,7 +25,7 @@ impl std::fmt::Display for CryptoError {
             CryptoError::KeyDerivationFailed => write!(f, "Key derivation failed."),
             CryptoError::IntegrityCheckFailed => write!(f, "Integrity check failed."),
             CryptoError::InvalidCiphertextLength => write!(f, "Invalid ciphertext length."),
-            CryptoError::InvalidMagicBytes => write!(f, "Invalid magic bytes. Not an AU79 file."),
+            CryptoError::InvalidMagicBytes => write!(f, "Invalid magic bytes. Not a CATWALK file."),
             CryptoError::InvalidVersion => write!(f, "Unsupported file version."),
             CryptoError::SystemTimeError => write!(f, "System time error."),
             CryptoError::DecompressionTooLarge => write!(f, "Decompressed data exceeds maximum allowed size."),

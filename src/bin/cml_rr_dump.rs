@@ -8,7 +8,7 @@
 use std::env;
 use std::io::{self, Write, BufWriter};
 
-use au79_crypto::cml_sponge::{cipher_init_r, keystream_r};
+use catwalk::cml_sponge::{cipher_init_r, keystream_r};
 
 fn main() {
     let args: Vec<String> = env::args().collect();

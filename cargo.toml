@@ -1,16 +1,15 @@
 [package]
-name = "au79-crypto"
+name = "catwalk"
 version = "0.1.0"
 edition = "2021"
-authors = ["Your Name <your.email@example.com>"]
-description = "A custom encryption algorithm with chaotic cryptography"
+description = "CATWALK: CML-Sponge AEAD file encryption tool"
 
 [lib]
-name = "au79_crypto"
+name = "catwalk"
 path = "src/lib.rs"
 
 [[bin]]
-name = "au79-crypto"
+name = "catwalk"
 path = "src/main.rs"
 
 [dependencies]
@@ -29,8 +28,16 @@ rfd = { version = "0.15", optional = true }
 zip = { version = "2.4", default-features = false, features = ["deflate"], optional = true }
 
 [features]
-default = ["gui"]
+default = []
 gui = ["eframe", "egui", "rfd", "zip"]
+
+[[bench]]
+name = "catwalk_bench"
+path = "benches/catwalk_bench.rs"
+harness = false
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
 
 [profile.release]
 opt-level = 3

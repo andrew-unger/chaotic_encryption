@@ -59,7 +59,7 @@ impl fmt::Display for FileInfo {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "Magic:              AU79\n\
+            "Magic:              CATW\n\
              Version:            {}\n\
              Flags:              {} ({})\n\
              Timestamp:          {}\n\
@@ -88,7 +88,7 @@ pub fn parse_file_info(data: &[u8]) -> Result<FileInfo, CryptoError> {
     }
 
     let version = data[4];
-    if version != 8 && version != VERSION {
+    if version != VERSION {
         return Err(CryptoError::InvalidVersion);
     }
 

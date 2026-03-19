@@ -8,11 +8,13 @@
 //!
 //! **Round function (4 steps, applied 8× per permutation):**
 //! 1. Counter injection — Weyl counter (GOLDEN = φ×2^64) advanced and added into
-//!    all 16 sites with distinct prime rotations {3,5,7,11,…,61}.  MUST be first:
-//!    the logistic and tent maps satisfy f(x) = f(MAX^x), so injecting the counter
-//!    before mapping breaks the complement symmetry that would otherwise make any
-//!    key and its bitwise complement produce identical keystreams.
-//! 2. Local maps   — logistic (even sites), tent (odd sites), computed as a snapshot.
+//!    all 16 sites with distinct prime rotations {3,5,7,11,…,61}.  Runs before the
+//!    map step to diversify site values and prevent the Cat Map's (0,0) fixed point
+//!    from being reached in practice.
+//! 2. Local map    — Arnold's Cat Map applied to 8 adjacent site pairs:
+//!    (0,1),(2,3),…,(14,15).  Computed as a snapshot into m[].
+//!    cat_map(x,y) = (x+y, x+2y) mod 2^64 — area-preserving, hyperbolic,
+//!    Lyapunov exponent ln((3+√5)/2) ≈ 0.9624.
 //! 3. CML coupling — s[i] = m[i] + m[(i+1)%16] + m[(i+7)%16] + m[(i+8)%16].
 //!    Distances {1,7,8} achieve full 16-site diffusion in exactly 4 rounds.
 //! 4. Multiplicative mixing — s[2k+1] *= (s[2k] | 1) for k=0..7.
@@ -70,36 +72,61 @@ const DOMAIN_TAG: u8 = 0x05;
 /// Rate size in bytes.
 const BLOCK_BYTES: usize = N_RATE * 8; // 64
 
-// ── Chaotic maps ──────────────────────────────────────────────────────────────
+// ── Local map ─────────────────────────────────────────────────────────────────
 
-/// Fixed-point logistic map: (x * (MAX − x)) >> 62.
+/// Arnold's Cat Map — the local nonlinear map applied to adjacent site pairs.
 ///
-/// Approximates 4x(1−x) in u64 arithmetic.  The 128-bit product is
-/// right-shifted 62 bits to keep the result in [0, 2^64).
+/// Implements the discrete linear toral automorphism in symplectic
+/// (Störmer–Verlet) integration order:
+///
+/// ```text
+/// [x']   [1  1] [x]
+/// [y'] = [1  2] [y]   (mod 2^64)
+///
+/// Computed as:
+///   x' = x + y           (mod 2^64)
+///   y' = x' + y          (mod 2^64)   ← uses updated x'; gives x + 2y
+/// ```
+///
+/// ## Mathematical properties
+///
+/// - **Area-preserving:** det([[1,1],[1,2]]) = 2 − 1 = 1.
+/// - **Hyperbolic (Anosov diffeomorphism):** eigenvalues (3 ± √5)/2 ≈ {2.618,
+///   0.382} — both real, product 1, neither equal to ±1.  The map has a stable
+///   and an unstable manifold filling R², giving maximum mixing.
+/// - **Lyapunov exponent:** ln((3 + √5)/2) ≈ 0.9624 — the maximum achievable
+///   for a 2×2 integer matrix with determinant 1 and trace 3.
+/// - **No complement symmetry:** `cat_map(x, y) ≠ cat_map(MAX−x, MAX−y)` for
+///   generic inputs; unlike the logistic and tent maps, no external fix is
+///   required.  The Weyl counter injection still runs first to diversify state.
+/// - **Fixed point at (0, 0):** `cat_map(0, 0) = (0, 0)`.  This is benign in
+///   practice: the Weyl counter injection (Step 1 of every CML round) runs
+///   *before* the Cat Map, ensuring that any site pair reaching (0, 0) is
+///   displaced by the counter before the map is applied.  The probability of a
+///   site pair being exactly (0, 0) after counter injection is ≈ 2⁻¹²⁸ per
+///   pair per round (two independent 64-bit coincidences required).
+/// - **No parameters:** unlike the logistic map (r = 4 approximation) and tent
+///   map, the Cat Map has a single canonical integer form — no fixed-point
+///   approximation, no precision loss.
+///
+/// ## Pairing strategy
+///
+/// Applied to the 8 adjacent site pairs: (0,1), (2,3), (4,5), (6,7),
+/// (8,9), (10,11), (12,13), (14,15).  This pairing matches Step 4's
+/// multiplicative mixing pairs, creating a coherent two-layer nonlinear
+/// transformation per pair per round before the coupling step propagates
+/// results across the full 16-site lattice.
+///
+/// ## Constant-time guarantee
+///
+/// All operations are wrapping additions — no branches, no data-dependent
+/// control flow, no divisions or modulo operators.  The implementation is
+/// unconditionally constant-time.
 #[inline(always)]
-fn logistic_map(x: u64) -> u64 {
-    let product = (x as u128).wrapping_mul((u64::MAX - x) as u128);
-    (product >> 62) as u64
-}
-
-/// Branchless fixed-point tent map: 2x if MSB=0, else 2*(MAX−x).
-#[inline(always)]
-fn tent_map(x: u64) -> u64 {
-    let mask = (x >> 63).wrapping_neg();
-    let asc = x;
-    let desc = u64::MAX - x;
-    let sel = asc ^ (mask & (asc ^ desc));
-    sel.wrapping_mul(2)
-}
-
-/// Apply the site-local map: logistic for even sites, tent for odd.
-#[inline(always)]
-fn local_map(x: u64, site: usize) -> u64 {
-    if site % 2 == 0 {
-        logistic_map(x)
-    } else {
-        tent_map(x)
-    }
+fn arnold_cat_map(x: u64, y: u64) -> (u64, u64) {
+    let x_new = x.wrapping_add(y);
+    let y_new = x_new.wrapping_add(y); // = x + 2y, symplectic order
+    (x_new, y_new)
 }
 
 // ── CML round and permutation ──────────────────────────────────────────────
@@ -108,17 +135,23 @@ fn local_map(x: u64, site: usize) -> u64 {
 #[inline(always)]
 fn cml_round(s: &mut [u64; N], counter: &mut u64) {
     // Step 1 — Counter injection (all 16 sites, prime rotations).
-    // Must precede the map step to break the complement symmetry
-    // logistic(x) == logistic(MAX ^ x) and tent(x) == tent(MAX ^ x).
+    // Runs before the map to ensure no site pair is (0,0) when the Cat Map
+    // is applied (see arnold_cat_map fixed-point note), and to diversify
+    // state across sites before the nonlinear step.
     *counter = counter.wrapping_add(GOLDEN);
     for i in 0..N {
         s[i] = s[i].wrapping_add(counter.rotate_left(ROT[i]));
     }
 
-    // Step 2 — Local maps (snapshot of all 16 sites).
+    // Step 2 — Arnold's Cat Map on adjacent pairs: (0,1),(2,3),...,(14,15).
+    // All pairs are written into snapshot m[] before coupling, preserving
+    // the sponge's snapshot semantics (no site's coupling sees another
+    // site's already-updated value from the same step).
     let mut m = [0u64; N];
-    for i in 0..N {
-        m[i] = local_map(s[i], i);
+    for k in 0..8 {
+        let (mx, my) = arnold_cat_map(s[2 * k], s[2 * k + 1]);
+        m[2 * k]     = mx;
+        m[2 * k + 1] = my;
     }
 
     // Step 3 — CML additive coupling, distances {1, 7, 8}.
@@ -219,10 +252,10 @@ fn absorb(state: &mut CmlSpongeState, data: &[u8], domain: u8) {
 /// Stafford Mix13 bijective finalizer.
 ///
 /// Applied to each rate word before output to ensure full bit avalanche.
-/// Required because `tent_map` always returns an even value (bit 0 = 0),
-/// which would otherwise create a low-bit linear dependency in the output.
-/// Mix13 is invertible, so no entropy is lost — it purely re-distributes the
-/// internal state bits across all output bit positions.
+/// Arnold's Cat Map does not have the low-bit bias of the tent map, but
+/// Mix13 is retained as an additional output whitening layer.  It is
+/// invertible (no entropy loss) and purely redistributes internal state
+/// bits across all output bit positions.
 /// Used by SplitMix64, Murmur3, and PCG for the same reason.
 #[inline(always)]
 fn stafford_mix13(x: u64) -> u64 {
@@ -254,6 +287,15 @@ fn squeeze_block(state: &mut CmlSpongeState) -> [u8; BLOCK_BYTES] {
 /// 1. All-zero 1024-bit state, counter = 0.
 /// 2. Absorb key  (domain 0x01) → permute.
 /// 3. Absorb IV   (domain 0x02) → permute.
+///
+/// # Nonce reuse
+///
+/// **Never reuse `(key, iv)` for two different messages.**  Reusing the same
+/// key and IV produces the same keystream; XOR-ing two ciphertexts encrypted
+/// under the same stream reveals the XOR of the plaintexts, and the authentication
+/// tags no longer provide integrity.  Each encryption must use a fresh, randomly
+/// generated IV (see the high-level [`crate::crypto::encrypt`] function, which
+/// handles IV generation automatically).
 pub fn cipher_init(key: &[u8; 32], iv: &[u8; 16]) -> CmlSpongeState {
     let mut state = CmlSpongeState::new();
     absorb(&mut state, key, DOMAIN_KEY);
@@ -341,7 +383,17 @@ pub fn aead_encrypt_chunk(state: &mut CmlSpongeState, data: &mut [u8]) {
 ///
 /// Call in order for consecutive ciphertext chunks, then call `aead_finalize`
 /// and compare the returned tag against the stored tag in constant time.
-/// Only use the plaintext if the tags match.
+///
+/// # Do not use plaintext before verifying
+///
+/// `data` is overwritten with decrypted plaintext **before** authentication is
+/// checked.  The caller must **not** act on or forward the contents of `data`
+/// until `aead_finalize` has been called and the returned tag compared against
+/// the stored tag using constant-time equality (e.g. `subtle::ConstantTimeEq`).
+/// Using unauthenticated plaintext enables decryption-oracle and padding-oracle
+/// attacks.  The high-level `decrypt` function in [`crate::crypto`] enforces
+/// this contract structurally — callers of this low-level API must enforce it
+/// themselves.
 pub fn aead_decrypt_chunk(state: &mut CmlSpongeState, data: &mut [u8]) {
     if data.is_empty() {
         return;

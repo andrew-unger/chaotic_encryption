@@ -8,12 +8,12 @@ use eframe::egui;
 use zeroize::Zeroize;
 use zip::write::SimpleFileOptions;
 
-extern crate au79_crypto;
-use au79_crypto::crypto::{encrypt, decrypt, validate_password, EncryptOptions, ProgressFn};
-use au79_crypto::error::CryptoError;
-use au79_crypto::utils::{parse_file_info, format_byte_size};
+extern crate catwalk;
+use catwalk::crypto::{encrypt, decrypt, validate_password, EncryptOptions, ProgressFn};
+use catwalk::error::CryptoError;
+use catwalk::utils::{parse_file_info, format_byte_size};
 
-const ARCHIVE_EXTENSION: &str = "au79archive";
+const ARCHIVE_EXTENSION: &str = "catwalkarchive";
 
 // ── Constants ──────────────────────────────────────────────────────────────────
 
@@ -54,7 +54,7 @@ pub enum WorkerMessage {
 
 // ── Application State ──────────────────────────────────────────────────────────
 
-pub struct Au79Gui {
+pub struct CatwalkGui {
     mode: Mode,
 
     // Single-file
@@ -87,7 +87,7 @@ pub struct Au79Gui {
     worker_rx: Option<mpsc::Receiver<WorkerMessage>>,
 }
 
-impl Default for Au79Gui {
+impl Default for CatwalkGui {
     fn default() -> Self {
         Self {
             mode: Mode::Encrypt,
@@ -114,7 +114,7 @@ impl Default for Au79Gui {
 
 // ── eframe::App ────────────────────────────────────────────────────────────────
 
-impl eframe::App for Au79Gui {
+impl eframe::App for CatwalkGui {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_worker();
         self.handle_dropped_files(ctx);
@@ -127,12 +127,12 @@ impl eframe::App for Au79Gui {
 
 // ── Rendering ──────────────────────────────────────────────────────────────────
 
-impl Au79Gui {
+impl CatwalkGui {
     fn render_top_panel(&mut self, ctx: &egui::Context) {
         egui::TopBottomPanel::top("header").show(ctx, |ui| {
             ui.add_space(6.0);
             ui.horizontal(|ui| {
-                ui.label(egui::RichText::new("AU79").size(22.0).strong().color(GOLD));
+                ui.label(egui::RichText::new("CATWALK").size(22.0).strong().color(GOLD));
                 ui.label(egui::RichText::new("Crypto").size(22.0).color(GOLD_DIM));
                 ui.add_space(20.0);
 
@@ -159,7 +159,7 @@ impl Au79Gui {
         egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
             ui.add_space(6.0);
 
-            // Status message
+            // Status message (scrollable to handle long error messages)
             let color = if self.status_is_error {
                 ERROR_RED
             } else if self.progress >= 1.0 {
@@ -167,7 +167,12 @@ impl Au79Gui {
             } else {
                 ui.visuals().text_color()
             };
-            ui.label(egui::RichText::new(&self.status_message).color(color));
+            egui::ScrollArea::vertical()
+                .id_salt("status_scroll")
+                .max_height(40.0)
+                .show(ui, |ui| {
+                    ui.label(egui::RichText::new(&self.status_message).color(color));
+                });
 
             // Progress bar
             ui.add(
@@ -379,12 +384,12 @@ impl Au79Gui {
             ui.add(
                 egui::TextEdit::singleline(&mut self.batch_output_path)
                     .desired_width(ui.available_width() - 80.0)
-                    .hint_text("Output .au79 file..."),
+                    .hint_text(format!("Output .{} file...", ARCHIVE_EXTENSION)),
             );
             if ui.button("Browse").clicked() {
                 let dialog = rfd::FileDialog::new()
                     .set_title("Save Encrypted Archive")
-                    .add_filter("AU79 Encrypted", &["au79"]);
+                    .add_filter("CATWALK Archive", &[ARCHIVE_EXTENSION]);
                 if let Some(path) = dialog.save_file() {
                     self.batch_output_path = path.to_string_lossy().to_string();
                 }
@@ -413,12 +418,12 @@ impl Au79Gui {
     fn render_info_mode(&mut self, ui: &mut egui::Ui) {
         ui.add_space(8.0);
 
-        ui.label(egui::RichText::new("Select an AU79 encrypted file").strong());
+        ui.label(egui::RichText::new("Select a CATWALK encrypted file").strong());
         ui.horizontal(|ui| {
             ui.add(
                 egui::TextEdit::singleline(&mut self.input_path)
                     .desired_width(ui.available_width() - 80.0)
-                    .hint_text("Select .au79 file..."),
+                    .hint_text("Select .catwalk file..."),
             );
             if ui.button("Browse").clicked() {
                 self.browse_input();
@@ -453,7 +458,7 @@ impl Au79Gui {
                 .inner_margin(12.0)
                 .show(ui, |ui| {
                     ui.label(
-                        egui::RichText::new("AU79 File Information")
+                        egui::RichText::new("CATWALK File Information")
                             .strong()
                             .size(16.0)
                             .color(GOLD),
@@ -543,7 +548,7 @@ impl Au79Gui {
                     if self.batch_output_path.is_empty() {
                         if let Some(dir) = path.parent() {
                             self.batch_output_path =
-                                dir.join("archive.au79").to_string_lossy().to_string();
+                                dir.join(format!("archive.{}", ARCHIVE_EXTENSION)).to_string_lossy().to_string();
                         }
                     }
                 }
@@ -566,7 +571,7 @@ impl Au79Gui {
         let dialog = rfd::FileDialog::new()
             .set_title("Select Input File")
             .add_filter("All Files", &["*"])
-            .add_filter("AU79 Encrypted", &["au79"]);
+            .add_filter("CATWALK Encrypted", &["catwalk"]);
         if let Some(path) = dialog.pick_file() {
             self.auto_detect_mode(&path);
             self.input_path = path.to_string_lossy().to_string();
@@ -594,7 +599,7 @@ impl Au79Gui {
                 if self.batch_output_path.is_empty() {
                     if let Some(dir) = path.parent() {
                         self.batch_output_path =
-                            dir.join("archive.au79").to_string_lossy().to_string();
+                            dir.join(format!("archive.{}", ARCHIVE_EXTENSION)).to_string_lossy().to_string();
                     }
                 }
                 self.batch_files.push(BatchFileEntry {
@@ -608,13 +613,13 @@ impl Au79Gui {
     // ── Auto-Detect Mode ─────────────────────────────────────────────────────
 
     fn auto_detect_mode(&mut self, path: &Path) {
-        let is_au79 = path.extension().map(|e| e == "au79").unwrap_or(false)
+        let is_eddy = path.extension().map(|e| e == "catwalk").unwrap_or(false)
             || fs::read(path)
                 .ok()
-                .map(|d| d.len() >= 4 && &d[..4] == b"AU79")
+                .map(|d| d.len() >= 4 && &d[..4] == b"CATW")
                 .unwrap_or(false);
 
-        if is_au79 {
+        if is_eddy {
             self.mode = Mode::Decrypt;
         } else {
             self.mode = Mode::Encrypt;
@@ -632,11 +637,11 @@ impl Au79Gui {
                     .unwrap_or_default()
                     .to_string_lossy()
                     .to_string();
-                name.push_str(".au79");
+                name.push_str(".catwalk");
                 out.set_file_name(name);
             }
             Mode::Decrypt => {
-                if out.extension().map(|e| e == "au79").unwrap_or(false) {
+                if out.extension().map(|e| e == "catwalk").unwrap_or(false) {
                     out.set_extension("");
                 }
             }
@@ -775,7 +780,7 @@ impl Au79Gui {
     }
 }
 
-impl Drop for Au79Gui {
+impl Drop for CatwalkGui {
     fn drop(&mut self) {
         self.password.zeroize();
         self.confirm_password.zeroize();
@@ -964,12 +969,12 @@ pub fn run_gui() -> Result<(), String> {
     };
 
     eframe::run_native(
-        "AU79-Crypto",
+        "CATWALK",
         options,
         Box::new(|cc| {
             // Dark theme
             cc.egui_ctx.set_visuals(egui::Visuals::dark());
-            Ok(Box::new(Au79Gui::default()))
+            Ok(Box::new(CatwalkGui::default()))
         }),
     )
     .map_err(|e| format!("Error running GUI: {}", e))

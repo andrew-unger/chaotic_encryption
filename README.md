@@ -1,14 +1,14 @@
-# AU79-Crypto: Chaotic Encryption Tool
+# CATWALK: Chaotic Encryption Tool
 
 ## Overview
 
-AU79-Crypto is a file encryption tool built on a novel chaotic stream cipher. The v9 cipher (CML-Sponge) uses a 16-site Coupled Map Lattice operating as a cryptographic sponge — providing authenticated encryption natively without a separate MAC primitive. Key derivation is handled by Argon2id and all key material is memory-locked and zeroized after use.
+CATWALK is a file encryption tool built on a novel chaotic stream cipher. The v9 cipher (CML-Sponge) uses a 16-site Coupled Map Lattice operating as a cryptographic sponge — providing authenticated encryption natively without a separate MAC primitive. Key derivation is handled by Argon2id and all key material is memory-locked and zeroized after use.
 
 Available as both a command-line tool and a cross-platform graphical application.
 
 ## Features
 
-- **CML-Sponge AEAD** — 16-site Coupled Map Lattice with 1024-bit state, 8-round permutation, SpongeWrap authenticated encryption
+- **CML-Sponge AEAD** — 16-site Coupled Map Lattice with 1024-bit state, 8-round permutation, SpongeWrap authenticated encryption; local map is Arnold's Cat Map (parameter-free, provably hyperbolic, natively integer)
 - **Native Authentication** — AEAD tag produced by the sponge capacity; no separate MAC primitive required
 - **Domain Separation** — Absorb phases (key, IV, AAD, ciphertext, tag) use distinct domain constants for strict phase isolation
 - **Argon2id Key Derivation** — Memory-hard password hashing (256 MB / 4 iterations); parameters are authenticated in the AEAD header
@@ -21,7 +21,7 @@ Available as both a command-line tool and a cross-platform graphical application
 - **File Extension Preservation** — Original file extension is restored on decryption
 - **Auto-Detection** — Automatically switches between Encrypt/Decrypt mode based on selected file
 - **Cross-Platform GUI** — Native desktop application built with egui/eframe
-- **Batch Archive Mode** — Bundle multiple files into a single encrypted `.au79` archive
+- **Batch Archive Mode** — Bundle multiple files into a single encrypted `.catwalk` archive
 - **Drag-and-Drop** — Drop files directly onto the GUI window
 - **Password Policy Enforcement** — Minimum 18 characters, consecutive repeat detection, real-time strength feedback
 
@@ -40,7 +40,7 @@ cd chaotic_encryption
 cargo build --release
 ```
 
-The binary will be at `target/release/au79-crypto` (or `au79-crypto.exe` on Windows).
+The binary will be at `target/release/catwalk` (or `catwalk.exe` on Windows).
 
 To build without the GUI (CLI only):
 
@@ -55,7 +55,7 @@ cargo build --release --no-default-features
 Launch the application without arguments (or double-click the executable):
 
 ```bash
-au79-crypto
+catwalk
 ```
 
 The GUI provides:
@@ -63,17 +63,17 @@ The GUI provides:
 - File browser dialogs and drag-and-drop support
 - Password entry with show/hide toggle and strength indicator
 - Password confirmation for encryption
-- Batch archive mode: bundle multiple files into a single encrypted `.au79` archive
+- Batch archive mode: bundle multiple files into a single encrypted `.catwalk` archive
 - Automatic extraction when decrypting a batch archive
 - Progress bar and elapsed time display
-- Dark theme with AU79 gold accent branding
+- Dark theme with CATWALK gold accent branding
 
 ### CLI Mode
 
 #### Encrypt
 
 ```bash
-au79-crypto encrypt <input_file> <output_file> [--no-metadata] [--no-compress]
+catwalk encrypt <input_file> <output_file> [--no-metadata] [--no-compress]
 ```
 
 You will be prompted for a password.
@@ -86,7 +86,7 @@ You will be prompted for a password.
 #### Decrypt
 
 ```bash
-au79-crypto decrypt <input_file> <output_file> [--force]
+catwalk decrypt <input_file> <output_file> [--force]
 ```
 
 The `--force` flag allows overwriting existing output files. The original file extension is automatically restored.
@@ -94,28 +94,28 @@ The `--force` flag allows overwriting existing output files. The original file e
 #### File Info
 
 ```bash
-au79-crypto info <input_file>
+catwalk info <input_file>
 ```
 
-Displays metadata about an encrypted `.au79` file without decrypting it (version, timestamp, Argon2 parameters, original extension).
+Displays metadata about an encrypted `.catwalk` file without decrypting it (version, timestamp, Argon2 parameters, original extension).
 
 ## Examples
 
 ```bash
 # Encrypt a document
-au79-crypto encrypt report.pdf report.au79
+catwalk encrypt report.pdf report.catwalk
 
 # Encrypt with privacy options (no timestamp, no compression)
-au79-crypto encrypt report.pdf report.au79 --no-metadata --no-compress
+catwalk encrypt report.pdf report.catwalk --no-metadata --no-compress
 
 # Decrypt it (original .pdf extension is restored automatically)
-au79-crypto decrypt report.au79 report
+catwalk decrypt report.catwalk report
 
 # View encrypted file metadata
-au79-crypto info report.au79
+catwalk info report.catwalk
 
 # Launch the GUI
-au79-crypto
+catwalk
 ```
 
 ## Technical Details
@@ -131,7 +131,7 @@ password + random salt + timestamp
         v
     master_key (32 bytes)
         |
-        v (BLAKE3 derive_key "au79-crypto.v9.cipher")
+        v (BLAKE3 derive_key "catwalk.v9.cipher")
     cipher_key (32 bytes)
         |
         v
@@ -173,12 +173,12 @@ The `CmlSpongeState` is a 16-site Coupled Map Lattice (CML) operating as a crypt
 
 | Stage | Operation | Purpose |
 |-------|-----------|---------|
-| 1. Counter injection | Weyl sequence (φ × 2⁶⁴) added to all 16 sites with prime rotations | Breaks complement symmetry, prevents fixed points |
-| 2. Local maps | Logistic map on even sites, tent map on odd sites | Nonlinear confusion via chaotic dynamics |
-| 3. Nearest-neighbor coupling | Each site XOR-mixed with left/right neighbors (rotated) | Spatial diffusion across the lattice |
-| 4. Global mixing | ARX cross-coupling across all 16 words | Full-state avalanche |
+| 1. Counter injection | Weyl sequence (φ × 2⁶⁴) added to all 16 sites with prime rotations | State diversification; ensures no site pair is (0,0) before map |
+| 2. Local map | Arnold's Cat Map on adjacent pairs (0,1),(2,3),…,(14,15) — `(x,y)→(x+y, x+2y)` | Provably hyperbolic nonlinear mixing; natively integer, no approximation |
+| 3. CML coupling | Each site additively coupled with neighbors at distances {1, 7, 8} | Full 16-site diffusion in exactly 4 rounds |
+| 4. Multiplicative mixing | `s[2k+1] *= (s[2k] | 1)` for k=0..7 | Second nonlinear layer on same adjacent pairs |
 
-**Output finalizer:** Each squeezed word passes through Stafford Mix13 (the bijective finalizer used by SplitMix64 / PCG), eliminating the low-bit structural bias inherent to the tent map. Stafford Mix13 is fully invertible — no entropy is lost.
+**Output finalizer:** Each squeezed word passes through Stafford Mix13 (the bijective finalizer used by SplitMix64 / PCG) for additional output whitening. Stafford Mix13 is fully invertible — no entropy is lost.
 
 **Sponge construction (SpongeWrap AEAD):**
 - Multi-rate padding with domain constants (KEY=0x01, IV=0x02, AAD=0x03, CT=0x04, TAG=0x05)
@@ -192,7 +192,7 @@ All arithmetic uses `u64`/`u128` wrapping operations, guaranteeing identical res
 
 | Field | Size | Description |
 |-------|------|-------------|
-| Magic | 4 bytes | `AU79` |
+| Magic | 4 bytes | `CATW` |
 | Version | 1 byte | `9` |
 | Flags | 1 byte | Bit 0: STRIP_METADATA, Bit 1: NO_COMPRESS |
 | Salt | 16 bytes | Random, used as Argon2id salt prefix |

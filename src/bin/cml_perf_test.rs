@@ -3,7 +3,7 @@
 /// Run with: cargo run --release --bin cml_perf_test
 use std::time::Instant;
 
-use au79_crypto::cml_sponge::{cipher_init, keystream};
+use catwalk::cml_sponge::{cipher_init, keystream};
 
 fn bench_mb(mb: usize) -> f64 {
     let key = blake3::derive_key("cml-sponge.bench.key", b"perf-test-seed-v1");
@@ -33,5 +33,5 @@ fn main() {
     println!("\nReference points (typical x86-64 software implementations):");
     println!("  ChaCha20:        ~1500–3000 MB/s (without AVX-512)");
     println!("  AES-128-CTR:     ~3000–6000 MB/s (AES-NI)");
-    println!("  AU79-Crypto v8:  ~460  MB/s  (same hardware)");
+    println!("  CATWALK v8:      ~460  MB/s  (same hardware)");
 }

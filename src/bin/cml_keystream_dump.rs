@@ -1,17 +1,25 @@
 /// Dumps raw CML-Sponge keystream bytes to stdout for statistical testing.
 ///
 /// Usage:
-///   cml_keystream_dump [seed_index]       (seed_index: 0-255, default 0)
+///   cml_keystream_dump [seed_index]
 ///   cml_keystream_dump | RNG_test stdin64
-///   cml_keystream_dump 5 | RNG_test stdin64 -tlmax 16GB
+///   cml_keystream_dump 5 | RNG_test stdin64 -tlmax 256GB
 ///
-/// Outputs an infinite stream of bytes from the CML-Sponge cipher seeded with
-/// a deterministic test key derived via BLAKE3. Different seed indices produce
-/// independent, non-overlapping streams.
+/// Seed modes:
+///   seed 0–253  : random-looking key AND IV both derived from the seed index.
+///                 Each seed produces an independent stream — use these to test
+///                 multiple (key, IV) pairs.
+///   seed 254    : all-zero key (0x00…00), all-zero IV — tests degenerate inputs.
+///   seed 255    : all-FF key (0xFF…FF), all-FF IV — tests the other extreme.
+///
+/// Key/IV derivation for seeds 0–253:
+///   key = BLAKE3("cml-sponge.practrand.key.v2",  seed_material)
+///   iv  = BLAKE3("cml-sponge.practrand.iv.v2",   seed_material)[0..16]
+/// where seed_material = "cml-sponge statistical evaluation seed v2" ++ [seed_index].
 use std::env;
 use std::io::{self, Write, BufWriter};
 
-use au79_crypto::cml_sponge::{cipher_init, keystream};
+use catwalk::cml_sponge::{cipher_init, keystream};
 
 fn main() {
     let args: Vec<String> = env::args().collect();
@@ -21,11 +29,20 @@ fn main() {
         0
     };
 
-    // Derive a deterministic 32-byte key from the seed index using BLAKE3.
-    let mut seed_material = b"cml-sponge statistical evaluation seed v1".to_vec();
-    seed_material.push(seed_index);
-    let key = blake3::derive_key("cml-sponge.practrand.test.key.v1", &seed_material);
-    let iv = [0u8; 16];
+    let (key, iv): ([u8; 32], [u8; 16]) = match seed_index {
+        254 => ([0x00u8; 32], [0x00u8; 16]),
+        255 => ([0xFFu8; 32], [0xFFu8; 16]),
+        idx => {
+            let mut seed_material = b"cml-sponge statistical evaluation seed v2".to_vec();
+            seed_material.push(idx);
+            let key = blake3::derive_key("cml-sponge.practrand.key.v2", &seed_material);
+            // Derive IV from the same seed with a distinct context string.
+            let iv_full = blake3::derive_key("cml-sponge.practrand.iv.v2", &seed_material);
+            let mut iv = [0u8; 16];
+            iv.copy_from_slice(&iv_full[..16]);
+            (key, iv)
+        }
+    };
 
     let mut state = cipher_init(&key, &iv);
     let stdout = io::stdout();

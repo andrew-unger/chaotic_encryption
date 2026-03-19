@@ -79,10 +79,10 @@ impl Drop for LockedBuffer {
 // ── Constants ────────────────────────────────────────────────────────────────
 
 pub mod constants {
-    /// File format version.  v8 used ChaoticKeystream + BLAKE3 MAC.
-    /// v9 uses CML-Sponge AEAD natively (single primitive for cipher + auth).
+    /// File format version.  v9 uses CML-Sponge AEAD natively
+    /// (single primitive for cipher + auth via sponge capacity).
     pub const VERSION: u8 = 9;
-    pub const MAGIC: &[u8; 4] = b"AU79";
+    pub const MAGIC: &[u8; 4] = b"CATW";
     pub const SALT_LEN: usize = 16;
     pub const HASH_LEN: usize = 32;
     pub const NONCE_LEN: usize = 16;
@@ -159,19 +159,9 @@ fn derive_key(
     Ok(key)
 }
 
-/// Derive the single v9 cipher key from the master key.
-///
-/// v9 uses one subkey for the CML-Sponge AEAD primitive (handles both
-/// encryption and authentication internally via the sponge capacity).
+/// Derive the v9 cipher key from the master key via BLAKE3 domain derivation.
 fn derive_cipher_key_v9(master_key: &[u8; 32]) -> [u8; 32] {
-    blake3::derive_key("au79-crypto.v9.cipher", master_key)
-}
-
-/// Derive the v8 subkeys (kept for backward-compatible decryption of v8 files).
-fn derive_subkeys_v8(master_key: &[u8; 32]) -> ([u8; 32], [u8; 32]) {
-    let chaos_key = blake3::derive_key("au79-crypto.v8.chaos", master_key);
-    let mac_key   = blake3::derive_key("au79-crypto.v8.mac",   master_key);
-    (chaos_key, mac_key)
+    blake3::derive_key("catwalk.v9.cipher", master_key)
 }
 
 // ── Password Validation ──────────────────────────────────────────────────────
@@ -199,6 +189,26 @@ pub fn validate_password(password: &str) -> Result<(), &'static str> {
 
 // ── Encrypt (v9 — CML-Sponge AEAD) ──────────────────────────────────────────
 
+/// Encrypt `plaintext` and return the complete CATWALK v9 ciphertext bundle.
+///
+/// The returned bytes contain the header, ciphertext, and 32-byte AEAD tag —
+/// all in one contiguous buffer ready to write to disk.
+///
+/// # Arguments
+///
+/// - `plaintext` — raw file bytes to encrypt.
+/// - `password` — must satisfy the requirements checked by [`validate_password`];
+///   call that function first if you want a human-readable error before attempting encryption.
+/// - `input_filename` — used to extract the file extension stored in the header
+///   (unless `options.strip_metadata` is set).  Pass `""` if there is no source filename.
+/// - `options` — controls compression and metadata stripping; see [`EncryptOptions`].
+/// - `progress` — optional callback called with values in `[0.0, 1.0]` as each phase
+///   completes.  Called from the same thread; must not block.
+///
+/// # Errors
+///
+/// Returns [`CryptoError`] on KDF failure, system time error, or I/O error.
+/// See [`validate_password`] for password policy enforcement.
 pub fn encrypt(
     plaintext: &[u8],
     password: &str,
@@ -300,9 +310,9 @@ pub fn encrypt(
 
     // Phase 4: Finalise tag + assemble output (0.85 → 0.90)
     //
-    // The 32-byte sponge tag replaces the separate BLAKE3 keyed MAC used in
-    // v8.  It is bound to: cipher_key, nonce, all header fields (AAD), and
-    // every ciphertext byte — providing Encrypt-then-MAC semantics natively.
+    // The 32-byte sponge tag is bound to: cipher_key, nonce, all header fields
+    // (AAD), and every ciphertext byte — providing Encrypt-then-MAC semantics
+    // natively via the sponge capacity.
     let tag = cml_sponge::aead_finalize(&mut sponge);
 
     let mut result = Vec::with_capacity(header.len() + ciphertext.len() + HASH_LEN);
@@ -314,8 +324,32 @@ pub fn encrypt(
     Ok(result)
 }
 
-// ── Decrypt (v9 + v8 backward-compatible) ───────────────────────────────────
+// ── Decrypt (v9 — CML-Sponge AEAD) ──────────────────────────────────────────
 
+/// Decrypt a complete CATWALK v9 ciphertext bundle and return `(plaintext, extension)`.
+///
+/// `extension` is the original file extension stored in the header (empty string if
+/// `strip_metadata` was set during encryption or no extension was present).
+///
+/// Verification is performed **before** the plaintext is returned.  The function
+/// returns `Err(CryptoError::AuthenticationFailed)` if the AEAD tag does not match,
+/// and no plaintext bytes are ever returned to the caller in that case.
+///
+/// # Arguments
+///
+/// - `ciphertext_bundle` — the complete output of [`encrypt`]: header + ciphertext + tag.
+/// - `password` — the password used during encryption.
+/// - `progress` — optional progress callback; see [`encrypt`] for details.
+///
+/// # Errors
+///
+/// - [`CryptoError::InvalidMagicBytes`] — first 4 bytes are not `CATW`.
+/// - [`CryptoError::InvalidVersion`] — version byte is not the current version (9).
+/// - [`CryptoError::InvalidCiphertextLength`] — bundle is too short to contain a valid header.
+/// - [`CryptoError::WeakKdfParameters`] — Argon2 memory < 64 MB or iterations < 2.
+/// - [`CryptoError::AuthenticationFailed`] — tag mismatch (wrong password or tampered data).
+/// - [`CryptoError::KeyDerivationFailed`] — Argon2id internal error.
+/// - [`CryptoError::DecompressionFailed`] — decompression error (corrupt compressed data).
 pub fn decrypt(
     ciphertext_bundle: &[u8],
     password: &str,
@@ -336,7 +370,7 @@ pub fn decrypt(
     }
 
     let version = ciphertext_bundle[4];
-    if version != 8 && version != VERSION {
+    if version != VERSION {
         return Err(CryptoError::InvalidVersion);
     }
 
@@ -379,35 +413,16 @@ pub fn decrypt(
     );
     report(progress, 0.35);
 
-    // Dispatch on file format version.
-    if version == 8 {
-        eprintln!(
-            "Warning: this file uses the v8 legacy cipher (ChaoticKeystream + BLAKE3). \
-             Re-encrypt with the current version for best security."
-        );
-        decrypt_v8(
-            master_key.get(),
-            nonce_bytes,
-            &ciphertext_bundle[..cipher_start],
-            encrypted,
-            stored_tag,
-            flags,
-            extension,
-            progress,
-        )
-    } else {
-        // version == VERSION (9)
-        decrypt_v9(
-            master_key.get(),
-            nonce_bytes,
-            &ciphertext_bundle[..cipher_start],
-            encrypted,
-            stored_tag,
-            flags,
-            extension,
-            progress,
-        )
-    }
+    decrypt_v9(
+        master_key.get(),
+        nonce_bytes,
+        &ciphertext_bundle[..cipher_start],
+        encrypted,
+        stored_tag,
+        flags,
+        extension,
+        progress,
+    )
 }
 
 // ── v9 decryption (CML-Sponge AEAD) ─────────────────────────────────────────
@@ -456,76 +471,13 @@ fn decrypt_v9(
     if computed_tag.ct_eq(stored_tag).unwrap_u8() != 1 {
         return Err(CryptoError::IntegrityCheckFailed);
     }
-    report(progress, 0.40);
+    report(progress, 0.88);
 
-    // Phase 4: Decompression (0.85 → 0.90)
+    // Phase 4: Decompression (0.88 → 0.90)
     let no_compress = (flags & FLAG_NO_COMPRESS) != 0;
     let plaintext = if no_compress { decrypted } else { decompress_data(&decrypted)? };
     report(progress, 0.90);
 
-    let extension_str = String::from_utf8_lossy(extension).to_string();
-    Ok((plaintext, extension_str))
-}
-
-// ── v8 decryption (ChaoticKeystream + BLAKE3 MAC — legacy) ──────────────────
-
-#[allow(clippy::too_many_arguments)]
-fn decrypt_v8(
-    master_key: &[u8; 32],
-    nonce_bytes: &[u8],
-    header: &[u8],
-    encrypted: &[u8],
-    stored_mac: &[u8],
-    flags: u8,
-    extension: &[u8],
-    progress: &Option<&ProgressFn>,
-) -> Result<(Vec<u8>, String), CryptoError> {
-    use crate::chaos::ChaoticKeystream;
-
-    let (chaos_key_raw, mac_key_raw) = derive_subkeys_v8(master_key);
-    let chaos_key = LockedBuffer::new(chaos_key_raw);
-    let mac_key   = LockedBuffer::new(mac_key_raw);
-
-    // Reconstruct the MAC input from the header + ciphertext.
-    // header contains all bytes before the ciphertext (magic through extension).
-    let ext_len_byte = header[header.len() - 1 - extension.len()];
-    let mut mac = blake3::Hasher::new_keyed(mac_key.get());
-    mac.update(header);
-    mac.update(encrypted);
-    let expected_mac = mac.finalize();
-
-    if expected_mac.as_bytes().ct_eq(stored_mac).unwrap_u8() != 1 {
-        return Err(CryptoError::IntegrityCheckFailed);
-    }
-    report(progress, 0.40);
-
-    let nonce: [u8; NONCE_LEN] = nonce_bytes
-        .try_into()
-        .map_err(|_| CryptoError::InvalidCiphertextLength)?;
-    let mut keystream = ChaoticKeystream::new(chaos_key.get(), &nonce);
-
-    let mut decrypted = encrypted.to_vec();
-    const CHUNK: usize = 65536;
-    let total_len = decrypted.len();
-    if total_len > 0 {
-        let mut offset = 0;
-        while offset < total_len {
-            let end = (offset + CHUNK).min(total_len);
-            keystream.apply_keystream(&mut decrypted[offset..end]);
-            offset = end;
-            if progress.is_some() {
-                let frac = offset as f32 / total_len as f32;
-                report(progress, 0.40 + frac * 0.45);
-            }
-        }
-    }
-    report(progress, 0.85);
-
-    let no_compress = (flags & FLAG_NO_COMPRESS) != 0;
-    let plaintext = if no_compress { decrypted } else { decompress_data(&decrypted)? };
-    report(progress, 0.90);
-
-    let _ = ext_len_byte; // suppress unused warning
     let extension_str = String::from_utf8_lossy(extension).to_string();
     Ok((plaintext, extension_str))
 }

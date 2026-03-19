@@ -3,7 +3,7 @@ REM Multi-seed PractRand validation script
 REM Runs PractRand (16 GB each) across 10 different seed indices.
 REM
 REM Prerequisites:
-REM   - cargo build --release (au79-crypto keystream_dump binary)
+REM   - cargo build --release (catwalk keystream_dump binary)
 REM   - PractRand RNG_test.exe compiled and on PATH or set PRACTRAND below
 REM
 REM Usage:
@@ -32,7 +32,7 @@ REM ── Create log directory ────────────────
 if not exist "%LOG_DIR%" mkdir "%LOG_DIR%"
 
 echo ============================================================
-echo  AU79-Crypto Multi-Seed PractRand Validation
+echo  CATWALK Multi-Seed PractRand Validation
 echo  Seeds: 0-%SEED_COUNT%   Length: %MAX_LENGTH% each
 echo ============================================================
 echo.

@@ -10,7 +10,7 @@
 //!
 //! Run with: cargo run --release --bin cml_reduced_round
 
-use au79_crypto::cml_sponge::{cipher_init_r, keystream_r};
+use catwalk::cml_sponge::{cipher_init_r, keystream_r};
 
 const SAMPLE_BYTES: usize = 1_000_000; // 1 MB per test
 const SEEDS: usize = 5;                // multiple seeds per round count

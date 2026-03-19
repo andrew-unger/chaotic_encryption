@@ -1,20 +1,25 @@
-use au79_crypto::crypto::{encrypt, decrypt, EncryptOptions};
+use std::sync::{Arc, Mutex};
+use catwalk::crypto::{encrypt, decrypt, EncryptOptions, ProgressFn};
+use catwalk::error::CryptoError;
+use catwalk::crypto::constants::MIN_HEADER_LEN;
 
 const DEFAULT_OPTS: EncryptOptions = EncryptOptions {
     strip_metadata: false,
     skip_compression: false,
 };
 
+// ── Existing round-trip tests ─────────────────────────────────────────────────
+
 #[test]
 fn round_trip_basic() {
-    let plaintext = b"Hello, this is a test of AU79 chaotic encryption!";
+    let plaintext = b"Hello, this is a test of CATWALK chaotic encryption!";
     let password = "testpassword123";
     let filename = "test.txt";
 
     let encrypted = encrypt(plaintext, password, filename, &DEFAULT_OPTS, None).expect("encryption failed");
 
     // Verify magic bytes and version
-    assert_eq!(&encrypted[..4], b"AU79");
+    assert_eq!(&encrypted[..4], b"CATW");
     assert_eq!(encrypted[4], 9); // version 9
 
     let (decrypted, ext) = decrypt(&encrypted, password, None).expect("decryption failed");
@@ -70,12 +75,12 @@ fn tampered_ciphertext_fails() {
 
     let mut encrypted = encrypt(plaintext, password, filename, &DEFAULT_OPTS, None).expect("encryption failed");
 
-    // Tamper with a byte in the ciphertext region (past the header, before MAC)
-    let tamper_pos = encrypted.len() - 33; // one byte before the 32-byte MAC
+    // Tamper with a byte in the ciphertext region (past the header, before tag)
+    let tamper_pos = encrypted.len() - 33; // one byte before the 32-byte tag
     encrypted[tamper_pos] ^= 0xFF;
 
     let result = decrypt(&encrypted, password, None);
-    assert!(result.is_err(), "tampered ciphertext should fail MAC check");
+    assert!(result.is_err(), "tampered ciphertext should fail tag check");
 }
 
 #[test]
@@ -148,4 +153,165 @@ fn round_trip_both_flags() {
     let (decrypted, ext) = decrypt(&encrypted, password, None).expect("decryption failed");
     assert_eq!(decrypted, plaintext);
     assert_eq!(ext, "");
+}
+
+// ── Error case tests ──────────────────────────────────────────────────────────
+
+#[test]
+fn invalid_magic_bytes_rejected() {
+    let mut data = vec![0u8; MIN_HEADER_LEN + 10];
+    data[0..4].copy_from_slice(b"FAKE");
+    data[4] = 9; // correct version
+    let result = decrypt(&data, "password", None);
+    assert!(matches!(result, Err(CryptoError::InvalidMagicBytes)),
+        "expected InvalidMagicBytes, got {:?}", result.err());
+}
+
+#[test]
+fn truncated_file_rejected() {
+    // Too short to be a valid header
+    let data = vec![b'C', b'A', b'T', b'W', 9u8, 0u8];
+    let result = decrypt(&data, "password", None);
+    assert!(matches!(result, Err(CryptoError::InvalidCiphertextLength)),
+        "expected InvalidCiphertextLength, got {:?}", result.err());
+}
+
+#[test]
+fn wrong_version_byte_rejected() {
+    // Build a MIN_HEADER_LEN-sized blob with correct magic but version 8
+    let mut data = vec![0u8; MIN_HEADER_LEN + 10];
+    data[0..4].copy_from_slice(b"CATW");
+    data[4] = 8; // old version — now invalid
+    // Fill argon2 fields with safe values so we reach the version check
+    let result = decrypt(&data, "password", None);
+    assert!(matches!(result, Err(CryptoError::InvalidVersion)),
+        "expected InvalidVersion, got {:?}", result.err());
+}
+
+#[test]
+fn weak_kdf_params_rejected() {
+    // Build a header with correct magic/version but m_log2 below minimum (16)
+    let mut data = vec![0u8; MIN_HEADER_LEN + 10];
+    data[0..4].copy_from_slice(b"CATW");
+    data[4] = 9;   // correct version
+    data[5] = 0;   // flags
+    // salt: bytes 6..22 (16 bytes) — leave as zero
+    // timestamp: bytes 22..30 (8 bytes) — leave as zero
+    // nonce: bytes 30..46 (16 bytes) — leave as zero
+    // argon params: bytes 46..49
+    data[46] = 10; // m_log2 = 10 — below minimum of 16
+    data[47] = 4;  // t_cost = 4
+    data[48] = 1;  // p_cost = 1
+    // ext_len: byte 49 = 0
+    let result = decrypt(&data, "password", None);
+    assert!(matches!(result, Err(CryptoError::WeakKdfParameters)),
+        "expected WeakKdfParameters, got {:?}", result.err());
+}
+
+#[test]
+fn tampered_tag_fails() {
+    let plaintext = b"tag tamper test";
+    let password = "tag_tamper_pass";
+    let filename = "test.bin";
+
+    let mut encrypted = encrypt(plaintext, password, filename, &DEFAULT_OPTS, None).expect("encryption failed");
+
+    // Flip a byte in the last 32 bytes (the tag)
+    let last = encrypted.len();
+    encrypted[last - 1] ^= 0xFF;
+
+    let result = decrypt(&encrypted, password, None);
+    assert!(matches!(result, Err(CryptoError::IntegrityCheckFailed)),
+        "expected IntegrityCheckFailed, got {:?}", result.err());
+}
+
+#[test]
+fn tampered_header_fails() {
+    let plaintext = b"header tamper test";
+    let password = "header_tamper_pass";
+    let filename = "test.bin";
+
+    let mut encrypted = encrypt(plaintext, password, filename, &DEFAULT_OPTS, None).expect("encryption failed");
+
+    // Flip a byte in the header (nonce region — bytes 30..46)
+    encrypted[30] ^= 0x01;
+
+    let result = decrypt(&encrypted, password, None);
+    assert!(matches!(result, Err(CryptoError::IntegrityCheckFailed)),
+        "expected IntegrityCheckFailed (AAD mismatch), got {:?}", result.err());
+}
+
+// ── Edge case tests ───────────────────────────────────────────────────────────
+
+#[test]
+fn zero_length_plaintext_with_compression() {
+    let opts = EncryptOptions { strip_metadata: false, skip_compression: false };
+    let encrypted = encrypt(b"", "edge_case_pass!", "empty.txt", &opts, None)
+        .expect("encryption failed");
+    let (decrypted, ext) = decrypt(&encrypted, "edge_case_pass!", None)
+        .expect("decryption failed");
+    assert!(decrypted.is_empty());
+    assert_eq!(ext, "txt");
+}
+
+#[test]
+fn max_extension_length() {
+    // ext_len is stored as u8, so max is 255 characters
+    let ext: String = "a".repeat(255);
+    let filename = format!("file.{}", ext);
+    let plaintext = b"max extension test";
+    let password = "max_ext_pass_test!";
+    let opts = EncryptOptions { strip_metadata: false, skip_compression: true };
+
+    let encrypted = encrypt(plaintext, password, &filename, &opts, None)
+        .expect("encryption failed");
+    let (decrypted, recovered_ext) = decrypt(&encrypted, password, None)
+        .expect("decryption failed");
+    assert_eq!(decrypted, plaintext);
+    assert_eq!(recovered_ext, ext);
+}
+
+// ── Progress monotonicity tests ───────────────────────────────────────────────
+
+fn collect_progress(cb_values: Arc<Mutex<Vec<f32>>>) -> ProgressFn {
+    Box::new(move |v: f32| {
+        cb_values.lock().unwrap().push(v);
+    })
+}
+
+#[test]
+fn progress_is_monotone_encrypt() {
+    let values = Arc::new(Mutex::new(Vec::<f32>::new()));
+    let cb = collect_progress(values.clone());
+    let plaintext: Vec<u8> = (0..50_000).map(|i| (i % 256) as u8).collect();
+    encrypt(&plaintext, "monotone_test_pass!", "test.bin", &DEFAULT_OPTS, Some(&cb))
+        .expect("encryption failed");
+
+    let v = values.lock().unwrap();
+    assert!(!v.is_empty(), "no progress values reported");
+    for w in v.windows(2) {
+        assert!(w[1] >= w[0],
+            "progress regressed: {} then {}", w[0], w[1]);
+    }
+    assert!(*v.last().unwrap() >= 0.9,
+        "final progress value too low: {}", v.last().unwrap());
+}
+
+#[test]
+fn progress_is_monotone_decrypt() {
+    let plaintext: Vec<u8> = (0..50_000).map(|i| (i % 256) as u8).collect();
+    let encrypted = encrypt(&plaintext, "monotone_test_pass!", "test.bin", &DEFAULT_OPTS, None)
+        .expect("encryption failed");
+
+    let values = Arc::new(Mutex::new(Vec::<f32>::new()));
+    let cb = collect_progress(values.clone());
+    decrypt(&encrypted, "monotone_test_pass!", Some(&cb))
+        .expect("decryption failed");
+
+    let v = values.lock().unwrap();
+    assert!(!v.is_empty(), "no progress values reported");
+    for w in v.windows(2) {
+        assert!(w[1] >= w[0],
+            "progress regressed: {} then {}", w[0], w[1]);
+    }
 }
