@@ -129,7 +129,7 @@ fn bench_decrypt(c: &mut Criterion) {
 // still gives a realistic shape: total memory traffic ≈ 128 MiB per call.
 //
 // To measure the full production KDF once, run:
-//   cargo bench --bench eddy_bench -- kdf_only --profile-time 1
+//   cargo bench --bench catwalk_bench -- kdf_only --profile-time 1
 
 fn bench_kdf(c: &mut Criterion) {
     const SALT: [u8; 16] = [

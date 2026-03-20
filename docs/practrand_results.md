@@ -180,8 +180,6 @@ with any of the following weaknesses would typically fail within the first few g
 
 - Complement symmetry (e.g. key ⊕ MAX produces same stream)
 - Short period or state collapse on degenerate inputs
-- Complement symmetry on degenerate key/IV inputs
-- Short period or state collapse on degenerate inputs
 - Low-order bit bias in the output stream
 - Correlated outputs from different key/IV pairs
 

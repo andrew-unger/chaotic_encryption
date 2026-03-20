@@ -91,16 +91,16 @@ attacks expensive.
 
 ## Baseline and regression tracking
 
-These numbers serve as the v9 baseline.  To save them for future comparison:
+These numbers serve as the v10 baseline.  To save them for future comparison:
 
 ```sh
-cargo bench --bench catwalk_bench -- --save-baseline v9
+cargo bench --bench catwalk_bench -- --save-baseline v10
 ```
 
 To compare a future change against this baseline:
 
 ```sh
-cargo bench --bench catwalk_bench -- --baseline v9
+cargo bench --bench catwalk_bench -- --baseline v10
 ```
 
 HTML reports are written to `target/criterion/` when `html_reports` feature is enabled.

@@ -347,9 +347,9 @@ pub fn encrypt(
 /// - [`CryptoError::InvalidVersion`] — version byte is not the current version (9).
 /// - [`CryptoError::InvalidCiphertextLength`] — bundle is too short to contain a valid header.
 /// - [`CryptoError::WeakKdfParameters`] — Argon2 memory < 64 MB or iterations < 2.
-/// - [`CryptoError::AuthenticationFailed`] — tag mismatch (wrong password or tampered data).
+/// - [`CryptoError::IntegrityCheckFailed`] — tag mismatch (wrong password or tampered data).
 /// - [`CryptoError::KeyDerivationFailed`] — Argon2id internal error.
-/// - [`CryptoError::DecompressionFailed`] — decompression error (corrupt compressed data).
+/// - [`CryptoError::DecompressionTooLarge`] — decompression exceeds maximum allowed size.
 pub fn decrypt(
     ciphertext_bundle: &[u8],
     password: &str,

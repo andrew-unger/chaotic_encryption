@@ -1,3 +1,9 @@
+// Note: Test passwords in this file are intentionally shorter than the 18-character
+// minimum enforced by `validate_password`.  The `encrypt()` and `decrypt()` functions
+// do NOT call `validate_password` — that is the caller's responsibility (enforced in
+// the CLI and GUI).  These tests exercise the cipher and AEAD round-trip, not the
+// password policy.
+
 use std::sync::{Arc, Mutex};
 use catwalk::crypto::{encrypt, decrypt, EncryptOptions, ProgressFn};
 use catwalk::error::CryptoError;

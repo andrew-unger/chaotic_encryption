@@ -26,7 +26,7 @@
 //! - Squeeze: output 64 bytes from rate, permute, repeat.
 //!
 //! **Cross-platform determinism:** all arithmetic is u64/u128 wrapping.
-//! Output is byte-for-byte identical to the Python reference implementation.
+//! Canonical output is defined by the test vectors in `tests/cml_sponge_tests.rs`.
 
 use zeroize::Zeroize;
 

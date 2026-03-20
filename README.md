@@ -15,7 +15,6 @@ Available as both a command-line tool and a cross-platform graphical application
 - **Single Subkey** — BLAKE3 `derive_key` produces one 256-bit cipher key; the sponge handles both encryption and authentication
 - **Streaming Encryption** — Data is processed in 64 KB chunks with no full-file keystream allocation
 - **Memory-Locked Keys** — Heap-allocated key buffers, VirtualLock prevents swapping to disk; zeroized on drop
-- **Backward Compatibility** — v8 files (ChaoticKeystream + BLAKE3 MAC) are automatically detected and decrypted
 - **Privacy Options** — Optional metadata stripping and compression bypass to minimize information leakage
 - **Argon2 Parameter Floor** — Decryption rejects artificially weak KDF parameters (prevents timing oracle attacks)
 - **File Extension Preservation** — Original file extension is restored on decryption
@@ -183,8 +182,8 @@ The `CmlSpongeState` is a 16-site Coupled Map Lattice (CML) operating as a crypt
 **Sponge construction (SpongeWrap AEAD):**
 - Multi-rate padding with domain constants (KEY=0x01, IV=0x02, AAD=0x03, CT=0x04, TAG=0x05)
 - State evolution is identical for encryption and decryption (both absorb ciphertext bytes), enabling tag verification from the sponge capacity without a separate MAC
-- Encryption: `keystream_word XOR plaintext_word → ciphertext; absorb(ciphertext)`
-- Decryption: `absorb(ciphertext); keystream_word XOR ciphertext_word → plaintext`
+- Encryption: `squeeze keystream → XOR plaintext → ciphertext; absorb(ciphertext)`
+- Decryption: `squeeze keystream → save ciphertext; XOR ciphertext → plaintext; absorb(saved ciphertext)`
 
 All arithmetic uses `u64`/`u128` wrapping operations, guaranteeing identical results on every platform.
 
@@ -208,9 +207,9 @@ All arithmetic uses `u64`/`u128` wrapping operations, guaranteeing identical res
 
 All fields from Magic through Extension are authenticated as associated data (absorbed but not encrypted).
 
-### Backward Compatibility
+### Version Note
 
-v8 files (ChaoticKeystream + BLAKE3 MAC) are automatically detected via the version byte and decrypted using the legacy path. v9/v10 share the same file format (version byte = 9); v10 refers to the cipher internals (5-term coupling), not the file format version.
+v9 and v10 share the same file format (version byte = 9); v10 refers to the cipher internals (5-term coupling), not the file format version.
 
 ## Dependencies
 
@@ -247,7 +246,7 @@ The strength meter provides real-time feedback:
 
 The CML-Sponge keystream (8 rounds, seed 0) has been validated with:
 
-- **PractRand** — 128 GB+, 355+ tests, zero anomalies (ongoing)
+- **PractRand** — 1 TB × 2 seeds (v10), 256 GB × 5 seeds (original coupling); 397 tests, zero persistent anomalies
 - **Reduced-round analysis** — 1-round, 4-round, and 8-round variants each pass PractRand to 1 GB, 16 GB, and 32 GB+ respectively before the first anomaly (none found yet)
 - **Multi-seed CI tests** — 50 seeds × 1 MB each: chi-squared byte frequency (Bonferroni-corrected), monobit, and serial correlation
 - **Single-seed suite** — 10 statistical tests including avalanche (single-bit key and IV sensitivity), gap, runs, compression ratio, and byte-pair frequency

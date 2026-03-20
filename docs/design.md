@@ -2,7 +2,7 @@
 
 **Version:** v10 (CML-Sponge AEAD — 5-term coupling)
 **Status:** Research implementation — self-reviewed, awaiting independent cryptanalysis
-**Implementation:** `src/cml_sponge.rs` (Rust), `cml_sponge/src/cml_sponge.py` (Python reference)
+**Implementation:** `src/cml_sponge.rs` (Rust)
 
 ---
 
@@ -66,7 +66,7 @@ to model with algebraic or differential techniques than pure ARX.
 CATWALK claims to be a **cryptographically secure stream cipher with AEAD support**
 based on a CML-Sponge construction. The claim is:
 
-**Proven:** Full 16-site diffusion in 4 CML rounds (analytically — see §2.5).
+**Proven:** Full 16-site diffusion in 2 CML rounds (analytically — see §2.5).
 **Conjectured:** The 8-round permutation is computationally indistinguishable from
 a random permutation under the assumption that the CML nonlinearity, Weyl counter
 injection, and multiplicative mixing together defeat known algebraic and

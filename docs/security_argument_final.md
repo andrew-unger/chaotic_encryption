@@ -589,11 +589,11 @@ The Cat Map, coupling, and multiplicative mixing are implemented entirely in ter
 
 The key and IV are absorbed via separate domain-separated absorb calls.  **[CONJECTURE]** The sponge capacity after `absorb(key, 0x01)` carries enough hidden state that the IV, even a chosen IV, cannot trivially relate the post-init state to the post-key state.  This has not been formally analyzed under the assumption that the permutation deviates from ideal.
 
-### 7.7 5-Term Coupling as a Potential Improvement [INFORMATIONAL]
+### 7.7 5-Term Coupling [RESOLVED — Implemented in v10]
 
-The 4-term coupling has an inherent 2-bit capacity reduction due to p(1) = 4 (even).  A 5-term unit-coefficient coupling polynomial p(x) = 1 + x^{d1} + x^{d2} + x^{d3} + x^{d4} has p(1) = 5 (odd), which would make the coupling invertible over Z/2^64Z and eliminate the 2-bit capacity loss.  Whether a 5-term polynomial with all 16 eigenvalues non-zero, fast diffusion, and good mixing properties exists has not been explored.
+The prior 4-term coupling ({1, 5, 11}) had an inherent 2-bit capacity reduction due to p(1) = 4 (even).  In v10, the coupling was upgraded to a 5-term polynomial p(x) = 1 + x + x³ + x⁷ + x¹¹ with distances {1, 3, 7, 11}.  This gives p(1) = 5 (odd), det(C) = −33075 (odd), making the coupling fully invertible over Z/2^64Z with trivial kernel — eliminating the 2-bit capacity loss entirely.  See §3 for the full analysis.
 
-A 3-term coupling (p(1) = 3, odd) was evaluated and rejected: all valid 3-term candidates have ≥ 3 unit-magnitude eigenvalues (|λ_k| = 1 for at least 3 values of k), meaning 3 or more Fourier modes of the lattice receive zero mixing energy from the coupling step.  This structural limitation makes 3-term coupling strictly inferior to the current 4-term design despite fixing the invertibility issue.
+A 3-term coupling (p(1) = 3, odd) was evaluated during the upgrade and rejected: all valid 3-term candidates have ≥ 3 unit-magnitude eigenvalues (|λ_k| = 1 for at least 3 values of k), meaning 3 or more Fourier modes of the lattice receive zero mixing energy from the coupling step.  This structural limitation makes 3-term coupling strictly inferior despite fixing the invertibility issue.
 
 ---
 
@@ -682,9 +682,7 @@ All 16 eigenvalues have strictly positive magnitude (all > 1).  The minimum is *
 
 ## Appendix C: Test Vectors
 
-Test vectors for the full cipher (cipher_init → keystream) are in `docs/design.md` §6 and `tests/cml_sponge_tests.rs`.  These vectors were regenerated for v10 after the coupling distance change from {1,5,11} to {1,3,7,11} and pass all 28 unit tests.
-
-The Python reference implementation (`cml_sponge/src/cml_sponge.py`) produces byte-for-byte identical output to the Rust implementation for all 4 test vectors, confirming cross-platform determinism.
+Test vectors for the full cipher (cipher_init → keystream) are in `docs/design.md` §6 and `tests/cml_sponge_tests.rs`.  These vectors were regenerated for v10 after the coupling distance change from {1,5,11} to {1,3,7,11} and pass all 29 unit tests.
 
 ---
 
