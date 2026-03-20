@@ -1,21 +1,29 @@
-/// Dumps raw CML-Sponge keystream bytes to stdout for statistical testing.
+/// Dumps raw CML-Sponge keystream bytes to stdout for PractRand statistical testing.
 ///
 /// Usage:
 ///   cml_keystream_dump [seed_index]
-///   cml_keystream_dump | RNG_test stdin64
-///   cml_keystream_dump 5 | RNG_test stdin64 -tlmax 256GB
+///   cml_keystream_dump 0   | RNG_test stdin64 -tlmax 1TB
+///   cml_keystream_dump 254 | RNG_test stdin64 -tlmax 1TB
 ///
-/// Seed modes:
-///   seed 0–253  : random-looking key AND IV both derived from the seed index.
-///                 Each seed produces an independent stream — use these to test
-///                 multiple (key, IV) pairs.
-///   seed 254    : all-zero key (0x00…00), all-zero IV — tests degenerate inputs.
-///   seed 255    : all-FF key (0xFF…FF), all-FF IV — tests the other extreme.
+/// Seed modes (CATWALK v10 validation matrix):
 ///
-/// Key/IV derivation for seeds 0–253:
-///   key = BLAKE3("cml-sponge.practrand.key.v2",  seed_material)
-///   iv  = BLAKE3("cml-sponge.practrand.iv.v2",   seed_material)[0..16]
-/// where seed_material = "cml-sponge statistical evaluation seed v2" ++ [seed_index].
+///   Seeds 0–3:   BLAKE3-derived key AND IV.
+///                seed_material = b"catwalk v10 practrand validation" ++ [seed_index as u8]
+///                key = BLAKE3::derive_key("catwalk.v10.practrand.key", seed_material)
+///                iv  = BLAKE3::derive_key("catwalk.v10.practrand.iv",  seed_material)[0..16]
+///
+///   Seed 64:     Alternating-bit degenerate case.
+///                key = [0xAA, 0x55, 0xAA, 0x55, ...] × 16 (32 bytes)
+///                iv  = [0xAA, 0x55, 0xAA, 0x55, ...] × 8  (16 bytes)
+///
+///   Seed 128:    High-bit degenerate case.
+///                key = [0x80; 32], iv = [0x80; 16]
+///
+///   Seed 254:    All-zero degenerate case.
+///                key = [0x00; 32], iv = [0x00; 16]
+///
+///   Seed 255:    All-ones degenerate case.
+///                key = [0xFF; 32], iv = [0xFF; 16]
 use std::env;
 use std::io::{self, Write, BufWriter};
 
@@ -32,12 +40,21 @@ fn main() {
     let (key, iv): ([u8; 32], [u8; 16]) = match seed_index {
         254 => ([0x00u8; 32], [0x00u8; 16]),
         255 => ([0xFFu8; 32], [0xFFu8; 16]),
+        128 => ([0x80u8; 32], [0x80u8; 16]),
+        64  => {
+            let mut key = [0u8; 32];
+            let mut iv  = [0u8; 16];
+            for i in 0..32 { key[i] = if i % 2 == 0 { 0xAA } else { 0x55 }; }
+            for i in 0..16 { iv[i]  = if i % 2 == 0 { 0xAA } else { 0x55 }; }
+            (key, iv)
+        }
         idx => {
-            let mut seed_material = b"cml-sponge statistical evaluation seed v2".to_vec();
+            // BLAKE3-derived key and IV for seeds 0–3 (and any other numeric seeds).
+            // Context strings are version-locked to CATWALK v10 validation.
+            let mut seed_material = b"catwalk v10 practrand validation".to_vec();
             seed_material.push(idx);
-            let key = blake3::derive_key("cml-sponge.practrand.key.v2", &seed_material);
-            // Derive IV from the same seed with a distinct context string.
-            let iv_full = blake3::derive_key("cml-sponge.practrand.iv.v2", &seed_material);
+            let key = blake3::derive_key("catwalk.v10.practrand.key", &seed_material);
+            let iv_full = blake3::derive_key("catwalk.v10.practrand.iv", &seed_material);
             let mut iv = [0u8; 16];
             iv.copy_from_slice(&iv_full[..16]);
             (key, iv)
