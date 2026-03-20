@@ -2,13 +2,13 @@
 
 ## Overview
 
-CATWALK is a file encryption tool built on a novel chaotic stream cipher. The v9 cipher (CML-Sponge) uses a 16-site Coupled Map Lattice operating as a cryptographic sponge — providing authenticated encryption natively without a separate MAC primitive. Key derivation is handled by Argon2id and all key material is memory-locked and zeroized after use.
+CATWALK is a file encryption tool built on a novel chaotic stream cipher. The v10 cipher (CML-Sponge) uses a 16-site Coupled Map Lattice operating as a cryptographic sponge — providing authenticated encryption natively without a separate MAC primitive. Key derivation is handled by Argon2id and all key material is memory-locked and zeroized after use.
 
 Available as both a command-line tool and a cross-platform graphical application.
 
 ## Features
 
-- **CML-Sponge AEAD** — 16-site Coupled Map Lattice with 1024-bit state, 8-round permutation, SpongeWrap authenticated encryption; local map is Arnold's Cat Map (parameter-free, provably hyperbolic, natively integer)
+- **CML-Sponge AEAD** — 16-site Coupled Map Lattice with 1024-bit state, 8-round permutation, SpongeWrap authenticated encryption; local map is Arnold's Cat Map (parameter-free, provably hyperbolic, natively integer); 5-term coupling with fully invertible circulant (det odd, trivial kernel, full 512-bit capacity)
 - **Native Authentication** — AEAD tag produced by the sponge capacity; no separate MAC primitive required
 - **Domain Separation** — Absorb phases (key, IV, AAD, ciphertext, tag) use distinct domain constants for strict phase isolation
 - **Argon2id Key Derivation** — Memory-hard password hashing (256 MB / 4 iterations); parameters are authenticated in the AEAD header
@@ -120,7 +120,7 @@ catwalk
 
 ## Technical Details
 
-### Encryption Pipeline (v9)
+### Encryption Pipeline (v10)
 
 ```
 password + random salt + timestamp
@@ -175,7 +175,7 @@ The `CmlSpongeState` is a 16-site Coupled Map Lattice (CML) operating as a crypt
 |-------|-----------|---------|
 | 1. Counter injection | Weyl sequence (φ × 2⁶⁴) added to all 16 sites with prime rotations | State diversification; ensures no site pair is (0,0) before map |
 | 2. Local map | Arnold's Cat Map on adjacent pairs (0,1),(2,3),…,(14,15) — `(x,y)→(x+y, x+2y)` | Provably hyperbolic nonlinear mixing; natively integer, no approximation |
-| 3. CML coupling | Each site additively coupled with neighbors at distances {1, 7, 8} | Full 16-site diffusion in exactly 4 rounds |
+| 3. CML coupling | Each site additively coupled with neighbors at distances {1, 3, 7, 11} — 5-term polynomial p(x)=1+x+x³+x⁷+x¹¹; det(C)=−33075 (odd, fully invertible) | Full 16-site diffusion in exactly 2 rounds |
 | 4. Multiplicative mixing | `s[2k+1] *= (s[2k] | 1)` for k=0..7 | Second nonlinear layer on same adjacent pairs |
 
 **Output finalizer:** Each squeezed word passes through Stafford Mix13 (the bijective finalizer used by SplitMix64 / PCG) for additional output whitening. Stafford Mix13 is fully invertible — no entropy is lost.
@@ -210,7 +210,7 @@ All fields from Magic through Extension are authenticated as associated data (ab
 
 ### Backward Compatibility
 
-v8 files (ChaoticKeystream + BLAKE3 MAC) are automatically detected via the version byte and decrypted using the legacy path. v9 is the default for all new encryptions.
+v8 files (ChaoticKeystream + BLAKE3 MAC) are automatically detected via the version byte and decrypted using the legacy path. v9/v10 share the same file format (version byte = 9); v10 refers to the cipher internals (5-term coupling), not the file format version.
 
 ## Dependencies
 

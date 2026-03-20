@@ -127,11 +127,10 @@ breaks any remaining symmetry.
 
 ### Seed 255 — All-FF key (`0xFF × 32`) and IV (`0xFF × 16`) (complete)
 
-The complement extreme: all bits set.  Logistic and tent maps satisfy
-`f(x) = f(MAX ^ x)`, so an all-FF key would be indistinguishable from an all-zero key
-in a naive implementation without the complement-symmetry fix.  CATWALK breaks this by
-injecting the Weyl counter **before** applying the maps in each CML round — the two
-inputs diverge immediately.
+The complement extreme: all bits set.  Arnold's Cat Map has no complement symmetry
+(`cat_map(MAX−x, MAX−y) ≠ cat_map(x, y)` in general), so an all-FF key produces a
+completely different stream from an all-zero key.  The Weyl counter injection before
+each Cat Map application further ensures immediate divergence.
 
 | Length | Tests | Anomalies | Notes | Time |
 |--------|-------|-----------|-------|------|
@@ -172,16 +171,18 @@ with any of the following weaknesses would typically fail within the first few g
 
 - Complement symmetry (e.g. key ⊕ MAX produces same stream)
 - Short period or state collapse on degenerate inputs
-- Linear bias in low-order bits (tent map always returns even without Mix13)
+- Complement symmetry on degenerate key/IV inputs
+- Short period or state collapse on degenerate inputs
+- Low-order bit bias in the output stream
 - Correlated outputs from different key/IV pairs
 
 The absence of anomalies across seeds 0, 254, and 255 — which span normal, all-zero,
 and all-one inputs — is strong empirical evidence that:
 
-1. The Weyl counter injection correctly breaks complement symmetry (seeds 254 vs 255
-   produce unrelated streams).
-2. The Stafford Mix13 output finalizer corrects the tent map's even-output bias
-   (seed 0 would fail bit-correlation tests within 1–2 GB without it).
+1. Arnold's Cat Map has no complement symmetry (seeds 254 vs 255 produce unrelated
+   streams), confirmed by the Weyl counter injection providing additional divergence.
+2. The Stafford Mix13 output finalizer provides full avalanche across all bit positions
+   with no residual low-order bias.
 3. Full 16-site diffusion is achieved within the 8-round budget.
 
 This validation does not constitute a cryptographic proof of security.  It rules out

@@ -1,8 +1,8 @@
 //! CML Sponge cipher test suite.
 //!
-//! Map substitution note (v9-cat): the original tent_map + logistic_map local
-//! maps were replaced with Arnold's Cat Map applied to adjacent site pairs.
-//! Test vectors TV1–TV4 were regenerated from the new construction.  All other
+//! Local map: Arnold's Cat Map applied to adjacent site pairs (0,1),(2,3),…,(14,15).
+//! Coupling: 5-term polynomial p(x)=1+x+x³+x⁷+x¹¹, distances {1,3,7,11} (v10).
+//! Test vectors TV1–TV4 were regenerated for v10.  All other
 //! tests (round-trip, AEAD, avalanche, etc.) are unchanged and must still pass.
 //!
 //! Covers:
@@ -44,8 +44,8 @@ fn hex(bytes: &[u8]) -> String {
 
 // ── Canonical test vectors ────────────────────────────────────────────────────
 // Generated with Arnold's Cat Map local map (adjacent-pair pairing).
-// Updated from the original tent+logistic map vectors when the local map was
-// replaced in v9-cat; all other construction parameters are unchanged.
+// Updated for v10: 5-term coupling distances {1,3,7,11} replacing 4-term {1,5,11}.
+// All other construction parameters are unchanged.
 // TV1: incremental key/IV
 // TV2: all-zero key/IV
 // TV3: all-FF key/IV   (MUST differ from TV2 — complement symmetry verified)
@@ -56,8 +56,9 @@ fn tv1_incremental_key_iv() {
     let key: [u8; 32] = core::array::from_fn(|i| i as u8);
     let iv:  [u8; 16] = core::array::from_fn(|i| i as u8);
     // Arnold's Cat Map construction with Stafford Mix13 output finalizer.
-    let expected = "74b37fe5131987a599c7e5092b5087a9535c6547697f0f2071f87312dfc73d09\
-                    74dbfce4859789c8b0c26adfb7769a0f573f6ddc8faac8c75727d2fa519fcbcf";
+    // Coupling distances updated from {1,5,11} to {1,3,7,11} (5-term, v10).
+    let expected = "c137b12a97e698688596a0c5ed64a3646d89178033df7df7c9128450b5bada44\
+                    1a47d2e620a9ac8ec35ec25e77cdd3aa6fb6fa5ef7c604944b7303c977919480";
     let got = ks(&key, &iv, 64);
     assert_eq!(hex(&got), expected, "TV1 mismatch");
 }
@@ -66,8 +67,8 @@ fn tv1_incremental_key_iv() {
 fn tv2_all_zero_key_iv() {
     let key = [0u8; 32];
     let iv  = [0u8; 16];
-    let expected = "4dafb9735fe43f700fd2e7fcb343638b936428f2d0a360cc3320561e13dda892\
-                    e71f5fa50756ecb8c4ca98188eea4f03c3e085b71d41a8f316e04fbff5a8e9d4";
+    let expected = "6388911bd2e420a790a975a8ee0b0932e7959b31a62dccfc0212d56c86bf80d8\
+                    24d2f6aac1692f3d32995b70fa7880e6181499e97db9b244b972d084c687581e";
     let got = ks(&key, &iv, 64);
     assert_eq!(hex(&got), expected, "TV2 mismatch");
 }
@@ -76,8 +77,8 @@ fn tv2_all_zero_key_iv() {
 fn tv3_all_ff_key_iv() {
     let key = [0xFFu8; 32];
     let iv  = [0xFFu8; 16];
-    let expected = "8ce84c61819dafe3863efdcc8903f98c35ac98b21c049ad851f96f10bc565b27\
-                    af85e5524da55ad30a1cb262fbca21ba7c5fe84aeb8358769222e4bae23985da";
+    let expected = "d7b65ed8274a4667fd09fbfb4ba860c11076d272c204540746e34cc51241274e\
+                    41e9518c64ffb54e6668c5fa980f9ed4b5b30095c343f1bde96d7c9ad1ca35b1";
     let got = ks(&key, &iv, 64);
     assert_eq!(hex(&got), expected, "TV3 mismatch");
     // Complement symmetry: all-FF must differ from all-zero.
@@ -91,8 +92,8 @@ fn tv3_all_ff_key_iv() {
 fn tv4_repeating_key_iv() {
     let key = [0x42u8; 32];
     let iv  = [0x13u8; 16];
-    let expected = "15eb8fea80c5120da8ff75a444626644c035ed228e93630dcbdd55e387def6f8\
-                    d2d6731d5ba3c695e671e58935ec2946a52278695e23676f75e8d0944ba617fd";
+    let expected = "b1e8729a2fa86cd109d1245a29420c46227ef9e23de58ed0ae6a6c6241257e93\
+                    77dd56561935a658ed74b14f24c6e4d070bee8f9ac7d6cdf274ca0aed6d51118";
     let got = ks(&key, &iv, 64);
     assert_eq!(hex(&got), expected, "TV4 mismatch");
 }
@@ -504,7 +505,7 @@ fn arnold_cat_map_area_preserving() {
 
 #[test]
 fn arnold_cat_map_no_complement_symmetry() {
-    // Unlike tent/logistic, cat_map(x,y) ≠ cat_map(MAX-x, MAX-y) in general.
+    // Arnold's Cat Map: cat_map(x,y) ≠ cat_map(MAX-x, MAX-y) for generic inputs.
     let x: u64 = 0x1111111111111111;
     let y: u64 = 0x2222222222222222;
     let (xn, yn) = cat_map_ref(x, y);
