@@ -54,8 +54,8 @@ const N_ROUNDS: usize = 8;
 ///      improvement over the prior {1,5,11} design's 0.765).
 ///   2. Invertible over Z/2⁶⁴Z — p(1) = 5 (odd) → det(C) = −33075 = −3³×5²×7² (odd)
 ///      → gcd(33075, 2⁶⁴) = 1 → kernel is trivial {0}.  No capacity loss.
-///      (The prior 4-term {1,5,11} had det = −1088 = −2⁶×17 (even), giving a
-///       4-element kernel and 2-bit effective capacity reduction.)
+///      The prior 4-term {1,5,11} had det = −1088 = −2⁶×17 (even), giving a
+///      4-element kernel and 2-bit effective capacity reduction.
 ///   3. Full 16-site diffusion by round 2 (symbolic simulation verified).
 ///   4. All four distances are odd → p(-1) = 1−1−1−1−1 = −3 ≠ 0.
 ///   5. All distances are prime (1,3,7,11) — nothing-up-my-sleeve character.
@@ -348,6 +348,7 @@ pub fn encrypt_in_place(state: &mut CmlSpongeState, data: &mut [u8]) {
     for (d, k) in data.iter_mut().zip(ks.iter()) {
         *d ^= k;
     }
+    ks.zeroize();
 }
 
 /// Decrypt is identical to encrypt for a stream cipher.
@@ -390,6 +391,7 @@ pub fn aead_encrypt_chunk(state: &mut CmlSpongeState, data: &mut [u8]) {
     for (d, k) in data.iter_mut().zip(ks.iter()) {
         *d ^= k;
     }
+    ks.zeroize();
     // Absorb the ciphertext for authentication.
     absorb(state, data, DOMAIN_CT);
 }
@@ -419,13 +421,15 @@ pub fn aead_decrypt_chunk(state: &mut CmlSpongeState, data: &mut [u8]) {
     let mut ks = vec![0u8; data.len()];
     keystream(state, &mut ks);
     // Save original ciphertext before XOR-ing to plaintext.
-    let ct = data.to_vec();
+    let mut ct = data.to_vec();
     // XOR to recover plaintext in place.
     for (d, k) in data.iter_mut().zip(ks.iter()) {
         *d ^= k;
     }
+    ks.zeroize();
     // Absorb the ciphertext (not the plaintext) — must match encryption order.
     absorb(state, &ct, DOMAIN_CT);
+    ct.zeroize();
 }
 
 /// Finalise the AEAD session and return a 32-byte authentication tag.

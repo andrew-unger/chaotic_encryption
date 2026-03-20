@@ -613,13 +613,13 @@ impl CatwalkGui {
     // ── Auto-Detect Mode ─────────────────────────────────────────────────────
 
     fn auto_detect_mode(&mut self, path: &Path) {
-        let is_eddy = path.extension().map(|e| e == "catwalk").unwrap_or(false)
+        let is_catwalk = path.extension().map(|e| e == "catwalk").unwrap_or(false)
             || fs::read(path)
                 .ok()
                 .map(|d| d.len() >= 4 && &d[..4] == b"CATW")
                 .unwrap_or(false);
 
-        if is_eddy {
+        if is_catwalk {
             self.mode = Mode::Decrypt;
         } else {
             self.mode = Mode::Encrypt;

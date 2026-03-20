@@ -44,8 +44,8 @@ fn main() {
         64  => {
             let mut key = [0u8; 32];
             let mut iv  = [0u8; 16];
-            for i in 0..32 { key[i] = if i % 2 == 0 { 0xAA } else { 0x55 }; }
-            for i in 0..16 { iv[i]  = if i % 2 == 0 { 0xAA } else { 0x55 }; }
+            for (i, b) in key.iter_mut().enumerate() { *b = if i % 2 == 0 { 0xAA } else { 0x55 }; }
+            for (i, b) in iv.iter_mut().enumerate()  { *b = if i % 2 == 0 { 0xAA } else { 0x55 }; }
             (key, iv)
         }
         idx => {

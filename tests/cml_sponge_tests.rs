@@ -444,6 +444,60 @@ fn aead_absorb_aad_domain_separation() {
         "AAD and ciphertext absorption must be domain-separated (different tags)");
 }
 
+// ── Multi-chunk AEAD consistency ─────────────────────────────────────────────
+
+/// Encrypting 192 bytes in three 64-byte chunks and decrypting in the same
+/// three chunks must recover the original plaintext with matching tags.
+/// This confirms that chunk boundaries are handled consistently across the
+/// encrypt/decrypt pair — the SpongeWrap absorb-after-XOR protocol produces
+/// identical state evolution regardless of which side performs it.
+#[test]
+fn aead_multi_chunk_encrypt_decrypt_roundtrip() {
+    let key: [u8; 32] = core::array::from_fn(|i| (i * 5 + 0x10) as u8);
+    let iv:  [u8; 16] = core::array::from_fn(|i| (i * 7 + 0x20) as u8);
+    let aad = b"multi-chunk consistency test";
+    let plaintext: [u8; 192] = core::array::from_fn(|i| (i % 251) as u8);
+
+    // Encrypt in three 64-byte chunks
+    let (ct0, ct1, ct2, enc_tag) = {
+        let mut s = cipher_init(&key, &iv);
+        absorb_aad(&mut s, aad);
+        let mut c0 = plaintext[0..64].to_vec();
+        let mut c1 = plaintext[64..128].to_vec();
+        let mut c2 = plaintext[128..192].to_vec();
+        aead_encrypt_chunk(&mut s, &mut c0);
+        aead_encrypt_chunk(&mut s, &mut c1);
+        aead_encrypt_chunk(&mut s, &mut c2);
+        let tag = aead_finalize(&mut s);
+        (c0, c1, c2, tag)
+    };
+
+    // Each chunk must differ from its plaintext (encryption occurred)
+    assert_ne!(&ct0[..], &plaintext[0..64], "chunk 0 ciphertext must differ from plaintext");
+
+    // Decrypt in three 64-byte chunks
+    let (pt0, pt1, pt2, dec_tag) = {
+        let mut s = cipher_init(&key, &iv);
+        absorb_aad(&mut s, aad);
+        let mut d0 = ct0.clone();
+        let mut d1 = ct1.clone();
+        let mut d2 = ct2.clone();
+        aead_decrypt_chunk(&mut s, &mut d0);
+        aead_decrypt_chunk(&mut s, &mut d1);
+        aead_decrypt_chunk(&mut s, &mut d2);
+        let tag = aead_finalize(&mut s);
+        (d0, d1, d2, tag)
+    };
+
+    // Tags must match (encrypt and decrypt state evolution is identical)
+    assert_eq!(enc_tag, dec_tag, "encrypt and decrypt tags must match");
+
+    // Recovered plaintext must match original
+    assert_eq!(&pt0[..], &plaintext[0..64], "chunk 0 plaintext mismatch");
+    assert_eq!(&pt1[..], &plaintext[64..128], "chunk 1 plaintext mismatch");
+    assert_eq!(&pt2[..], &plaintext[128..192], "chunk 2 plaintext mismatch");
+}
+
 // ── Arnold's Cat Map mathematical verification ────────────────────────────────
 //
 // Verifies the basic algebraic properties of the Cat Map before trusting the

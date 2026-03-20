@@ -8,8 +8,8 @@
 ///   - Argon2id KDF at minimum accepted parameters (kdf_only)
 ///
 /// Usage:
-///   cargo bench --bench eddy_bench
-///   cargo bench --bench eddy_bench -- --save-baseline v9
+///   cargo bench --bench catwalk_bench
+///   cargo bench --bench catwalk_bench -- --save-baseline v10
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 
 use argon2::{Algorithm, Argon2, Params, Version};
