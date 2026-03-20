@@ -126,10 +126,10 @@ needed; see §5 of this document and `docs/security_argument_final.md` for the f
 ### 2.3 Coupling Topology
 
 After the local maps are applied, each site is updated by adding the mapped values
-of three neighbors:
+of four neighbors:
 
 ```
-s[i] = m[i] + m[(i+1) % 16] + m[(i+5) % 16] + m[(i+11) % 16]
+s[i] = m[i] + m[(i+1)%16] + m[(i+3)%16] + m[(i+7)%16] + m[(i+11)%16]
 ```
 
 where `m[i]` is the local-map output of site `i` before coupling (snapshot).
@@ -561,4 +561,4 @@ below were generated with the v10 construction: Arnold's Cat Map local map +
 | KDF memory | 256 MB (2^18 KiB) | ~1–4 second cost; configurable within floor |
 | KDF iterations | 4 | Multiplies time cost beyond memory |
 | Nonce size | 16 bytes | 128-bit nonce space; collision at ~2^64 encryptions |
-| BLAKE3 derive | "catwalk.v9.cipher" | Domain separation between KDF output and cipher key |
+| BLAKE3 derive | "catwalk.v9.cipher" | Domain separation between KDF output and cipher key (retained from v9 for file format compatibility; not updated to v10 to preserve decryption of existing files) |

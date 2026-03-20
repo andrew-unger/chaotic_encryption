@@ -4,6 +4,15 @@
 **Target:** 256 GB per stream (`-tlmax 256GB`)
 **Binary:** `cml_keystream_dump` (key AND IV both BLAKE3-derived from seed index)
 **Platform:** Windows 10 IoT Enterprise LTSC 2021 (x86-64)
+**Construction:** CML-Sponge AEAD (Arnold's Cat Map local map + additive CML coupling)
+**Coupling distances:** {1, 7, 8} (original construction; see warning below)
+**Git commit:** c2a8507 (Rename project from EDDY to CATWALK)
+
+> ⚠️ These 256 GB results were generated against the original coupling distances
+> {1, 7, 8}. Neither the v9 design ({1, 5, 11}, never deployed) nor the v10
+> design ({1, 3, 7, 11}) has been validated at 256 GB. A v10 smoke test
+> (seeds 0, 254, 255 at 8 GB each, 294 tests each) passed with 0 anomalies
+> (commit d664962). Full 256 GB re-validation against v10 is pending.
 
 ---
 

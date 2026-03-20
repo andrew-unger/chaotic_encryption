@@ -314,7 +314,9 @@ All have 2-round full diffusion and det(C) = ±33075.
 {7,8,10,12}  {7,8,12,14}  {7,10,12,14} {8,10,12,13}
 -- all-odd subset --
 {7,11,13,15} {1,9,11,13}  {1,5,7,13}   {1,3,7,11}   {3,5,7,15}
-{1,5,9,11}   (note: some all-odd at lower min|lambda| omitted here)
+{1,5,9,11}
 ```
 
-(Full enumeration available by running the search script.)
+(Complete enumeration of all 160 valid candidates available by running the search
+script. The 40 candidates listed here are the top tier at min|λ_k| = 1.2593.
+The remaining 120 candidates have lower eigenvalue margins and are not recommended.)

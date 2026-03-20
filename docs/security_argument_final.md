@@ -1,4 +1,4 @@
-# CATWALK v9 — Security Argument
+# CATWALK v10 — Security Argument
 
 **Construction:** CML-Sponge AEAD (Coupled Map Lattice sponge)
 **Version:** 10 (Arnold's Cat Map local map; 5-term coupling distances {1, 3, 7, 11})
@@ -329,9 +329,9 @@ c ≡ 0 (mod 2^64).  No non-trivial null vectors exist.
 For non-constant vectors: all eigenvalues |λ_k| (k ≠ 0) are irrational (algebraic) numbers
 greater than 1 (minimum 1.259).  None divide 2^64, so no non-trivial null vector can exist in
 any Fourier mode.  Verified computationally: the vector 2^62·**1** (which was in the kernel of
-the prior 4-term design) maps to C·(2^62·**1**) = 5·2^62·**1** ≡ 2^62·**1** (mod 2^64)
-(since 5·2^62 mod 2^64 = 4611686018427387904 = 2^62 when 5·2^62 - 2^64 = 2^62·(5-4) = 2^62 — wait,
-5·2^62 = 5·4611686018427387904 = 23058430092136939520; mod 2^64 = 23058430092136939520 - 18446744073709551616 = 4611686018427387904 = 2^62 ≠ 0).
+the prior 4-term design) maps to C·(2^62·**1**) = 5·2^62·**1** mod 2^64 = 2^62·**1** ≠ **0**
+(Verification: 5·2^62 mod 2^64 = 2^62, since 5·2^62 − 2^64 = 2^62·(5−4) = 2^62,
+confirming C·(2^62·**1**) ≢ **0** mod 2^64 as required).
 
 **Sponge security impact.** The coupling step is bijective; no capacity is lost.  The effective
 capacity is the full **512 bits**.  No correction to the sponge bound is needed.
