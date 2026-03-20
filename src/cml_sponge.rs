@@ -465,6 +465,20 @@ pub fn cml_permute_r(state: &mut CmlSpongeState, rounds: usize) {
     }
 }
 
+/// Copy the raw rate words (sites 0–7) into `out` as little-endian bytes,
+/// WITHOUT applying the Stafford Mix13 output finalizer.
+///
+/// `out` must be exactly [`BLOCK_BYTES`] (64) bytes.
+///
+/// This is used exclusively by the `catwalk_raw_dump` PractRand binary to
+/// test the intrinsic statistical quality of the CML-Sponge permutation
+/// before Mix13 is applied.
+pub fn raw_rate_bytes(state: &CmlSpongeState, out: &mut [u8; BLOCK_BYTES]) {
+    for i in 0..N_RATE {
+        out[i * 8..(i + 1) * 8].copy_from_slice(&state.lattice[i].to_le_bytes());
+    }
+}
+
 /// Initialise a state for reduced-round testing (same as cipher_init but
 /// the number of rounds per permutation is overridden externally).
 /// Useful for automated distinguisher tests.

@@ -223,6 +223,8 @@ f(x):
 
 **Role in CATWALK.** Mix13 is retained as a defense-in-depth output whitening layer. It is applied to each rate word before squeezing keystream and before generating the authentication tag.
 
+**[EMPIRICAL]** Raw permutation output (pre-Mix13) was tested with PractRand 0.95 to 32 GB on three seeds (0, 254, 255) using the `catwalk_raw_dump` binary. All three seeds passed with zero failures across 975 total tests. Transient "unusual" ratings (p ≈ 3e-3 to 3e-4) appeared at intermediate lengths but none persisted to the final 32 GB checkpoint. This confirms that Mix13 is defense-in-depth — the CML-Sponge permutation produces statistically strong output at the raw lattice level, and Mix13 is not load-bearing. See `docs/practrand_raw_permutation.md` for full results.
+
 ### 2.4 Multiplicative Mixing (Step 4)
 
 For each pair k = 0..7:
@@ -436,7 +438,7 @@ The header (magic, version, flags, salt, timestamp, nonce, Argon2 parameters, ex
 
 ### 5.3 Constant-Time Tag Verification
 
-The tag comparison uses `subtle::ConstantTimeEq` (the `subtle` crate, which provides CPU-instruction-level constant-time equality). **[PROOF]** Assuming the Rust `subtle` crate correctly compiles to constant-time code (which is its design guarantee), there is no timing side channel in tag comparison.  Decryption returns `Err(AuthenticationFailed)` without returning any plaintext bytes on tag mismatch; plaintext is not returned until the tag has been verified.
+The tag comparison uses `subtle::ConstantTimeEq` (the `subtle` crate, which provides CPU-instruction-level constant-time equality). **[PROOF]** Assuming the Rust `subtle` crate correctly compiles to constant-time code (which is its design guarantee), there is no timing side channel in tag comparison.  Decryption returns `Err(IntegrityCheckFailed)` without returning any plaintext bytes on tag mismatch; plaintext is not returned until the tag has been verified.
 
 ### 5.4 Authentication Tag Strength
 
