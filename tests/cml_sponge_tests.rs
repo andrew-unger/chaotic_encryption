@@ -6,7 +6,7 @@
 //! tests (round-trip, AEAD, avalanche, etc.) are unchanged and must still pass.
 //!
 //! Covers:
-//!   - Cross-validation against canonical Python test vectors (TV1–TV4)
+//!   - Cross-validation against canonical test vectors (TV1–TV4)
 //!   - Complement symmetry: all-zero and all-FF keys must diverge
 //!   - Encrypt / decrypt round-trip
 //!   - IV sensitivity: 1-bit IV change → different keystream

@@ -332,7 +332,7 @@ pub fn encrypt(
 /// `strip_metadata` was set during encryption or no extension was present).
 ///
 /// Verification is performed **before** the plaintext is returned.  The function
-/// returns `Err(CryptoError::AuthenticationFailed)` if the AEAD tag does not match,
+/// returns `Err(CryptoError::IntegrityCheckFailed)` if the AEAD tag does not match,
 /// and no plaintext bytes are ever returned to the caller in that case.
 ///
 /// # Arguments

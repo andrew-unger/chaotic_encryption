@@ -35,7 +35,7 @@
 //!     &EncryptOptions { strip_metadata: false, skip_compression: true },
 //!     None,  // progress callback
 //! ).unwrap();
-//! std::fs::write("output.catwalkarchive", &bundle).unwrap();
+//! std::fs::write("output.catwalk", &bundle).unwrap();
 //!
 //! // Decrypt
 //! let (recovered, extension) = decrypt(

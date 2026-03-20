@@ -259,7 +259,6 @@ If {1, 3, 7, 11} is adopted:
    a 2-round further optimisation elsewhere compensates.
 
 2. **Test vector regeneration.** All four test vectors (TV1–TV4) must be regenerated.
-   The Python reference implementation will need the coupling distances updated.
 
 3. **PractRand smoke test.** Run seeds 0 and 254 to 8 GB as a quick validation before
    committing.  Full 256 GB validation would confirm statistical quality at the same level
