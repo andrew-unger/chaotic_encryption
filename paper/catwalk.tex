@@ -1,0 +1,1249 @@
+% CATWALK: A Stream Cipher Based on Arnold's Cat Map
+% in a Coupled Lattice Sponge Construction
+%
+% First complete draft for IACR ePrint submission.
+% Status: research cipher, self-reviewed, awaiting independent cryptanalysis.
+
+\documentclass[runningheads]{llncs}
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{tikz}
+\usepackage{pgfplots}
+\pgfplotsset{compat=1.18}
+\usepackage{booktabs}
+\usepackage{multirow}
+\usepackage{hyperref}
+\usepackage{xcolor}
+\usepackage{enumitem}
+
+% Security claim labels
+\newcommand{\proof}[1]{\textsc{[Proof]} #1}
+\newcommand{\conjecture}[1]{\textsc{[Conjecture]} #1}
+\newcommand{\empirical}[1]{\textsc{[Empirical]} #1}
+
+% Common notation
+\newcommand{\Ztwo}{\mathbb{Z}/2^{64}\mathbb{Z}}
+\newcommand{\catmap}{\mathbf{A}}
+\newcommand{\coupmat}{\mathbf{C}}
+\newcommand{\state}{\mathbf{s}}
+\newcommand{\GOLDEN}{\texttt{0x9E3779B97F4A7C15}}
+
+\begin{document}
+
+\title{CATWALK: A Stream Cipher Based on Arnold's Cat Map\\in a Coupled Lattice Sponge Construction}
+
+\author{Anonymous}
+\institute{Independent Research}
+
+\maketitle
+
+%% ============================================================
+%% ABSTRACT
+%% ============================================================
+\begin{abstract}
+Can spatiotemporal chaos serve as a cryptographic primitive?
+We present CATWALK, an authenticated encryption scheme whose core permutation
+is a Coupled Map Lattice (CML) wrapped in a Bertoni~et~al.\ sponge framework.
+The local map is Arnold's Cat Map---a linear toral automorphism with proven
+Anosov hyperbolicity---operating on 8 adjacent pairs of a 16-site lattice
+over~$\Ztwo$.  Unlike prior chaos-based ciphers, CATWALK uses
+exact integer arithmetic (no floating point), a standard sponge construction
+with formal capacity analysis, and a local map whose hyperbolic properties are
+provable, not assumed.  A principled eigenvalue analysis of the coupling
+topology discovered and fixed a structural singularity, leading to a 5-term
+coupling architecture with distances $\{1,3,7,11\}$ that is fully invertible
+over~$\Ztwo$ (trivial kernel, $\det = -33075$, $\min|\lambda_k| = 1.259$).
+PractRand validation at~1~TB (397 tests, zero persistent anomalies), raw
+permutation validation at~32~GB without the output finalizer, and
+reduced-round analysis establishing a $4\times$ security margin all support
+the empirical quality of the construction.  CATWALK is a research cipher: it
+has not received independent cryptanalysis, and the core security conjecture---that the CML-Sponge permutation is indistinguishable from a random
+permutation---remains unproven.  We present the design, analysis, and open
+problems to invite community scrutiny.
+\end{abstract}
+
+\keywords{stream cipher \and authenticated encryption \and coupled map lattice \and Arnold's Cat Map \and sponge construction \and chaos-based cryptography}
+
+%% ============================================================
+%% 1. INTRODUCTION
+%% ============================================================
+\section{Introduction}
+\label{sec:intro}
+
+Chaos theory offers a compelling intuition for cryptographic design:
+a chaotic dynamical system exhibits sensitive dependence on initial conditions
+(small input changes produce large, unpredictable output changes), topological
+mixing (any open set eventually maps onto the entire phase space), and dense
+periodic orbits (the system visits every neighborhood infinitely often).
+These properties mirror the classical Shannon requirements of confusion and
+diffusion~\cite{arnold1968ergodic}.
+
+\paragraph{Why previous chaos ciphers failed.}
+Despite this intuition, chaos-based cryptography has a troubled history.
+Baptista's seminal proposal~\cite{baptista1998cryptography} and many subsequent
+designs~\cite{kocarev2001chaos,fridrich1998symmetric,chen2004symmetric}
+suffer from three fundamental problems identified by Li~et~al.~\cite{li2001problems}:
+\begin{enumerate}[nosep]
+\item \textbf{Floating-point non-determinism.}
+  Continuous chaotic maps require real-number arithmetic.
+  Finite-precision IEEE~754 floating-point introduces rounding errors that
+  accumulate unpredictably across platforms, destroying cross-platform
+  determinism and reducing effective dynamical complexity.
+\item \textbf{No formal framework.}
+  Most chaos ciphers are \emph{ad hoc} stream generators without a
+  principled construction (no sponge, no Feistel, no SPN).
+  This makes formal security analysis impossible: there is no capacity
+  bound, no indifferentiability proof, and no well-defined security game.
+\item \textbf{Weak or absent mixing analysis.}
+  The chaotic properties of the continuous map do not automatically transfer
+  to the discretized version.  Complement symmetry, short periods on finite
+  fields, and low-order bit bias have broken multiple proposals.
+\end{enumerate}
+
+\paragraph{What CATWALK does differently.}
+CATWALK addresses each of these problems with three specific design decisions:
+\begin{enumerate}[nosep]
+\item \textbf{Exact integer arithmetic.}
+  Arnold's Cat Map is the matrix $\begin{psmallmatrix}1&1\\1&2\end{psmallmatrix}$
+  acting on~$(\Ztwo)^2$ via wrapping additions---no floating point, no
+  approximation, no precision loss.  The map is natively integer.
+\item \textbf{Sponge framework.}
+  The CML permutation is wrapped in a standard Bertoni--Daemen--Peeters--Van~Assche
+  sponge~\cite{bertoni2007sponge,bertoni2008indifferentiability},
+  providing rate/capacity separation, domain-separated absorption, and
+  a formal security bound of $q^2/2^c$ (where $c = 512$ bits is the capacity).
+\item \textbf{Provable hyperbolicity.}
+  Arnold's Cat Map is an Anosov diffeomorphism on the real torus $\mathbb{T}^2$,
+  with Lyapunov exponent $\ln((3+\sqrt{5})/2) \approx 0.9624$.
+  This is a \emph{proven} mathematical property, not a numerical observation.
+  The map has no complement symmetry (Section~\ref{sec:construction}),
+  its unique fixed point at $(0,0)$ is rendered negligible by Weyl counter
+  injection, and its determinant~1 guarantees bijectivity over any ring.
+\end{enumerate}
+
+\paragraph{Design-by-analysis methodology.}
+The design of CATWALK's coupling topology illustrates a principled
+cryptographic design process.
+A geometric analysis of the lattice dynamics revealed that the original
+coupling distances $\{1,7,8\}$ produced a \emph{singular} coupling matrix---the
+polynomial $p(x) = 1+x+x^7+x^8$ has $p(-1) = 0$, meaning the alternating
+Fourier mode is in the kernel, destroying the sponge security guarantee
+(Section~\ref{sec:coupling}).
+This discovery motivated a systematic eigenvalue analysis of all feasible
+coupling topologies:  an exhaustive search over all $\binom{15}{4} = 1365$
+distance combinations identified 160~valid 5-term candidates, from which
+$\{1,3,7,11\}$ was selected for its optimal properties
+($\det(\coupmat) = -33075$, odd; $\min|\lambda_k| = 1.259$; trivial kernel;
+all-prime distances).
+The singularity discovery and its resolution through principled search is
+the central methodological contribution of this paper.
+
+\paragraph{Paper contributions.}
+\begin{enumerate}[nosep]
+\item A complete specification of the CML-Sponge AEAD construction---precise
+  enough to reimplement from scratch (Section~\ref{sec:construction}).
+\item A comprehensive coupling matrix analysis, including the discovery and
+  resolution of a structural singularity through exhaustive polynomial root
+  analysis (Section~\ref{sec:coupling}).
+\item A security analysis with honest labeling of every claim as \textsc{[Proof]},
+  \textsc{[Conjecture]}, or \textsc{[Empirical]} (Section~\ref{sec:security}).
+\item Statistical validation at 1~TB with PractRand, raw permutation validation
+  at 32~GB without the output finalizer, and reduced-round analysis
+  establishing a $4\times$ conservative security margin (Section~\ref{sec:validation}).
+\item An explicit enumeration of open problems inviting independent
+  cryptanalysis (Section~\ref{sec:openproblems}).
+\end{enumerate}
+
+\paragraph{Paper roadmap.}
+Section~\ref{sec:prelim} covers mathematical preliminaries.
+Section~\ref{sec:construction} gives the full construction specification.
+Section~\ref{sec:coupling} presents the coupling matrix analysis.
+Section~\ref{sec:security} develops the security argument.
+Section~\ref{sec:validation} reports statistical validation results.
+Section~\ref{sec:performance} discusses performance.
+Section~\ref{sec:related} surveys related work.
+Section~\ref{sec:openproblems} enumerates open problems.
+Section~\ref{sec:conclusion} concludes.
+
+%% ============================================================
+%% 2. PRELIMINARIES
+%% ============================================================
+\section{Preliminaries}
+\label{sec:prelim}
+
+\subsection{Coupled Map Lattices}
+
+A \emph{Coupled Map Lattice} (CML), introduced by Kaneko~\cite{kaneko1984cml,kaneko1985cml},
+is a dynamical system defined on a regular lattice of~$N$ sites,
+where each site $i$ carries a state $s_i$ in some phase space~$\mathcal{S}$.
+The system evolves in discrete time through two alternating steps:
+\begin{enumerate}[nosep]
+\item \textbf{Local map:} each site applies a map $f: \mathcal{S} \to \mathcal{S}$
+  independently.
+\item \textbf{Coupling:} each site's state is updated by a weighted sum of its
+  own state and those of its neighbors.
+\end{enumerate}
+For a ring lattice of $N$~sites with coupling function $g$ and distances
+$\mathcal{D} = \{d_1, \ldots, d_k\}$:
+\[
+  s_i^{(t+1)} = g\!\left(\{f(s_{(i+d) \bmod N}^{(t)})\}_{d \in \mathcal{D} \cup \{0\}}\right).
+\]
+CMLs exhibit \emph{spatiotemporal chaos}: the interaction of local chaotic dynamics
+with spatial coupling produces complex, high-dimensional behavior that is
+resistant to low-dimensional approximation.
+
+\subsection{Sponge Constructions}
+
+The sponge construction, introduced by Bertoni~et~al.~\cite{bertoni2007sponge},
+is a mode of operation for a fixed-width permutation~$\pi: \{0,1\}^b \to \{0,1\}^b$.
+The $b$-bit state is partitioned into a \emph{rate} $r$ and a \emph{capacity} $c$
+($b = r + c$).  During \emph{absorption}, input blocks are XOR'd into the rate
+portion and $\pi$ is applied.  During \emph{squeezing}, rate bits are read as
+output and $\pi$ is applied.
+
+The fundamental security result~\cite{bertoni2008indifferentiability} states that
+a sponge with an ideal permutation is indifferentiable from a random oracle,
+with distinguishing advantage bounded by:
+\[
+  \mathrm{Adv} \leq \frac{q^2}{2^c}
+\]
+where $q$ is the number of queries.  This bound requires the capacity to be
+\emph{effectively} $c$~bits---i.e., the permutation must not have structural
+weaknesses that reduce the capacity below~$c$.
+
+Keccak~\cite{keccak2011}, the SHA-3 standard, is the canonical sponge-based hash.
+SpongeWrap extends the sponge to authenticated encryption by absorbing ciphertext
+(not plaintext) for authentication, providing native Encrypt-then-MAC semantics.
+
+\subsection{Arnold's Cat Map}
+
+Arnold's Cat Map~\cite{arnold1968ergodic} is the linear toral automorphism
+defined by the matrix:
+\[
+  \catmap = \begin{pmatrix} 1 & 1 \\ 1 & 2 \end{pmatrix}, \qquad
+  \begin{pmatrix} x' \\ y' \end{pmatrix}
+  = \catmap \begin{pmatrix} x \\ y \end{pmatrix} \pmod{2^{64}}.
+\]
+In symplectic (St\"ormer--Verlet) integration order: $x' = x + y$, then $y' = x' + y = x + 2y$.
+
+\paragraph{Key properties.}
+\begin{itemize}[nosep]
+\item \textbf{Area-preserving:} $\det(\catmap) = 2 - 1 = 1$.
+  The map is a bijection on $(\Ztwo)^2$ and on $(\mathbb{Z}/m\mathbb{Z})^2$ for any~$m$.
+\item \textbf{Hyperbolic (Anosov):} eigenvalues $\lambda_{\pm} = (3 \pm \sqrt{5})/2
+  \approx \{2.618, 0.382\}$, both real, product~1, neither a root of unity.
+  The map has stable and unstable manifolds filling~$\mathbb{R}^2$.
+\item \textbf{Lyapunov exponent:} $\Lambda = \ln\lambda_+ = \ln((3+\sqrt{5})/2) \approx 0.9624$.
+  This is the maximum achievable for any $2 \times 2$ integer matrix with
+  $\det = 1$ and $\mathrm{tr} = 3$.
+\item \textbf{No complement symmetry:}
+  $\catmap(M-x, M-y) \neq \catmap(x,y)$ and $\neq (M - \catmap(x,y))$ for
+  generic inputs, where $M = 2^{64} - 1$.  See Section~\ref{sec:construction}.
+\item \textbf{Unique fixed point:} $(0,0)$ is the only fixed point.
+\item \textbf{Symplectic:} $\catmap \in \mathrm{Sp}(2, \mathbb{Z})$.
+  The map preserves the symplectic form $dx \wedge dy$.
+\end{itemize}
+
+\subsection{Notation}
+
+\begin{table}[h]
+\centering
+\caption{Notation used throughout this paper.}
+\label{tab:notation}
+\begin{tabular}{@{}ll@{}}
+\toprule
+Symbol & Meaning \\
+\midrule
+$N = 16$ & Number of lattice sites \\
+$r = 512$ & Rate (bits); sites $s[0..7]$ \\
+$c = 512$ & Capacity (bits); sites $s[8..15]$ \\
+$R = 8$ & Rounds per permutation \\
+$\catmap$ & Arnold's Cat Map matrix $\begin{psmallmatrix}1&1\\1&2\end{psmallmatrix}$ \\
+$\coupmat$ & $16 \times 16$ circulant coupling matrix \\
+$p(x)$ & Coupling polynomial $1 + x + x^3 + x^7 + x^{11}$ \\
+$\omega$ & Primitive 16th root of unity $e^{2\pi i/16}$ \\
+$\lambda_k$ & $k$-th eigenvalue of $\coupmat$: $\lambda_k = p(\omega^k)$ \\
+$\oplus$ & Bitwise XOR \\
+$\boxplus$ & Wrapping addition mod~$2^{64}$ \\
+$\boxtimes$ & Wrapping multiplication mod~$2^{64}$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+%% ============================================================
+%% 3. THE CATWALK CONSTRUCTION
+%% ============================================================
+\section{The CATWALK Construction}
+\label{sec:construction}
+
+This section specifies the CML-Sponge AEAD construction precisely enough
+to reimplement from scratch.
+
+\subsection{State Layout}
+
+The permutation operates on a 1024-bit state consisting of:
+\begin{itemize}[nosep]
+\item \textbf{Lattice:} 16 words $s[0], \ldots, s[15]$, each $\in \Ztwo$.
+\item \textbf{Weyl counter:} one word $\mathrm{ctr} \in \Ztwo$.
+\end{itemize}
+The lattice is partitioned as:
+\begin{itemize}[nosep]
+\item \textbf{Rate} ($r = 512$ bits): sites $s[0..7]$.
+  XOR'd with input during absorb; read during squeeze.
+\item \textbf{Capacity} ($c = 512$ bits): sites $s[8..15]$.
+  Never directly output; carries secret state across permutations.
+\end{itemize}
+Initial state: all sites zero, counter zero.
+
+\subsection{One Permutation Round}
+
+Each round applies four steps in sequence.  See Algorithm~\ref{alg:round}.
+
+\begin{algorithm}[t]
+\caption{One CML-Sponge round.  All arithmetic is wrapping mod $2^{64}$.}
+\label{alg:round}
+\begin{algorithmic}[1]
+\Require State $s[0..15]$, counter $\mathrm{ctr}$
+\Statex \textbf{Step 1 --- Weyl counter injection:}
+\State $\mathrm{ctr} \gets \mathrm{ctr} \boxplus \mathrm{GOLDEN}$
+  \Comment{$\mathrm{GOLDEN} = \lfloor \varphi \cdot 2^{64} \rfloor = \GOLDEN$}
+\For{$i = 0$ \textbf{to} $15$}
+  \State $s[i] \gets s[i] \boxplus \mathrm{rotl}(\mathrm{ctr},\, \mathrm{ROT}[i])$
+    \Comment{ROT = first 16 primes $\geq 3$}
+\EndFor
+\Statex \textbf{Step 2 --- Arnold's Cat Map (snapshot):}
+\For{$k = 0$ \textbf{to} $7$}
+  \State $m[2k] \gets s[2k] \boxplus s[2k+1]$
+  \State $m[2k+1] \gets m[2k] \boxplus s[2k+1]$
+    \Comment{Symplectic order: $y' = x' + y$}
+\EndFor
+\Statex \textbf{Step 3 --- CML 5-term additive coupling:}
+\For{$i = 0$ \textbf{to} $15$}
+  \State $s[i] \gets m[i] \boxplus m[(i{+}1)\bmod 16] \boxplus m[(i{+}3)\bmod 16]
+    \boxplus m[(i{+}7)\bmod 16] \boxplus m[(i{+}11)\bmod 16]$
+\EndFor
+\Statex \textbf{Step 4 --- Multiplicative mixing:}
+\For{$k = 0$ \textbf{to} $7$}
+  \State $s[2k{+}1] \gets s[2k{+}1] \boxtimes (s[2k] \mathbin{|} 1)$
+    \Comment{$|\,1$ ensures odd multiplier}
+\EndFor
+\end{algorithmic}
+\end{algorithm}
+
+\paragraph{Step 1: Weyl counter injection.}
+The Weyl sequence with $\mathrm{GOLDEN} = \lfloor \varphi \cdot 2^{64} \rfloor$
+($\varphi = (1+\sqrt{5})/2$) is a nothing-up-my-sleeve constant with optimal
+equidistribution.  The 16 rotation amounts $\mathrm{ROT} = [3, 5, 7, 11, 13, 17,
+19, 23, 29, 31, 37, 41, 43, 47, 53, 61]$ are the first 16 primes $\geq 3$,
+all coprime to~64.  Each site receives a distinct rotation of the counter,
+breaking translational symmetry across pairs before the Cat Map is applied.
+
+\paragraph{Step 2: Arnold's Cat Map.}
+The matrix $\catmap = \begin{psmallmatrix}1&1\\1&2\end{psmallmatrix}$
+is applied to the 8~adjacent pairs $(s[0],s[1]), (s[2],s[3]), \ldots, (s[14],s[15])$.
+All 8~pairs are written into a snapshot array~$m[]$ before the coupling step,
+preserving single-step semantics.  This pairing matches Step~4's multiplicative
+mixing pairs, creating a coherent two-layer transformation per pair.
+
+\paragraph{Step 3: CML additive coupling.}
+The coupling distances $\{1, 3, 7, 11\}$ produce the polynomial
+$p(x) = 1 + x + x^3 + x^7 + x^{11}$ with $p(1) = 5$ (odd).
+Each site receives the sum of itself and four neighbors.
+Full analysis is in Section~\ref{sec:coupling}.
+
+\paragraph{Step 4: Multiplicative mixing.}
+$s[2k+1] \gets s[2k+1] \boxtimes (s[2k] \mathbin{|} 1)$.
+The OR with~1 ensures the multiplier is always odd, hence invertible
+mod~$2^{64}$.
+\proof{Step~4 is a bijection on each pair $(s[2k], s[2k+1])$ for every value of~$s[2k]$,
+since odd integers are units in~$\Ztwo$.}
+This is the sole nonlinear step in the round function---Steps 1--3 are affine
+over~$\Ztwo$.
+
+\subsection{Permutation and Output Finalizer}
+
+The permutation $\pi$ applies $R = 8$ rounds of Algorithm~\ref{alg:round}.
+Before output, the Stafford Mix13 bijective finalizer~\cite{stafford2011}
+is applied to each rate word:
+\begin{align*}
+  x &\gets x \oplus (x \gg 30), \quad
+  x \gets x \boxtimes \texttt{0xBF58476D1CE4E5B9}, \\
+  x &\gets x \oplus (x \gg 27), \quad
+  x \gets x \boxtimes \texttt{0x94D049BB133111EB}, \\
+  x &\gets x \oplus (x \gg 31).
+\end{align*}
+\proof{Mix13 is a bijection on~$\Ztwo$ (composition of xor-shifts with odd multiplications).
+It satisfies the strict avalanche criterion: every output bit depends on every input bit.}
+
+\empirical{Raw permutation output (pre-Mix13) passes PractRand at 32~GB
+on 3 seeds with zero failures (Section~\ref{sec:validation}), confirming
+that Mix13 is defense-in-depth, not load-bearing.}
+
+\subsection{Sponge Operations}
+
+\paragraph{Absorb.}
+Keccak-style multi-rate padding: $M \| D \| \texttt{0x00}^* \| \texttt{0x80}$,
+where $D$ is the domain byte and padding brings the total to a multiple of
+64~bytes.  Each 64-byte block is XOR'd into the rate (sites~0--7, little-endian)
+and the permutation $\pi$ is applied.
+
+\proof{The padding is injective: distinct $(M, D)$ pairs produce distinct padded blocks.}
+
+\paragraph{Squeeze.}
+Apply Mix13 to each rate word, read 64~bytes (little-endian), apply~$\pi$.
+
+\paragraph{Domain separation.}
+Five domain bytes ensure that absorb calls for different roles cannot produce
+identical state transitions (Table~\ref{tab:domains}).
+
+\begin{table}[h]
+\centering
+\caption{Domain separation bytes.}
+\label{tab:domains}
+\begin{tabular}{@{}lll@{}}
+\toprule
+Domain & Value & Usage \\
+\midrule
+\texttt{DOMAIN\_KEY} & \texttt{0x01} & Key absorption \\
+\texttt{DOMAIN\_IV}  & \texttt{0x02} & IV/nonce absorption \\
+\texttt{DOMAIN\_AAD} & \texttt{0x03} & Associated data (authenticated, not encrypted) \\
+\texttt{DOMAIN\_CT}  & \texttt{0x04} & Ciphertext absorption during AEAD \\
+\texttt{DOMAIN\_TAG} & \texttt{0x05} & Tag finalization (empty absorb) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{AEAD Construction}
+
+CATWALK follows SpongeWrap~\cite{bertoni2007sponge}:
+
+\begin{enumerate}[nosep]
+\item \textbf{Init:} All-zero state.  Absorb 32-byte key with domain~\texttt{0x01},
+  then 16-byte nonce with domain~\texttt{0x02}.
+\item \textbf{AAD:} Absorb header bytes with domain~\texttt{0x03}.
+\item \textbf{Encrypt:} For each plaintext chunk~$P$: squeeze keystream~$K$,
+  compute $C = P \oplus K$, absorb~$C$ with domain~\texttt{0x04}.
+\item \textbf{Decrypt:} For each ciphertext chunk~$C$: squeeze keystream~$K$,
+  save~$C$, compute $P = C \oplus K$, absorb saved~$C$ with domain~\texttt{0x04}.
+\item \textbf{Finalize:} Empty absorb with domain~\texttt{0x05}.
+  Tag = first 32~bytes of rate (4~words, each through Mix13).
+\end{enumerate}
+
+\proof{Both encrypt and decrypt absorb the \emph{ciphertext} with
+domain~\texttt{0x04}, so sponge state evolution is identical.
+The tag is bound to: key, nonce, all AAD, and all ciphertext---providing
+native Encrypt-then-MAC semantics.}
+
+\subsection{Key Derivation}
+
+\begin{enumerate}[nosep]
+\item Argon2id~\cite{rfc9106}: password $+$ (16-byte random salt $\|$ 8-byte timestamp)
+  $\to$ 32-byte master key.  Default: $m = 256$~MB, $t = 4$ iterations, $p = 1$ lane.
+\item BLAKE3~\cite{blake3} domain derivation:
+  $\mathrm{cipher\_key} = \mathrm{BLAKE3\_derive\_key}(\text{``catwalk.v9.cipher''},\, \mathrm{master\_key})$.
+\item Sponge init: absorb cipher\_key, then absorb nonce.
+\end{enumerate}
+
+Minimum accepted parameters on decryption: $m \geq 64$~MB, $t \geq 2$.
+This prevents crafted headers from bypassing the KDF cost.
+
+\subsection{Parameters Summary}
+
+\begin{table}[h]
+\centering
+\caption{CATWALK parameters.}
+\label{tab:params}
+\begin{tabular}{@{}lll@{}}
+\toprule
+Parameter & Value & Rationale \\
+\midrule
+Lattice sites & 16 & Power of 2; rich coupling topology \\
+Site width & 64 bits & Matches CPU word width \\
+Total state & 1024 + 64 bits & 16 sites + Weyl counter \\
+Rate / Capacity & 512 / 512 bits & Full capacity (no correction) \\
+Rounds & 8 & $4\times$ diffusion margin \\
+Coupling distances & $\{1,3,7,11\}$ & 5-term; $|\det|=33075$ (odd); $\min|\lambda|=1.259$ \\
+GOLDEN & $\GOLDEN$ & $\lfloor \varphi \cdot 2^{64} \rfloor$ \\
+ROT & First 16 primes $\geq 3$ & All coprime to 64 \\
+Output finalizer & Stafford Mix13 & Bijective whitening layer \\
+Tag size & 32 bytes & 128-bit forgery resistance (birthday) \\
+Nonce size & 16 bytes & 128-bit; collision at $\sim\!2^{64}$ encryptions \\
+KDF & Argon2id & Memory-hard; RFC~9106 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+%% ============================================================
+%% 4. COUPLING MATRIX ANALYSIS
+%% ============================================================
+\section{Coupling Matrix Analysis}
+\label{sec:coupling}
+
+This section presents the systematic analysis that discovered a structural
+singularity in the original coupling topology and resolved it through
+exhaustive polynomial root analysis.  This design-by-analysis process is the
+central methodological contribution of this paper.
+
+\subsection{Circulant Structure}
+
+The coupling step (Step~3) applies a $16 \times 16$ circulant matrix $\coupmat$
+over~$\Ztwo$ whose first row encodes the coupling polynomial
+$p(x) = \sum_{d \in \mathcal{D} \cup \{0\}} x^d$.
+The eigenvalues of a circulant over~$\mathbb{C}$ are
+$\lambda_k = p(\omega^k)$ for $k = 0, \ldots, 15$,
+where $\omega = e^{2\pi i/16}$ is the primitive 16th root of unity.
+
+\subsection{The Original \texorpdfstring{$\{1,7,8\}$}{1,7,8} Design and Its Failure}
+
+The initial CATWALK design used distances $\{1,7,8\}$, giving:
+\[
+  p(x) = 1 + x + x^7 + x^8.
+\]
+Evaluating at $x = -1$ (the 16th root of unity with $k = 8$):
+\[
+  p(-1) = 1 + (-1) + (-1)^7 + (-1)^8 = 1 - 1 - 1 + 1 = 0.
+\]
+\proof{$\lambda_8 = p(-1) = 0$, so $\coupmat$ is singular over~$\mathbb{C}$ (and over every ring).}
+
+The null vector $\mathbf{v} = (1, -1, 1, -1, \ldots, 1, -1) \in \ker(\coupmat)$
+means that two states differing by~$\mathbf{v}$ produce \emph{identical} coupling
+output.  This collapses one dimension of the state space per round, destroying
+the sponge security guarantee: the effective capacity is reduced by at least
+one bit per coupling application.
+
+\paragraph{Why this matters.}
+The sponge bound $\mathrm{Adv} \leq q^2/2^c$ assumes the permutation operates
+on a full $b$-bit state.  If the coupling step has a non-trivial kernel, the
+permutation's effective state dimension is reduced, and the capacity bound no
+longer holds at its stated value.  For the $\{1,7,8\}$ design, the rank
+deficiency is catastrophic: it provides an algebraic distinguisher for the
+permutation, breaking the random-permutation assumption entirely.
+
+\subsection{Fix Methodology: Polynomial Root Analysis}
+
+The singularity at $p(-1) = 0$ arises because the distances $\{1,7,8\}$
+include an even distance (8), so $(-1)^8 = +1$, which can cancel with the
+odd-distance terms.  This observation leads to a clear design requirement:
+
+\begin{quote}
+\emph{Choose coupling distances such that $p(\omega^k) \neq 0$ for all
+$k = 0, \ldots, 15$.  Equivalently, the coupling polynomial must have no roots
+among the 16th roots of unity.}
+\end{quote}
+
+Additionally, for the coupling to be invertible over~$\Ztwo$ (preserving full
+sponge capacity), we require $\det(\coupmat)$ to be \emph{odd}---since
+$\gcd(\det(\coupmat), 2^{64}) = 1$ if and only if $\det(\coupmat)$ is odd.
+
+\subsection{3-Term Coupling: Evaluated and Rejected}
+
+A 3-term polynomial $p(x) = 1 + x^{d_1} + x^{d_2}$ has $p(1) = 3$ (odd),
+which immediately fixes the invertibility issue.  However, all 100 valid 3-term
+candidates have $\geq 3$ unit-magnitude eigenvalues ($|\lambda_k| = 1$ for at
+least 3 values of~$k$).  A unit-magnitude eigenvalue means the coupling step
+performs \emph{zero mixing work} on that Fourier mode---it is an isometry
+providing no diffusion.
+
+\proof{For any 3-term unit-coefficient polynomial with 2~non-zero exponents chosen
+from $\{1, \ldots, 15\}$, at least 3 of the 16~eigenvalue magnitudes equal~1.
+This is a structural impossibility to avoid given the degree constraints of
+3-term circulants on a 16-site ring.}
+
+\subsection{4-Term \texorpdfstring{$\{1,5,11\}$}{1,5,11}: Partial Fix}
+
+The intermediate design used distances $\{1,5,11\}$:
+$p(x) = 1 + x + x^5 + x^{11}$, $p(1) = 4$ (even).
+\[
+  \det(\coupmat) = -1088 = -2^6 \times 17 \quad (\text{even}).
+\]
+Since $\det(\coupmat)$ is even, $\gcd(1088, 2^{64}) = 64 \neq 1$, and $\coupmat$
+is \emph{not} invertible over~$\Ztwo$.  The kernel has 4~elements:
+$\{0,\, 2^{62}\mathbf{1},\, 2^{63}\mathbf{1},\, 3 \cdot 2^{62}\mathbf{1}\}$,
+causing a 2-bit effective capacity reduction (510~bits instead of~512).
+
+Additionally, $\min|\lambda_k| = 0.765$ (at $k = 2, 6, 10, 14$), meaning
+25\% of Fourier modes are \emph{contracted} by the coupling---they receive
+less energy after coupling than before.
+
+\subsection{5-Term Exhaustive Search}
+
+For the 5-term polynomial $p(x) = 1 + x^{d_1} + x^{d_2} + x^{d_3} + x^{d_4}$
+with $1 \leq d_1 < d_2 < d_3 < d_4 \leq 15$, there are $\binom{15}{4} = 1365$
+candidate distance sets.  We evaluated all 1365 against four requirements:
+
+\begin{enumerate}[nosep,label=R\arabic*.]
+\item Non-singular over $\mathbb{C}$: $|p(\omega^k)| > 0$ for all~$k$.
+\item Odd determinant: $\det(\coupmat)$ odd (invertible over~$\Ztwo$).
+\item No unit-magnitude eigenvalues: $||p(\omega^k)| - 1| > 10^{-6}$ for $k \neq 0$.
+\item Full 16-site diffusion in $\leq 4$ rounds.
+\end{enumerate}
+
+\textbf{160 candidates} satisfy all four requirements.  Of these, 134 achieve
+2-round full diffusion, and 40 achieve the maximum eigenvalue margin
+$\min|\lambda_k| = 1.259$.  Among the top-tier candidates, 6 have all-odd
+distances.
+
+\subsection{Selection of \texorpdfstring{$\{1,3,7,11\}$}{1,3,7,11}}
+
+The recommended distance set $\{1,3,7,11\}$ was selected from the 6 all-odd
+top-tier candidates based on:
+\begin{itemize}[nosep]
+\item \textbf{All-odd distances} $\Rightarrow$ $p(-1) = 1-1-1-1-1 = -3 \neq 0$
+  (algebraic guarantee).
+\item \textbf{All-prime distances} (1, 3, 7, 11): nothing-up-my-sleeve character.
+\item \textbf{Well-distributed} across $\{1, \ldots, 15\}$ (not clustered).
+\item \textbf{Shares} $d_1 = 1$ and $d_4 = 11$ with the prior design, making the
+  change targeted.
+\end{itemize}
+
+\begin{table}[h]
+\centering
+\caption{Direct comparison of coupling designs.}
+\label{tab:coupling-comparison}
+\begin{tabular}{@{}lccc@{}}
+\toprule
+Property & 3-term (best) & 4-term $\{1,5,11\}$ & 5-term $\{1,3,7,11\}$ \\
+\midrule
+$p(1)$ & 3 (odd) & 4 (even) & 5 (odd) \\
+Invertible over $\Ztwo$? & Yes & No & \textbf{Yes} \\
+Unit-magnitude modes & $\geq 3$ & 0 & \textbf{0} \\
+$\min|\lambda_k|$ & 1.000 & 0.765 & \textbf{1.259} \\
+$|\det(\coupmat)|$ & varies & 1088 & \textbf{33075} \\
+Kernel & trivial & 4 elements & \textbf{trivial} \\
+Effective capacity & 512 bits & 510 bits & \textbf{512 bits} \\
+Diffusion (rounds) & varies & 2 & \textbf{2} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Proofs of Non-Singularity}
+
+\proof{(Over $\mathbb{C}$.)  All 16 eigenvalues $\lambda_k = p(\omega^k)$ are
+non-zero.  The minimum magnitude is $\min_k |\lambda_k| = 1.259$ (at
+$k = 1, 7, 9, 15$).  Direct computation confirms $|p(\omega^k)| > 1$ for all~$k$.
+The determinant is $\det(\coupmat) = \prod_{k=0}^{15} \lambda_k = -33075$.}
+
+\proof{(Over $\mathbb{Z}$.)  The same eigenvalue computation applies: the
+characteristic polynomial of~$\coupmat$ over~$\mathbb{Q}$ has no zero among
+the 16th roots of unity, so $\coupmat$ is non-singular over~$\mathbb{Q}$ and
+hence over~$\mathbb{Z}$.}
+
+\proof{(Over $\Ztwo$.)  $\det(\coupmat) = -33075 = -3^3 \times 5^2 \times 7^2$
+(odd).  $\gcd(33075, 2^{64}) = 1$, so $\coupmat$ is fully invertible
+over~$\Ztwo$.  The kernel is trivial: $\ker(\coupmat) = \{\mathbf{0}\}$.
+The coupling step is a bijection on $(\Ztwo)^{16}$---no information is lost.}
+
+\paragraph{Eigenvalue table.}
+Table~\ref{tab:eigenvalues} lists all 16 eigenvalue magnitudes.  All modes
+satisfy $|\lambda_k| > 1$: every Fourier mode is amplified, none contracted.
+
+\begin{table}[h]
+\centering
+\caption{Eigenvalue magnitudes $|\lambda_k| = |p(\omega^k)|$ for distances $\{1,3,7,11\}$.}
+\label{tab:eigenvalues}
+\begin{tabular}{@{}cc|cc@{}}
+\toprule
+$k$ & $|\lambda_k|$ & $k$ & $|\lambda_k|$ \\
+\midrule
+0 & 5.000 & 8 & 3.000 \\
+1 & \textbf{1.259} & 9 & \textbf{1.259} \\
+2 & 1.732 & 10 & 1.732 \\
+3 & 2.101 & 11 & 2.101 \\
+4 & 2.236 & 12 & 2.236 \\
+5 & 2.101 & 13 & 2.101 \\
+6 & 1.732 & 14 & 1.732 \\
+7 & \textbf{1.259} & 15 & \textbf{1.259} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+%% ============================================================
+%% 5. SECURITY ANALYSIS
+%% ============================================================
+\section{Security Analysis}
+\label{sec:security}
+
+\subsection{Permutation Properties}
+
+\proof{The CML-Sponge permutation is a bijection on $(\Ztwo)^{16} \times \Ztwo$.
+Each of the four round steps is individually bijective:}
+\begin{itemize}[nosep]
+\item Step~1 (counter injection): translation by a constant---invertible.
+\item Step~2 (Cat Map): $\det(\catmap) = 1$---invertible over any ring.
+\item Step~3 (coupling): $\det(\coupmat) = -33075$ (odd)---invertible over~$\Ztwo$.
+\item Step~4 (multiplicative mixing): $(s[2k] \mathbin{|} 1)$ is always odd---invertible
+  multiplier in~$\Ztwo$.
+\end{itemize}
+
+\proof{The effective capacity is the full $c = 512$~bits.
+The coupling matrix has trivial kernel over~$\Ztwo$, so no state-space dimension
+is collapsed.  No capacity correction is needed.}
+
+\proof{The sponge security bound, conditional on the permutation being ideal, is:
+\[
+  \mathrm{Adv} \leq \frac{q^2}{2^{512}}.
+\]
+For $q = 2^{128}$ queries (128-bit security target):
+$\mathrm{Adv} \leq 2^{256}/2^{512} = 2^{-256}$, which is negligible.}
+
+\proof{Full 16-site diffusion occurs in exactly 2 rounds with distances $\{1,3,7,11\}$.
+Verified by symbolic propagation: after 1~round, each site is influenced by
+5 source sites; after 2~rounds, all 16~sites are mutually dependent.
+The 8-round permutation provides a $4\times$ diffusion margin.}
+
+\subsection{The Core Security Conjecture}
+
+The entire security argument rests on one conjecture:
+
+\begin{quote}
+\conjecture{The CML-Sponge permutation $\pi$ is computationally indistinguishable
+from a uniformly random permutation on $\{0,1\}^{1024}$.}
+\end{quote}
+
+\paragraph{What is NOT proven.}
+\begin{itemize}[nosep]
+\item No differential cryptanalysis of the CML round has been performed.
+  The DDT of Step~4 has not been computed.
+\item No linear cryptanalysis.  The LAT of Step~4 has not been computed.
+\item No algebraic degree analysis.  The growth of algebraic degree through
+  8~rounds has not been formally bounded.
+\item No formal reduction from the permutation conjecture to a standard
+  hardness assumption.
+\end{itemize}
+
+\paragraph{What IS proven.}
+\begin{itemize}[nosep]
+\item Bijectivity of every round step (proof above).
+\item Coupling matrix: full rank, trivial kernel, all eigenvalues amplifying
+  ($|\lambda_k| \geq 1.259$).
+\item Cat Map: Anosov hyperbolicity with Lyapunov exponent $\approx 0.9624$.
+\item No complement symmetry: verified algebraically and by test vectors.
+\item Full 16-site diffusion in 2~rounds.
+\end{itemize}
+
+\paragraph{What is supported empirically.}
+\begin{itemize}[nosep]
+\item PractRand at 1~TB: 397~tests, zero persistent anomalies (Section~\ref{sec:validation}).
+\item Raw permutation (no Mix13) at 32~GB: 325~tests, zero failures.
+\item Reduced-round analysis: $4\times$ margin over statistical distinguisher threshold.
+\end{itemize}
+
+\subsection{Cryptanalysis Record}
+
+Table~\ref{tab:attacks} summarizes the outcomes of all considered attacks.
+
+\begin{table}[h]
+\centering
+\caption{Cryptanalysis attempts.  ``Closed'' means the attack was analyzed and
+found to be non-viable.  ``Open'' means the analysis is incomplete.}
+\label{tab:attacks}
+\small
+\begin{tabular}{@{}clll@{}}
+\toprule
+\# & Attack & Outcome & Status \\
+\midrule
+1 & Generic preimage (sponge) & No attack found & Closed (conditional) \\
+2 & Coupling null vector & \textbf{Found \& fixed} ($\{1,7,8\}$) & \textbf{Closed (v10)} \\
+3 & Statistical distinguisher & No anomaly at 1~TB & Closed (empirical) \\
+4 & Related-key/IV & No attack found & Open \\
+5 & Differential (1-round) & Not formally analyzed & Open \\
+6 & Eigenvalue basin & All $|\lambda_k| > 1$ & Closed (v10) \\
+7 & Diffusion horizon (1-round) & Confirmed at 1~round; closed at 2+ & Closed \\
+8 & Even det (non-invertible) & \textbf{Found \& fixed} ($\{1,5,11\}$) & \textbf{Closed (v10)} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{Attack~2: Coupling singularity (the methodological contribution).}
+The discovery that $p(-1) = 0$ for distances $\{1,7,8\}$ was made through
+geometric analysis of the CML lattice dynamics.  The null vector
+$\mathbf{v} = (1, -1, 1, -1, \ldots)$ makes the coupling step singular:
+two states differing by~$\mathbf{v}$ produce identical output.
+This \emph{invalidates the sponge security proof} by reducing the effective
+state dimension.  The fix---a systematic search over all 1365 distance
+combinations (Section~\ref{sec:coupling})---demonstrates that principled
+cryptographic design can discover and resolve structural flaws that would
+be invisible to statistical testing alone.  PractRand cannot detect this
+singularity: the null vector is a single algebraic direction in a
+$2^{1024}$-element state space.
+
+\paragraph{Attack~8: Even determinant.}
+The intermediate design $\{1,5,11\}$ fixed the $p(-1) = 0$ singularity
+but introduced a subtler problem: $\det(\coupmat) = -1088$ is even,
+giving a 4-element kernel and 2-bit capacity loss.  A 3-term coupling was
+evaluated and rejected (Section~\ref{sec:coupling}).  The 5-term architecture
+resolves both issues simultaneously: odd determinant, trivial kernel,
+full capacity.
+
+\subsection{The Nonlinearity Question}
+\label{sec:nonlinearity}
+
+We address the most important open question directly.
+
+Arnold's Cat Map is a \emph{linear} map over~$\Ztwo$.  It is the matrix
+$\begin{psmallmatrix}1&1\\1&2\end{psmallmatrix}$ acting by wrapping addition---degree~1 in both variables.  The coupling step (Step~3) is also linear (a
+circulant matrix over~$\Ztwo$).  Steps~1 and~2 together form an \emph{affine}
+map.
+
+\textbf{Step~4 is the sole source of nonlinearity.}
+$s[2k+1] \gets s[2k+1] \boxtimes (s[2k] \mathbin{|} 1)$ is degree-2 over~$\Ztwo$.
+It acts on 8 of the 16~sites (the odd-indexed ones).  Over 8~rounds, the
+algebraic degree grows roughly as $2^r$ for the affected words, but the
+even-indexed words are only indirectly affected through the coupling step.
+
+\paragraph{Comparison.}
+In AES, the S-box (GF$(2^8)$ inversion) provides maximum algebraic degree~254
+per application, applied to \emph{all} 16~state bytes.  In Keccak, the $\chi$
+step provides degree-2 nonlinearity applied to all 1600~bits.  In ChaCha20,
+the nonlinear operation (addition mod~$2^{32}$) is interleaved densely in every
+quarter-round.  CATWALK's nonlinear density is lower: one multiplicative step
+per round on half the state.
+
+\paragraph{Why this is an open problem, not a known weakness.}
+\begin{enumerate}[nosep]
+\item No algebraic attack on the CML-Sponge permutation has been demonstrated.
+  The linearity of Steps~1--3 does not automatically imply vulnerability;
+  it means that the security depends critically on Step~4's interaction with
+  the linear layers, which has not been analyzed.
+\item The reduced-round analysis (Section~\ref{sec:validation}) provides
+  empirical evidence: the \emph{raw} permutation (no Mix13) achieves
+  statistical indistinguishability at 2~rounds.  If the nonlinearity were
+  insufficient, we would expect to see statistical weaknesses persisting
+  to higher round counts.
+\item The Cat Map's linearity is over~$\Ztwo$, not over~$\mathrm{GF}(2)$.
+  The wrapping-addition arithmetic means that carry propagation introduces
+  effective nonlinearity at the bit level---a $k$-bit wrapping addition has
+  algebraic degree~$k$ over~$\mathrm{GF}(2)$.  The cryptographic significance
+  of this bit-level nonlinearity is not well understood.
+\end{enumerate}
+
+\paragraph{What future analysis should determine.}
+\begin{itemize}[nosep]
+\item Compute the differential distribution table of Step~4:
+  $\Pr[\Delta y' \mid \Delta x, \Delta y]$ where $y' = y \boxtimes (x \mathbin{|} 1)$.
+\item Compute the linear approximation table of Step~4.
+\item Bound the algebraic degree of the full permutation output as a function
+  of round count.
+\item Determine whether the affine structure of Steps~1--3 permits efficient
+  linearization attacks (Gr\"obner bases, MQ solvers).
+\end{itemize}
+
+\subsection{Geometric Foundations}
+
+\paragraph{The state space.}
+The CML-Sponge state can be viewed as a point in $(\mathbb{T}^2_{64})^8$,
+where $\mathbb{T}^2_{64} = (\Ztwo)^2$ is the discrete torus.  Each Cat Map
+pair lives on one copy of~$\mathbb{T}^2_{64}$, and the coupling step
+provides inter-torus communication.
+
+\paragraph{Anosov dynamics.}
+On the real torus~$\mathbb{T}^2$, the Cat Map is an Anosov diffeomorphism:
+it has a global hyperbolic structure with stable and unstable manifolds
+filling the torus densely.  The Lyapunov exponent $\Lambda \approx 0.9624$
+quantifies the exponential divergence rate.  On the discrete torus $\mathbb{T}^2_{64}$,
+the map retains the algebraic structure (bijectivity, eigenvalue ratio) but
+has finite period.  The cryptographic significance is that any two
+``nearby'' states (in the Hamming metric) diverge rapidly through the
+Cat Map---a form of the avalanche effect grounded in proven dynamical
+systems theory rather than empirical observation.
+
+\paragraph{Symplectic structure.}
+$\catmap \in \mathrm{Sp}(2, \mathbb{Z})$ since $\catmap^T J \catmap = J$
+where $J = \begin{psmallmatrix}0&1\\-1&0\end{psmallmatrix}$.
+The symplectic property ensures area preservation (no contraction or
+expansion of phase-space volume), which prevents state collapse.
+
+%% ============================================================
+%% 6. STATISTICAL VALIDATION
+%% ============================================================
+\section{Statistical Validation}
+\label{sec:validation}
+
+\subsection{Methodology}
+
+All statistical testing uses PractRand~0.95~\cite{practrand} in \texttt{stdin64}
+mode with the full core test suite (64-bit folding).  PractRand applies a
+battery of up to 397~distinct statistical tests at the 1~TB checkpoint,
+testing for correlations, bit-level biases, gap distributions, and other
+non-random patterns.  Its four-level severity scale---``unusual'' ($p < 10^{-3}$),
+``suspicious'' ($p < 10^{-5}$), ``very suspicious'' ($p < 10^{-7}$), and
+``FAIL''---allows precise characterization of anomalies.
+
+\subsection{Main Validation: 1~TB}
+
+The v10 construction ($\{1,3,7,11\}$ coupling) was tested to 1~TB per seed.
+Key and IV for each seed are derived via BLAKE3 from independent context strings.
+
+\begin{table}[h]
+\centering
+\caption{PractRand v10 validation at 1~TB (seeds 0 and 1 complete).}
+\label{tab:practrand-1tb}
+\begin{tabular}{@{}clccl@{}}
+\toprule
+Seed & Key type & Tests at 1~TB & Anomalies (final) & Transient \\
+\midrule
+0 & BLAKE3-derived & 397 & 1 unusual$^*$ & 0 \\
+1 & BLAKE3-derived & 397 & 0 & 1 unusual at 256~MB \\
+2--255 & various & \multicolumn{3}{c}{In progress} \\
+\bottomrule
+\end{tabular}
+\\[4pt]
+{\footnotesize $^*$\texttt{[Low1/64]mod3n(5):(1,9-0)} $R = +8.3$, $p = 1.0 \times 10^{-4}$---
+appeared only at the 1~TB checkpoint, consistent with the expected
+Poisson rate of $\sim$0.4 unusual events per checkpoint at 397~tests.}
+\end{table}
+
+The original $\{1,7,8\}$ construction was validated at 256~GB on 5~seeds
+(0, 1, 2, 254, 255), each passing 369~tests with zero persistent anomalies.
+Seeds~254 (all-zero key/IV) and~255 (all-FF key/IV) are the critical
+degenerate cases; their clean passage on distinct outputs confirms the
+absence of complement symmetry at the cipher level.
+
+\subsection{Raw Permutation Validation}
+
+To determine whether the Stafford Mix13 output finalizer is defense-in-depth
+or load-bearing, the raw permutation output (before Mix13) was tested with
+PractRand to 32~GB on three seeds.
+
+\begin{table}[h]
+\centering
+\caption{Raw permutation PractRand results (no Mix13 finalizer).}
+\label{tab:practrand-raw}
+\begin{tabular}{@{}ccccc@{}}
+\toprule
+Seed & Key type & Tests at 32~GB & Failures & Transient unusual \\
+\midrule
+0 & BLAKE3-derived & 325 & 0 & 1 (at 1~GB, gone by 2~GB) \\
+254 & $\texttt{0x00} \times 32$ & 325 & 0 & 1 (at 8--16~GB, gone by 32~GB) \\
+255 & $\texttt{0xFF} \times 32$ & 325 & 0 & 1 (at 2~GB, gone by 4~GB) \\
+\midrule
+\textbf{Total} & & \textbf{975} & \textbf{0} & 3 (all transient) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\empirical{Mix13 is defense-in-depth, not load-bearing.  The CML-Sponge
+permutation produces statistically strong output at the raw lattice level.}
+
+\subsection{Reduced-Round Analysis}
+
+Rounds~1--8 were tested in both with-Mix13 and raw (no-Mix13) configurations,
+each to 4~GB (Table~\ref{tab:reduced-round}).
+
+\begin{table}[h]
+\centering
+\caption{Reduced-round PractRand results.  ``Pass'' = 277 tests at 4~GB, zero failures.}
+\label{tab:reduced-round}
+\begin{tabular}{@{}ccc@{}}
+\toprule
+Rounds & With Mix13 & Raw (no Mix13) \\
+\midrule
+1 & Pass & \textbf{FAIL} at 512~MB \\
+2 & Pass & Pass \\
+3 & Pass & Pass \\
+4 & Pass & Pass \\
+5 & Pass & Pass \\
+6 & Pass & Pass (3 transient unusual) \\
+7 & Pass & Pass \\
+8 & Pass & Pass \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The 1-round raw failure is catastrophic: \texttt{[Low1/64]Gap-16:A}
+$R = +189.2$, $p = 4.6 \times 10^{-162}$---extreme bias in the
+least-significant-bit gap distribution, as expected from a single CML round
+that provides only local pair-wise mixing without full 16-site diffusion.
+At 2~rounds, full diffusion eliminates the distinguisher completely.
+
+\paragraph{Security margin.}
+\empirical{The raw permutation achieves statistical indistinguishability at
+2~rounds.  The 8-round design provides a $4\times$ conservative margin
+($8/2 = 4$).}  With Mix13, even 1~round passes (effective margin $\geq 8\times$),
+but the conservative figure uses the raw permutation.
+
+\begin{table}[h]
+\centering
+\caption{Security margin comparison with established ciphers.}
+\label{tab:margin-comparison}
+\begin{tabular}{@{}lccc@{}}
+\toprule
+Cipher & Design rounds & Distinguisher at & Margin \\
+\midrule
+ChaCha20~\cite{bernstein2008chacha} & 20 & 7 rounds & $2.9\times$ \\
+AES-128~\cite{daemen2001aes} & 10 & 6 rounds & $1.7\times$ \\
+CATWALK v10 & 8 & 2 rounds (raw) & $4.0\times$ \\
+\bottomrule
+\end{tabular}
+\\[4pt]
+{\footnotesize Note: ChaCha20 and AES margins are based on best published
+reduced-round distinguishers.  CATWALK's margin is measured against statistical
+distinguishers only; algebraic distinguishers have not been analyzed.}
+\end{table}
+
+\paragraph{Honest caveat.}
+\empirical{PractRand validates output stream quality, not cryptographic security.
+A generator that passes PractRand may still be broken by algebraic or structural
+attacks.  The Mix13 output finalizer may mask algebraic structure that would be
+exploitable by a cryptanalyst but invisible to statistical tests.  The
+reduced-round margin should therefore be interpreted as a lower bound on the
+true security margin, not a definitive characterization.}
+
+%% ============================================================
+%% 7. PERFORMANCE
+%% ============================================================
+\section{Performance}
+\label{sec:performance}
+
+All benchmarks were measured with Criterion~0.5 on Windows~10 (x86-64),
+Rust stable with release profile (LTO, single codegen unit, strip).
+
+\begin{table}[h]
+\centering
+\caption{CATWALK performance benchmarks.}
+\label{tab:performance}
+\begin{tabular}{@{}lrr@{}}
+\toprule
+Operation & Time & Throughput \\
+\midrule
+Permutation (8 rounds) & 137.6~ns & --- \\
+Keystream (64 bytes) & 169.8~ns & 360~MiB/s \\
+AEAD encrypt (1~KB) & 7.21~$\mu$s & 135~MiB/s \\
+AEAD encrypt (64~KB) & 311.0~$\mu$s & 201~MiB/s \\
+AEAD encrypt (1~MB) & 6.05~ms & 165~MiB/s \\
+AEAD decrypt (1~KB) & 8.71~$\mu$s & 112~MiB/s \\
+AEAD decrypt (64~KB) & 317.3~$\mu$s & 197~MiB/s \\
+KDF (min params: 64~MB, $t\!=\!2$) & 93.4~ms & --- \\
+KDF (production: 256~MB, $t\!=\!4$) & $\sim$1.5~s & --- \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{Permutation cost.}
+Each permutation applies 8~CML rounds over the 1024-bit state in 137.6~ns,
+yielding a raw permutation ceiling of $64\text{ bytes} / 137.6\text{ ns} \approx 445$~MiB/s.
+
+\paragraph{Streaming throughput.}
+The AEAD plateau is $\sim$200~MiB/s at 64~KB payloads.  Each 64-byte ciphertext
+block requires two permutations (one for squeeze, one for absorb), giving a
+theoretical ceiling of $64 / (2 \times 137.6) \approx 222$~MiB/s, consistent
+with the measured 200~MiB/s.
+
+\paragraph{Comparison.}
+ChaCha20-Poly1305 achieves 1--3~GiB/s on the same class of hardware (5--15$\times$
+faster), leveraging SIMD-friendly quarter-round operations.  CATWALK's higher
+per-byte cost is inherent to the CML architecture: the 16-site coupling step
+involves 80~wrapping additions per round (5~per site $\times$ 16~sites), and the
+AEAD absorb step doubles the permutation count per output block.
+
+\paragraph{KDF dominance.}
+For files smaller than a few hundred megabytes, the Argon2id KDF ($\sim$1.5~s
+at production parameters) completely dominates the encryption time.  This is
+intentional: the KDF cost makes offline password-guessing attacks expensive.
+
+\paragraph{SIMD optimization potential.}
+The multi-pass coupling implementation (5~sequential loops, one per distance)
+was specifically designed for auto-vectorization.  The compiler generates
+SIMD loads for each rotated-offset pass.  Further optimization with explicit
+AVX2 intrinsics is future work.
+
+%% ============================================================
+%% 8. RELATED WORK
+%% ============================================================
+\section{Related Work}
+\label{sec:related}
+
+\paragraph{Chaos-based cryptography.}
+Baptista~\cite{baptista1998cryptography} proposed the first chaos-based
+encryption scheme, using the logistic map's sensitivity to initial conditions
+as a keying mechanism.  Kocarev~\cite{kocarev2001chaos} surveyed the field
+and identified key challenges: discretization artifacts, short periods on
+finite-precision representations, and the gap between continuous-time chaos
+theory and discrete cryptographic requirements.
+Li~et~al.~\cite{li2001problems} provided the most influential critique,
+demonstrating concrete attacks on multiple chaos ciphers based on
+floating-point precision loss, complement symmetry, and weak mixing.
+CATWALK addresses each of Li~et~al.'s concerns: exact integer arithmetic
+eliminates precision loss, proven Anosov structure replaces assumed chaos,
+and the sponge framework provides a formal security model.
+
+\paragraph{Coupled Map Lattices in cryptography.}
+Kaneko~\cite{kaneko1984cml,kaneko1985cml} introduced CMLs as models of
+spatiotemporal chaos.  Their application to cryptography has been explored
+by several authors, typically using logistic or tent maps as the local function
+with diffusive coupling.  These proposals generally suffer from the same
+floating-point issues as other chaos ciphers, and none embed the CML in
+a sponge framework with formal capacity analysis.  CATWALK's use of
+Arnold's Cat Map (integer-exact, provably hyperbolic) as the local map,
+combined with the sponge wrapper, distinguishes it from prior CML proposals.
+
+\paragraph{Sponge constructions.}
+The sponge construction was introduced by Bertoni~et~al.~\cite{bertoni2007sponge}
+and its indifferentiability from a random oracle was proved
+in~\cite{bertoni2008indifferentiability}.  Keccak~\cite{keccak2011}, selected
+as SHA-3, is the canonical instantiation.  CATWALK follows the same framework
+but replaces the Keccak-$f$ permutation with the CML-Sponge permutation.
+The sponge security bound $q^2/2^c$ applies identically, conditional on the
+permutation's quality.
+
+\paragraph{Arnold's Cat Map in image encryption.}
+Fridrich~\cite{fridrich1998symmetric} used the Cat Map for pixel-position
+scrambling in image encryption, exploiting the map's mixing property on the
+torus.  Chen~et~al.~\cite{chen2004symmetric} extended this to 3D Cat Maps.
+These applications use the Cat Map as a position permutation (shuffling pixel
+locations), not as a state-evolution primitive within a sponge.  CATWALK uses
+the Cat Map in a fundamentally different way: as the local map in a CML that
+serves as the sponge permutation's core mixing step.
+
+\paragraph{ARX stream ciphers.}
+Salsa20~\cite{bernstein2005salsa20} and ChaCha20~\cite{bernstein2008chacha}
+are the dominant modern stream ciphers, built on the ARX (add-rotate-XOR)
+paradigm.  Their quarter-round structure provides dense nonlinear mixing
+through the interaction of addition mod~$2^{32}$ and XOR.  CATWALK's round
+function uses a similar vocabulary of operations (wrapping addition,
+multiplication, rotation) but in a different architecture: the CML topology
+provides the diffusion mechanism rather than a fixed-wiring permutation.
+ChaCha20 achieves 5--15$\times$ higher throughput and has received extensive
+cryptanalysis; CATWALK's advantage is the richer mathematical structure
+of the CML dynamics.
+
+\paragraph{AES and block ciphers.}
+AES~\cite{daemen2001aes,fips197} uses the SPN (substitution-permutation network)
+paradigm with a high-degree S-box (GF$(2^8)$ inversion, algebraic degree~254).
+This provides maximum nonlinear density per round.  CATWALK's lower nonlinear
+density (Section~\ref{sec:nonlinearity}) is compensated by the larger state
+(1024 vs.\ 128~bits) and higher round count relative to the diffusion minimum
+($4\times$ vs.\ AES's $1.7\times$).  Whether this trade-off is sufficient for
+cryptographic security is the central open question.
+
+\paragraph{Password-based key derivation.}
+Argon2~\cite{rfc9106}, the winner of the Password Hashing Competition, provides
+memory-hard key derivation.  CATWALK uses Argon2id (hybrid data-dependent and
+data-independent passes) at 256~MB / 4~iterations, followed by BLAKE3~\cite{blake3}
+domain derivation.  The decryption-side parameter floor prevents KDF downgrade
+attacks via crafted file headers.
+
+%% ============================================================
+%% 9. OPEN PROBLEMS
+%% ============================================================
+\section{Open Problems}
+\label{sec:openproblems}
+
+We enumerate the unresolved questions in order of estimated importance.
+Each represents an opportunity for independent cryptanalysis.
+
+\begin{enumerate}
+
+\item \textbf{Formal pseudorandomness reduction.}
+  \emph{Problem:} Prove (or disprove) that the CML-Sponge permutation is
+  a pseudorandom permutation under a standard hardness assumption.
+  \emph{Why it matters:} Without this, the security argument is conditional
+  on an unverified conjecture.
+  \emph{What closing it requires:} A complexity-theoretic reduction, or a
+  concrete attack demonstrating the conjecture is false.
+  \emph{Status:} Completely open.
+
+\item \textbf{Differential and linear cryptanalysis of the round function.}
+  \emph{Problem:} Compute or bound the maximum differential probability and
+  linear correlation of the CML round.
+  \emph{Why it matters:} Steps~1--3 are affine; differential/linear propagation
+  through them is deterministic.  The security depends entirely on Step~4's
+  resistance.
+  \emph{What closing it requires:} Computation of the DDT and/or LAT for
+  Step~4, then bounding multi-round characteristics using the coupling
+  structure for diffusion.
+  \emph{Status:} Not attempted.
+
+\item \textbf{Algebraic degree analysis.}
+  \emph{Problem:} Compute the algebraic degree of the permutation output as a
+  function of round count, particularly for the even-indexed sites that are
+  only indirectly affected by Step~4.
+  \emph{Why it matters:} Low algebraic degree after 8~rounds would indicate
+  vulnerability to algebraic attacks (Gr\"obner bases, MQ solvers).
+  \emph{What closing it requires:} Symbolic computation tracking the degree
+  growth through the composition of affine and multiplicative steps.
+  \emph{Status:} Not attempted.
+
+\item \textbf{Period of the Cat Map on $(\Ztwo)^2$.}
+  \emph{Problem:} Compute or tightly bound the period of
+  $\begin{psmallmatrix}1&1\\1&2\end{psmallmatrix}$ acting on $(\Ztwo)^2$.
+  \emph{Why it matters:} A short period would limit the keystream length.
+  In practice, the Weyl counter injection ensures each round operates
+  at a different offset, making the bare period largely irrelevant.
+  \emph{What closing it requires:} Number-theoretic analysis of the matrix
+  order modulo~$2^{64}$.
+  \emph{Status:} Not computed.  \conjecture{The period is astronomically large.}
+
+\item \textbf{Independent cryptanalysis.}
+  \emph{Problem:} Subject the CML-Sponge permutation to analysis by
+  researchers with expertise in symmetric cryptanalysis.
+  \emph{Why it matters:} Self-review is inherently limited.
+  \emph{What closing it requires:} External engagement.
+  \emph{Status:} This paper is intended to facilitate exactly this.
+
+\item \textbf{Mixing proof: exponential correlation decay.}
+  \emph{Problem:} Prove that spatial correlations in the CML lattice decay
+  exponentially with round count.
+  \emph{Why it matters:} Would provide a theoretical foundation for the
+  empirical observation that 2~rounds suffice for statistical indistinguishability.
+  \emph{What closing it requires:} Transfer operator analysis of the CML
+  dynamics over~$\Ztwo$, extending results from continuous CML theory.
+  \emph{Status:} Not attempted.
+
+\item \textbf{5-term coupling optimality.}
+  \emph{Problem:} Determine whether the 5-term architecture with
+  $\{1,3,7,11\}$ is optimal among all feasible coupling designs for this
+  lattice size, or whether alternative structures (e.g., 6-term, non-uniform
+  coefficients, non-circulant topologies) offer stronger security guarantees.
+  \emph{Why it matters:} The exhaustive search covered only unit-coefficient
+  circulant designs.
+  \emph{What closing it requires:} Extended search or proof of optimality.
+  \emph{Status:} The 5-term architecture is the best among unit-coefficient
+  4-distance circulants; other design spaces are unexplored.
+
+\end{enumerate}
+
+%% ============================================================
+%% 10. CONCLUSION
+%% ============================================================
+\section{Conclusion}
+\label{sec:conclusion}
+
+We have presented CATWALK, a research-grade authenticated encryption scheme
+whose core permutation is a Coupled Map Lattice wrapped in a standard sponge
+framework.  The construction is specified precisely enough for independent
+reimplementation (Section~\ref{sec:construction}), and every security claim
+is labeled as \textsc{[Proof]}, \textsc{[Conjecture]}, or \textsc{[Empirical]}.
+
+The central methodological contribution is the design-by-analysis process
+that discovered and resolved a structural singularity in the coupling topology
+(Section~\ref{sec:coupling}).  Geometric analysis revealed the flaw;
+exhaustive polynomial root analysis fixed it.  This process---where the
+analysis tool and the design tool are the same mathematical framework---is,
+we believe, a model for principled cryptographic design.
+
+CATWALK is a research cipher.  It has not received independent cryptanalysis.
+The core security conjecture---that the CML-Sponge permutation is
+indistinguishable from random---remains unproven.  The nonlinearity question
+(Section~\ref{sec:nonlinearity}) is the highest-priority open problem.
+Statistical validation (1~TB PractRand, raw permutation testing, $4\times$
+reduced-round margin) provides empirical support but is not a substitute for
+formal analysis.
+
+We explicitly invite the cryptographic community to scrutinize this
+construction.  The open problems enumerated in Section~\ref{sec:openproblems}
+represent concrete opportunities for analysis.  A successful attack would be
+as valuable as a successful defense: it would clarify the boundary between
+chaos-theoretic intuition and cryptographic reality.
+
+The complete reference implementation (Rust, $\sim$530 lines for the core
+primitive) and all documentation are publicly available.
+
+\bibliographystyle{splncs04}
+\bibliography{refs}
+
+\end{document}
