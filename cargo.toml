@@ -3,6 +3,9 @@ name = "catwalk"
 version = "0.1.0"
 edition = "2021"
 description = "CATWALK: CML-Sponge AEAD file encryption tool"
+authors = ["Andrew Unger"]
+repository = "https://github.com/andrew-unger/chaotic_encryption"
+readme = "README.md"
 
 [lib]
 name = "catwalk"

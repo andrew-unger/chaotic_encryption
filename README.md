@@ -24,6 +24,16 @@ Available as both a command-line tool and a cross-platform graphical application
 - **Drag-and-Drop** — Drop files directly onto the GUI window
 - **Password Policy Enforcement** — Minimum 18 characters, consecutive repeat detection, real-time strength feedback
 
+## Paper
+
+The design, analysis, and open problems are described in:
+
+> **CATWALK: A Stream Cipher Based on Arnold's Cat Map in a Coupled Lattice Sponge Construction**
+>
+> `paper/catwalk.tex` — IACR ePrint submission (LaTeX source + bibliography)
+
+The paper includes the complete construction specification, coupling matrix eigenvalue analysis, security argument with honest claim labeling, and statistical validation results.
+
 ## Installation
 
 ### Prerequisites

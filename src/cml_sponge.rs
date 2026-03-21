@@ -91,7 +91,7 @@ const BLOCK_BYTES: usize = N_RATE * 8; // 64
 /// Arnold's Cat Map — the local nonlinear map applied to adjacent site pairs.
 ///
 /// Implements the discrete linear toral automorphism in symplectic
-/// (Störmer–Verlet) integration order:
+/// integration order:
 ///
 /// ```text
 /// [x']   [1  1] [x]
