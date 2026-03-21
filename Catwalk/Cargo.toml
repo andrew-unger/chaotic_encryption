@@ -5,7 +5,7 @@ edition = "2021"
 description = "CATWALK: CML-Sponge AEAD file encryption tool"
 authors = ["Andrew Unger"]
 repository = "https://github.com/andrew-unger/chaotic_encryption"
-readme = "README.md"
+readme = "../Support/README.md"
 
 [lib]
 name = "catwalk"
@@ -36,8 +36,16 @@ gui = ["eframe", "egui", "rfd", "zip"]
 
 [[bench]]
 name = "catwalk_bench"
-path = "benches/catwalk_bench.rs"
+path = "../Support/benches/catwalk_bench.rs"
 harness = false
+
+[[test]]
+name = "cml_sponge_tests"
+path = "../Support/tests/cml_sponge_tests.rs"
+
+[[test]]
+name = "round_trip"
+path = "../Support/tests/round_trip.rs"
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
