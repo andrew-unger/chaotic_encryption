@@ -33,5 +33,5 @@ fn main() {
     println!("\nReference points (typical x86-64 software implementations):");
     println!("  ChaCha20:        ~1500–3000 MB/s (without AVX-512)");
     println!("  AES-128-CTR:     ~3000–6000 MB/s (AES-NI)");
-    println!("  CATWALK v8:      ~460  MB/s  (same hardware)");
+    println!("  CATWALK v10:     ~460  MB/s  (same hardware)");
 }

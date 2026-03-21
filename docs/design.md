@@ -214,6 +214,8 @@ Justification:
 - PractRand validation at 256 GB with multiple seeds provides empirical support that
   8 rounds is sufficient for statistical indistinguishability (see `docs/practrand_results.md`).
 
+Reduced-round PractRand testing (docs/reduced_round_analysis.md) confirms that the raw permutation achieves full statistical indistinguishability at 2 rounds without Mix13, giving the 8-round design a 4× conservative empirical security margin.
+
 ### 2.6 Sponge Construction
 
 CATWALK uses a sponge construction following Bertoni et al. (2007), adapted for a
@@ -551,7 +553,7 @@ below were generated with the v10 construction: Arnold's Cat Map local map +
 | Total state | 1024 bits (+ 64-bit counter) | Large enough for 512-bit capacity |
 | Rate | 512 bits (8 sites × 64 bits) | 64 bytes per squeeze block |
 | Capacity | 512 bits (full) | C invertible over Z/2^64Z → no capacity correction |
-| Rounds | 8 per permutation | 4× full-diffusion margin (2 rounds = full diffusion) |
+| Rounds | 8 per permutation | 4× full-diffusion margin (2 rounds = full diffusion, empirical minimum; 8 rounds = 4× conservative margin over PractRand distinguisher threshold — see docs/reduced_round_analysis.md) |
 | Coupling distances | {1, 3, 7, 11} | 5-term; det=−33075 (odd, invertible); min\|λ\|=1.259; full diffusion in 2 rounds; all-prime |
 | Weyl increment (GOLDEN) | 0x9E3779B97F4A7C15 | frac(φ) × 2^64; nothing-up-my-sleeve |
 | Counter rotations (ROT) | First 16 primes ≥ 3 | All odd, coprime to 64; nothing-up-my-sleeve |

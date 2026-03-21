@@ -220,6 +220,10 @@ All: no anomalies at every checkpoint through 4 GB (277 tests each)
   systematic weakness.
 
 - The 1-round raw failure is in [Low1/64] (lowest-bit folded) Gap-16 tests,
-  indicating that the single-round permutation leaves detectable structure
-  specifically in the least significant bits. This is consistent with the
-  known tent-map even-bit bias that Mix13 was designed to correct.
+  indicating that a single CML round leaves detectable structure in the least
+  significant bits of the raw output. This is expected — one round provides
+  only local pair-wise mixing (Arnold's Cat Map on adjacent pairs) without
+  full 16-site diffusion. The coupling step requires 2 rounds to propagate
+  information across all 16 sites; at 1 round the low bits of sites distant
+  from the initially-mixed pairs retain detectable structure. By round 2,
+  full diffusion is achieved and the bias disappears completely.

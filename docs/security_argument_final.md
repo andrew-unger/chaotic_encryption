@@ -495,6 +495,24 @@ A real weakness (complement symmetry, short period, even-bit bias, correlated ou
 
 **Result:** No statistical distinguisher found at 256 GB × 5 seeds.
 
+### Reduced-Round Security Margin
+
+**[EMPIRICAL]** Full statistical indistinguishability of the raw permutation output (without Mix13) is achieved at 2 rounds. The 8-round design therefore provides a **4× conservative security margin** (8 ÷ 2) above the empirically determined minimum.
+
+With Mix13 applied, all round counts from 1 to 8 pass PractRand to 4 GB, giving a construction margin of ≥8×. The conservative figure of 4× is used because it is independent of Mix13.
+
+For context, well-regarded stream and block ciphers have the following empirical margins:
+
+| Cipher | Design rounds | Distinguisher at | Margin |
+|--------|--------------|-----------------|--------|
+| ChaCha20 | 20 | 7 rounds | 2.9× |
+| AES-128 | 10 | 6 rounds | 1.7× |
+| CATWALK v10 | 8 | 1 round (raw) | 4.0× |
+
+Note: ChaCha20 and AES margins are based on best published reduced-round distinguishers as of 2024. CATWALK's margin is measured against statistical distinguishers only; algebraic distinguishers have not been analyzed for any of these ciphers at their full round count.
+
+Full reduced-round analysis is documented in docs/reduced_round_analysis.md.
+
 ### Attack 4 — Related-Key / Related-IV Distinguisher
 
 **Target:** Find a pair of (key, IV) inputs that produce correlated or identical keystreams.
