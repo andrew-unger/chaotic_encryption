@@ -19,6 +19,7 @@
 \usepackage{hyperref}
 \usepackage{xcolor}
 \usepackage{enumitem}
+\usepackage{todonotes}
 
 % Security claim labels
 \newcommand{\proof}[1]{\textsc{[Proof]} #1}
@@ -57,7 +58,8 @@ provable, not assumed.  A principled eigenvalue analysis of the coupling
 topology discovered and fixed a structural singularity, leading to a 5-term
 coupling architecture with distances $\{1,3,7,11\}$ that is fully invertible
 over~$\Ztwo$ (trivial kernel, $\det = -33075$, $\min|\lambda_k| = 1.259$).
-PractRand validation at~1~TB (397 tests, zero persistent anomalies), raw
+PractRand validation to 1~TB per seed (397 tests per seed at the 1~TB checkpoint;
+full multi-seed validation in progress), raw
 permutation validation at~32~GB without the output finalizer, and
 reduced-round analysis establishing a $4\times$ security margin all support
 the empirical quality of the construction.  CATWALK is a research cipher: it
@@ -228,7 +230,7 @@ defined by the matrix:
   \begin{pmatrix} x' \\ y' \end{pmatrix}
   = \catmap \begin{pmatrix} x \\ y \end{pmatrix} \pmod{2^{64}}.
 \]
-In symplectic (St\"ormer--Verlet) integration order: $x' = x + y$, then $y' = x' + y = x + 2y$.
+Computed in symplectic order (update $x$ first, then use updated $x$ to compute $y$): $x' = x + y$, then $y' = x' + y = x + 2y$.
 
 \paragraph{Key properties.}
 \begin{itemize}[nosep]
@@ -238,8 +240,10 @@ In symplectic (St\"ormer--Verlet) integration order: $x' = x + y$, then $y' = x'
   \approx \{2.618, 0.382\}$, both real, product~1, neither a root of unity.
   The map has stable and unstable manifolds filling~$\mathbb{R}^2$.
 \item \textbf{Lyapunov exponent:} $\Lambda = \ln\lambda_+ = \ln((3+\sqrt{5})/2) \approx 0.9624$.
-  This is the maximum achievable for any $2 \times 2$ integer matrix with
-  $\det = 1$ and $\mathrm{tr} = 3$.
+  For any $2 \times 2$ integer matrix with $\det = 1$ and trace~3,
+  the characteristic equation $\lambda^2 - 3\lambda + 1 = 0$ gives
+  eigenvalues $(3 \pm \sqrt{5})/2$ uniquely, so the Lyapunov exponent
+  is the same for all such matrices.
 \item \textbf{No complement symmetry:}
   $\catmap(M-x, M-y) \neq \catmap(x,y)$ and $\neq (M - \catmap(x,y))$ for
   generic inputs, where $M = 2^{64} - 1$.  See Section~\ref{sec:construction}.
@@ -419,19 +423,49 @@ Domain & Value & Usage \\
 
 \subsection{AEAD Construction}
 
-CATWALK follows SpongeWrap~\cite{bertoni2007sponge}:
+The AEAD construction follows SpongeWrap semantics.
+Algorithm~\ref{alg:aead-enc} specifies encryption.
+Decryption is identical except: keystream is generated
+first, then ciphertext is absorbed (not plaintext),
+then XOR'd to recover plaintext.  The tag is verified
+before any plaintext is returned.
 
-\begin{enumerate}[nosep]
-\item \textbf{Init:} All-zero state.  Absorb 32-byte key with domain~\texttt{0x01},
-  then 16-byte nonce with domain~\texttt{0x02}.
-\item \textbf{AAD:} Absorb header bytes with domain~\texttt{0x03}.
-\item \textbf{Encrypt:} For each plaintext chunk~$P$: squeeze keystream~$K$,
-  compute $C = P \oplus K$, absorb~$C$ with domain~\texttt{0x04}.
-\item \textbf{Decrypt:} For each ciphertext chunk~$C$: squeeze keystream~$K$,
-  save~$C$, compute $P = C \oplus K$, absorb saved~$C$ with domain~\texttt{0x04}.
-\item \textbf{Finalize:} Empty absorb with domain~\texttt{0x05}.
-  Tag = first 32~bytes of rate (4~words, each through Mix13).
-\end{enumerate}
+\begin{algorithm}[t]
+\caption{CATWALK AEAD encryption.}
+\label{alg:aead-enc}
+\begin{algorithmic}[1]
+\Require Key $K$ (32 bytes), nonce $N$ (16 bytes),
+         header $H$, plaintext $P$
+\Ensure Ciphertext $C$, tag $T$
+\State $\sigma \gets \mathsf{CipherInit}(K, N)$
+  \Comment{Absorb $K$ with domain 0x01, $N$ with domain 0x02}
+\State $\mathsf{Absorb}(\sigma, H, \texttt{0x03})$
+  \Comment{Header authenticated, not encrypted}
+\ForAll{64-byte blocks $P_i$ of $P$}
+  \State $K_i \gets \mathsf{Squeeze}(\sigma, 64)$
+    \Comment{Squeeze keystream (with Mix13)}
+  \State $C_i \gets P_i \oplus K_i$
+  \State $\mathsf{Absorb}(\sigma, C_i, \texttt{0x04})$
+    \Comment{Absorb ciphertext, not plaintext}
+\EndFor
+\State $\mathsf{Absorb}(\sigma, \varepsilon, \texttt{0x05})$
+  \Comment{Domain-separated finalisation}
+\State $T \gets \mathsf{Squeeze}(\sigma, 32)$
+  \Comment{32-byte tag}
+\State \Return $(C, T)$
+\end{algorithmic}
+\end{algorithm}
+
+\paragraph{Domain separation.}
+Five domain bytes separate the five absorption phases:
+\texttt{0x01}~(key), \texttt{0x02}~(IV/nonce),
+\texttt{0x03}~(AAD/header), \texttt{0x04}~(ciphertext),
+\texttt{0x05}~(tag finalisation).
+The Keccak-style multi-rate padding
+$M \| D \| \texttt{0x00}^* \| \texttt{0x80}$
+makes the padded encoding injective: distinct
+$(M, D)$ pairs produce distinct padded blocks,
+preventing cross-phase collisions.
 
 \proof{Both encrypt and decrypt absorb the \emph{ciphertext} with
 domain~\texttt{0x04}, so sponge state evolution is identical.
@@ -897,11 +931,10 @@ appeared only at the 1~TB checkpoint, consistent with the expected
 Poisson rate of $\sim$0.4 unusual events per checkpoint at 397~tests.}
 \end{table}
 
-The original $\{1,7,8\}$ construction was validated at 256~GB on 5~seeds
-(0, 1, 2, 254, 255), each passing 369~tests with zero persistent anomalies.
-Seeds~254 (all-zero key/IV) and~255 (all-FF key/IV) are the critical
-degenerate cases; their clean passage on distinct outputs confirms the
-absence of complement symmetry at the cipher level.
+Prior to the v10 coupling design, an intermediate design ($\{1,5,11\}$, 4-term
+coupling) was validated at 256~GB on 5~seeds (0, 1, 2, 254, 255), each passing
+369~tests with zero persistent anomalies.  Those results are superseded by the
+v10 validation reported here.
 
 \subsection{Raw Permutation Validation}
 
@@ -999,8 +1032,9 @@ true security margin, not a definitive characterization.}
 \section{Performance}
 \label{sec:performance}
 
-All benchmarks were measured with Criterion~0.5 on Windows~10 (x86-64),
-Rust stable with release profile (LTO, single codegen unit, strip).
+All benchmarks were measured with Criterion~0.5 on Windows~10 IoT Enterprise
+(x86-64, \todo{insert CPU model}),%
+\space Rust stable with release profile (LTO, single codegen unit, strip).
 
 \begin{table}[h]
 \centering
