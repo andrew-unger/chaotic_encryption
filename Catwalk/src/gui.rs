@@ -921,24 +921,31 @@ impl CatwalkGui {
                     return;
                 }
 
-                // Build a content rect that already has the desired symmetric margins
-                // baked in. Using allocate_new_ui with an explicit Rect is the only
-                // reliable way to constrain *both* left and right boundaries in egui,
-                // because inner_margin.right does not reduce max_rect.right on panels.
+                // Apply only horizontal margins via an explicit content_rect.
+                // We do NOT cap max.y here — the ScrollArea below handles the
+                // vertical extent, allowing content to scroll rather than clip.
+                // Using allocate_new_ui with an explicit Rect is the only reliable
+                // way to constrain *both* left and right boundaries in egui, because
+                // inner_margin.right does not reduce max_rect.right on panels.
                 let h_margin = 20.0_f32;
-                let v_margin = 8.0_f32;
                 let full = ui.max_rect();
                 let content_rect = egui::Rect::from_min_max(
-                    egui::pos2(full.min.x + h_margin, full.min.y + v_margin),
-                    egui::pos2(full.max.x - h_margin, full.max.y - v_margin),
+                    egui::pos2(full.min.x + h_margin, full.min.y),
+                    egui::pos2(full.max.x - h_margin, full.max.y),
                 );
 
                 ui.allocate_new_ui(egui::UiBuilder::new().max_rect(content_rect), |ui| {
-                    match self.mode {
-                        Mode::Info => self.render_info_mode(ui),
-                        Mode::Archive => self.render_batch_mode(ui),
-                        _ => self.render_single_mode(ui),
-                    }
+                    egui::ScrollArea::vertical()
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            ui.add_space(8.0); // top padding
+                            match self.mode {
+                                Mode::Info    => self.render_info_mode(ui),
+                                Mode::Archive => self.render_batch_mode(ui),
+                                _             => self.render_single_mode(ui),
+                            }
+                            ui.add_space(8.0); // bottom padding
+                        });
                 });
             });
     }
