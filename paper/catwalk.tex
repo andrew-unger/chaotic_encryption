@@ -19,7 +19,7 @@
 \usepackage{hyperref}
 \usepackage{xcolor}
 \usepackage{enumitem}
-\usepackage{todonotes}
+
 
 % Security claim labels
 \newcommand{\proof}[1]{\textsc{[Proof]} #1}
@@ -82,7 +82,7 @@ a chaotic dynamical system exhibits sensitive dependence on initial conditions
 mixing (any open set eventually maps onto the entire phase space), and dense
 periodic orbits (the system visits every neighborhood infinitely often).
 These properties mirror the classical Shannon requirements of confusion and
-diffusion~\cite{arnold1968ergodic}.
+diffusion~\cite{shannon1949communication}.
 
 \paragraph{Why previous chaos ciphers failed.}
 Despite this intuition, chaos-based cryptography has a troubled history.
@@ -456,16 +456,7 @@ before any plaintext is returned.
 \end{algorithmic}
 \end{algorithm}
 
-\paragraph{Domain separation.}
-Five domain bytes separate the five absorption phases:
-\texttt{0x01}~(key), \texttt{0x02}~(IV/nonce),
-\texttt{0x03}~(AAD/header), \texttt{0x04}~(ciphertext),
-\texttt{0x05}~(tag finalisation).
-The Keccak-style multi-rate padding
-$M \| D \| \texttt{0x00}^* \| \texttt{0x80}$
-makes the padded encoding injective: distinct
-$(M, D)$ pairs produce distinct padded blocks,
-preventing cross-phase collisions.
+Domain bytes are defined in Table~\ref{tab:domains}.
 
 \proof{Both encrypt and decrypt absorb the \emph{ciphertext} with
 domain~\texttt{0x04}, so sponge state evolution is identical.
@@ -478,7 +469,12 @@ native Encrypt-then-MAC semantics.}
 \item Argon2id~\cite{rfc9106}: password $+$ (16-byte random salt $\|$ 8-byte timestamp)
   $\to$ 32-byte master key.  Default: $m = 256$~MB, $t = 4$ iterations, $p = 1$ lane.
 \item BLAKE3~\cite{blake3} domain derivation:
-  $\mathrm{cipher\_key} = \mathrm{BLAKE3\_derive\_key}(\text{``catwalk.v9.cipher''},\, \mathrm{master\_key})$.
+  $\mathrm{cipher\_key} = \mathrm{BLAKE3\_derive\_key}(\text{``catwalk.v9.cipher''},\, \mathrm{master\_key})$.%
+  \footnote{The context string \texttt{catwalk.v9.cipher}
+  is retained from the v9 file format for backward
+  compatibility with files encrypted by prior versions.
+  It does not imply the v9 construction; all other
+  parameters reflect the v10 design.}
 \item Sponge init: absorb cipher\_key, then absorb nonce.
 \end{enumerate}
 
@@ -1033,7 +1029,7 @@ true security margin, not a definitive characterization.}
 \label{sec:performance}
 
 All benchmarks were measured with Criterion~0.5 on Windows~10 IoT Enterprise
-(x86-64, \todo{insert CPU model}),%
+(x86-64, AMD Ryzen 9 3900X),%
 \space Rust stable with release profile (LTO, single codegen unit, strip).
 
 \begin{table}[h]
