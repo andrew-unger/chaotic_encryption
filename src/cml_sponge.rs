@@ -530,3 +530,20 @@ pub fn keystream_r(state: &mut CmlSpongeState, out: &mut [u8], rounds: usize) {
         pos += take;
     }
 }
+
+// ── Raw permutation for offline analysis ──────────────────────────────────
+
+/// Apply `rounds` iterations of the CML round function directly to a raw
+/// lattice array and Weyl counter, bypassing the [`CmlSpongeState`] wrapper.
+///
+/// This is intended **exclusively for offline algebraic analysis** (e.g.
+/// measuring algebraic degree growth per round, computing ANFs, or building
+/// differential trails).  It exposes the raw permutation without sponge
+/// padding, domain separation, or the Stafford Mix13 output finalizer.
+///
+/// **Do not use for encryption or authentication.**
+pub fn permute_raw(lattice: &mut [u64; 16], counter: &mut u64, rounds: usize) {
+    for _ in 0..rounds.min(32) {
+        cml_round(lattice, counter);
+    }
+}
