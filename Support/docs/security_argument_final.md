@@ -750,3 +750,24 @@ For the benefit of external reviewers:
 6. **No comparison to established designs.** The security properties have not been compared to those of ChaCha20, AES-GCM, or other vetted stream ciphers in a formal framework.  An empirical security margin comparison (ChaCha20 2.9×, AES-128 1.7×, CATWALK 4×) is documented in `docs/reduced_round_analysis.md`, but this compares statistical distinguisher thresholds only — not algebraic or differential attacks.
 
 7. **PractRand coverage.** v10 validation: seeds 0 and 1 at 1 TB each (397 tests, zero persistent anomalies); seeds 2, 3, 64, 128, 254, 255 at 1 TB in progress.  Original {1,7,8} coupling: 5 seeds at 256 GB each (369 tests, zero anomalies).  Raw permutation: 3 seeds at 32 GB (325 tests each, zero anomalies).  No multi-stream correlation tests (e.g., NIST SP 800-22 pairwise tests) have been run.
+
+---
+
+## Keyfile Support — Security Properties
+
+| Property | Description | Status |
+|----------|-------------|--------|
+| Keyfile support | Optional second authentication factor | IMPLEMENTED |
+| Pre-combination hashing | BLAKE3(keyfile) before Argon2id; fixed 32-byte contribution regardless of keyfile size | PROOF: BLAKE3 is collision-resistant; distinct keyfiles produce distinct hashes with overwhelming probability |
+| Path not stored | The keyfile filesystem path is never written to the header; only `FLAG_KEYFILE` (bit 2) is recorded | PROOF: header layout in `crypto.rs` contains no path field |
+| Wrong keyfile indistinguishable from wrong password | Both produce `IntegrityCheckFailed` via constant-time AEAD tag mismatch | PROOF: tag verification is the only point of failure; no branching on KDF output |
+| Separator byte | `0x00` between password bytes and keyfile hash prevents length-extension ambiguity | PROOF: Argon2id password input `pw||0x00||hash` is unambiguous for any non-null-containing password and 32-byte hash |
+| Maximum keyfile size | 1 GB enforced via `fs::metadata().len()` before reading | IMPLEMENTED: `CryptoError::KeyfileTooLarge` returned immediately |
+| Two-factor security model | Compromise of password alone (without keyfile) is insufficient for decryption | PROOF: Argon2id input includes BLAKE3(keyfile); attacker must obtain both factors |
+
+### Threat model note
+
+The keyfile provides no protection if it is stored in the same location as the
+encrypted file, or in any location that an attacker who obtained the encrypted
+file also has access to. The security benefit requires physical or logical
+separation of keyfile and encrypted file.

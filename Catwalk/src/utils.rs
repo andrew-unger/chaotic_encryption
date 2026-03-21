@@ -46,7 +46,8 @@ impl FileInfo {
     pub fn flags_display(&self) -> String {
         let mut parts = Vec::new();
         if self.flags & FLAG_STRIP_METADATA != 0 { parts.push("STRIP_METADATA"); }
-        if self.flags & FLAG_NO_COMPRESS != 0 { parts.push("NO_COMPRESS"); }
+        if self.flags & FLAG_NO_COMPRESS    != 0 { parts.push("NO_COMPRESS"); }
+        if self.flags & FLAG_KEYFILE        != 0 { parts.push("KEYFILE"); }
         if parts.is_empty() { "none".to_string() } else { parts.join(", ") }
     }
 

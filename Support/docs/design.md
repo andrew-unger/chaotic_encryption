@@ -564,3 +564,58 @@ below were generated with the v10 construction: Arnold's Cat Map local map +
 | KDF iterations | 4 | Multiplies time cost beyond memory |
 | Nonce size | 16 bytes | 128-bit nonce space; collision at ~2^64 encryptions |
 | BLAKE3 derive | "catwalk.v9.cipher" | Domain separation between KDF output and cipher key (retained from v9 for file format compatibility; not updated to v10 to preserve decryption of existing files) |
+
+## 8. Keyfile Support
+
+CATWALK supports an optional keyfile as a second authentication factor. When a
+keyfile is provided, the Argon2id input becomes:
+
+```
+password_bytes || 0x00 || BLAKE3(keyfile_contents)
+```
+
+The keyfile is hashed with BLAKE3 before combining with the password. This
+gives a fixed 32-byte contribution regardless of keyfile size (max 1 GB) and
+prevents feeding large files directly into Argon2id. The null-byte separator
+between the password and the hash prevents length-extension ambiguity.
+
+The `FLAG_KEYFILE` bit (`0x04`) in the file header indicates that a keyfile was
+used during encryption. The keyfile *path* is never stored. On decryption the
+user must supply the original keyfile — supplying a wrong or missing keyfile
+produces the same error as a wrong password (`IntegrityCheckFailed`), so an
+attacker cannot determine which factor was wrong.
+
+### Flag assignment
+
+| Bit | Constant            | Value | Meaning                                   |
+|-----|---------------------|-------|-------------------------------------------|
+| 0   | `FLAG_STRIP_METADATA` | 0x01 | Timestamp and extension stripped         |
+| 1   | `FLAG_NO_COMPRESS`    | 0x02 | Ciphertext stored uncompressed           |
+| 2   | `FLAG_KEYFILE`        | 0x04 | Keyfile was mixed into KDF input         |
+
+### Threat model
+
+A keyfile protects against scenarios where the password is compromised but the
+keyfile is not: database breaches, password reuse across services, shoulder
+surfing, etc.
+
+A keyfile provides **no** additional protection if stored in the same location
+as the encrypted file, or on a cloud service that syncs with the encrypted
+file.
+
+### Keyfile generation
+
+Keyfiles should be 64 bytes of CSPRNG output. CATWALK provides two generation
+methods:
+
+- **CLI:** `catwalk genkey --output <path>` — generates 64 bytes from
+  `rand::thread_rng()` (OS CSPRNG).
+- **GUI:** "Generate new keyfile" button opens an interactive entropy
+  harvesting dialog that collects mouse movement, click timestamps, keyboard
+  timing, and frame jitter, then whitens all accumulated entropy with
+  BLAKE3-XOF to produce a 64-byte keyfile.
+
+The interactive harvesting is a UX and trust feature: users who move their
+mouse are contributing genuine unpredictability that no software RNG can
+replicate. The BLAKE3 step at derivation time provides compression and
+whitening of the raw pool.

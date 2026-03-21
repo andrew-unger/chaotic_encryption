@@ -1,9 +1,10 @@
 use argon2::{Algorithm, Argon2, Params, Version};
 use blake3;
 use rand::Rng;
-use subtle::ConstantTimeEq;
+use std::fs;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
+use subtle::ConstantTimeEq;
 use zeroize::Zeroize;
 
 use crate::cml_sponge;
@@ -101,9 +102,17 @@ pub mod constants {
     pub const MIN_PASSWORD_LEN: usize = 18;
     pub const MAX_CONSECUTIVE_REPEAT: usize = 3;
 
-    // Flags byte bit definitions
+    // Flags byte bit definitions (byte index 5 in the header).
+    // Bit 0 — strip timestamp and file extension from header.
     pub const FLAG_STRIP_METADATA: u8 = 0x01;
-    pub const FLAG_NO_COMPRESS: u8 = 0x02;
+    // Bit 1 — ciphertext is stored uncompressed.
+    pub const FLAG_NO_COMPRESS:    u8 = 0x02;
+    // Bit 2 — a keyfile was mixed into the KDF input.
+    // NOTE: 0x01 and 0x02 were already taken; this is the next available bit.
+    pub const FLAG_KEYFILE:        u8 = 0x04;
+
+    /// Byte index of the flags field within the CATWALK header.
+    pub const FLAGS_OFFSET: usize = 5;
 
     // Minimum header size: magic(4) + ver(1) + flags(1) + salt(16) + ts(8) + nonce(16) + argon(3) + ext_len(1) + tag(32)
     pub const MIN_HEADER_LEN: usize = 4 + 1 + 1 + SALT_LEN + TIMESTAMP_LEN + NONCE_LEN + 3 + 1 + HASH_LEN;
@@ -133,8 +142,42 @@ impl Default for EncryptOptions {
 
 // ── Key Derivation ───────────────────────────────────────────────────────────
 
-fn derive_key(
+/// Build the raw byte slice that Argon2id hashes as its "password" input.
+///
+/// Without a keyfile: `password_bytes`.
+/// With a keyfile:    `password_bytes || 0x00 || BLAKE3(keyfile_contents)`.
+///
+/// The keyfile is hashed before combining so Argon2id always receives a
+/// fixed-length input regardless of keyfile size (up to 1 GB).
+/// The null-byte separator prevents length-extension ambiguity.
+fn build_kdf_input(
     password: &str,
+    keyfile_path: Option<&Path>,
+) -> Result<Vec<u8>, CryptoError> {
+    if let Some(path) = keyfile_path {
+        // Check size via metadata first to avoid loading a huge file.
+        let file_len = fs::metadata(path)?.len();
+        if file_len > 1_073_741_824 {
+            return Err(CryptoError::KeyfileTooLarge);
+        }
+        let contents = fs::read(path)?;
+        let digest = blake3::hash(&contents);
+        let mut material = password.as_bytes().to_vec();
+        material.push(0x00); // separator — prevents length-extension ambiguity
+        material.extend_from_slice(digest.as_bytes());
+        Ok(material)
+    } else {
+        Ok(password.as_bytes().to_vec())
+    }
+}
+
+/// Derive a 32-byte master key from raw KDF input bytes via Argon2id.
+///
+/// The salt passed to Argon2id is `salt || timestamp` so that the timestamp
+/// contributes to the per-file KDF domain even when it is zeroed out by
+/// `strip_metadata`.
+fn derive_key(
+    kdf_input: &[u8],
     salt: &[u8],
     timestamp: &[u8],
     m_log2: u8,
@@ -154,7 +197,7 @@ fn derive_key(
     combined_salt.extend_from_slice(timestamp);
 
     argon2
-        .hash_password_into(password.as_bytes(), &combined_salt, &mut key)
+        .hash_password_into(kdf_input, &combined_salt, &mut key)
         .map_err(|_| CryptoError::KeyDerivationFailed)?;
     Ok(key)
 }
@@ -197,23 +240,20 @@ pub fn validate_password(password: &str) -> Result<(), &'static str> {
 /// # Arguments
 ///
 /// - `plaintext` — raw file bytes to encrypt.
-/// - `password` — must satisfy the requirements checked by [`validate_password`];
-///   call that function first if you want a human-readable error before attempting encryption.
+/// - `password` — must satisfy the requirements checked by [`validate_password`].
 /// - `input_filename` — used to extract the file extension stored in the header
-///   (unless `options.strip_metadata` is set).  Pass `""` if there is no source filename.
-/// - `options` — controls compression and metadata stripping; see [`EncryptOptions`].
-/// - `progress` — optional callback called with values in `[0.0, 1.0]` as each phase
-///   completes.  Called from the same thread; must not block.
-///
-/// # Errors
-///
-/// Returns [`CryptoError`] on KDF failure, system time error, or I/O error.
-/// See [`validate_password`] for password policy enforcement.
+///   (unless `options.strip_metadata` is set).
+/// - `options` — controls compression and metadata stripping.
+/// - `keyfile_path` — optional path to a keyfile. When `Some`, the keyfile's
+///   BLAKE3 hash is mixed into the Argon2id input before the KDF runs, and
+///   `FLAG_KEYFILE` is set in the header. The keyfile path itself is never stored.
+/// - `progress` — optional callback called with values in `[0.0, 1.0]`.
 pub fn encrypt(
     plaintext: &[u8],
     password: &str,
     input_filename: &str,
     options: &EncryptOptions,
+    keyfile_path: Option<&Path>,
     progress: Option<&ProgressFn>,
 ) -> Result<Vec<u8>, CryptoError> {
     let progress = &progress;
@@ -256,17 +296,20 @@ pub fn encrypt(
     let ext_len = extension.len() as u8;
 
     let mut flags: u8 = 0;
-    if options.strip_metadata { flags |= FLAG_STRIP_METADATA; }
+    if options.strip_metadata  { flags |= FLAG_STRIP_METADATA; }
     if options.skip_compression { flags |= FLAG_NO_COMPRESS; }
+    if keyfile_path.is_some()   { flags |= FLAG_KEYFILE; }
 
     let m_log2 = ARGON2_M_LOG2;
     let t_cost = ARGON2_T_COST;
     let p_cost = ARGON2_P_COST;
 
-    // Phase 2: Argon2id KDF (0.05 → 0.35)
+    // Phase 2: Build KDF input and run Argon2id (0.05 → 0.35)
+    let mut kdf_input = build_kdf_input(password, keyfile_path)?;
     let master_key = LockedBuffer::new(
-        derive_key(password, &salt, &timestamp, m_log2, t_cost, p_cost)?
+        derive_key(&kdf_input, &salt, &timestamp, m_log2, t_cost, p_cost)?
     );
+    kdf_input.zeroize();
     let cipher_key = LockedBuffer::new(derive_cipher_key_v9(master_key.get()));
     report(progress, 0.35);
 
@@ -309,10 +352,6 @@ pub fn encrypt(
     report(progress, 0.85);
 
     // Phase 4: Finalise tag + assemble output (0.85 → 0.90)
-    //
-    // The 32-byte sponge tag is bound to: cipher_key, nonce, all header fields
-    // (AAD), and every ciphertext byte — providing Encrypt-then-MAC semantics
-    // natively via the sponge capacity.
     let tag = cml_sponge::aead_finalize(&mut sponge);
 
     let mut result = Vec::with_capacity(header.len() + ciphertext.len() + HASH_LEN);
@@ -331,28 +370,27 @@ pub fn encrypt(
 /// `extension` is the original file extension stored in the header (empty string if
 /// `strip_metadata` was set during encryption or no extension was present).
 ///
-/// Verification is performed **before** the plaintext is returned.  The function
-/// returns `Err(CryptoError::IntegrityCheckFailed)` if the AEAD tag does not match,
-/// and no plaintext bytes are ever returned to the caller in that case.
+/// Verification is performed **before** the plaintext is returned.
 ///
 /// # Arguments
 ///
-/// - `ciphertext_bundle` — the complete output of [`encrypt`]: header + ciphertext + tag.
+/// - `ciphertext_bundle` — the complete output of [`encrypt`].
 /// - `password` — the password used during encryption.
-/// - `progress` — optional progress callback; see [`encrypt`] for details.
+/// - `keyfile_path` — if `FLAG_KEYFILE` is set in the header, this **must**
+///   be `Some(path)`. Providing `None` returns [`CryptoError::KeyfileRequired`].
+///   Providing a keyfile for a file that was encrypted without one is silently
+///   ignored (the flag is authoritative).
+/// - `progress` — optional progress callback.
 ///
 /// # Errors
 ///
-/// - [`CryptoError::InvalidMagicBytes`] — first 4 bytes are not `CATW`.
-/// - [`CryptoError::InvalidVersion`] — version byte is not the current version (9).
-/// - [`CryptoError::InvalidCiphertextLength`] — bundle is too short to contain a valid header.
-/// - [`CryptoError::WeakKdfParameters`] — Argon2 memory < 64 MB or iterations < 2.
-/// - [`CryptoError::IntegrityCheckFailed`] — tag mismatch (wrong password or tampered data).
-/// - [`CryptoError::KeyDerivationFailed`] — Argon2id internal error.
-/// - [`CryptoError::DecompressionTooLarge`] — decompression exceeds maximum allowed size.
+/// All error variants from [`encrypt`] plus:
+/// - [`CryptoError::KeyfileRequired`] — file needs a keyfile but none was supplied.
+/// - [`CryptoError::KeyfileTooLarge`] — provided keyfile exceeds 1 GB.
 pub fn decrypt(
     ciphertext_bundle: &[u8],
     password: &str,
+    keyfile_path: Option<&Path>,
     progress: Option<&ProgressFn>,
 ) -> Result<(Vec<u8>, String), CryptoError> {
     let progress = &progress;
@@ -374,7 +412,7 @@ pub fn decrypt(
         return Err(CryptoError::InvalidVersion);
     }
 
-    let flags = ciphertext_bundle[5];
+    let flags = ciphertext_bundle[FLAGS_OFFSET];
 
     let salt_start  = 6;
     let ts_start    = salt_start + SALT_LEN;
@@ -394,10 +432,24 @@ pub fn decrypt(
         return Err(CryptoError::WeakKdfParameters);
     }
 
-    let ext_len     = ciphertext_bundle[ext_len_pos] as usize;
-    let ext_start   = ext_len_pos + 1;
+    // Enforce keyfile requirement before doing any expensive KDF work.
+    // If the flag is set but no keyfile was supplied, fail immediately.
+    // If no flag is set but a keyfile was supplied, silently ignore it —
+    // the flag in the header is authoritative.
+    let effective_keyfile = if (flags & FLAG_KEYFILE) != 0 {
+        match keyfile_path {
+            Some(p) => Some(p),
+            None    => return Err(CryptoError::KeyfileRequired),
+        }
+    } else {
+        // File encrypted without a keyfile; ignore any keyfile supplied.
+        None
+    };
+
+    let ext_len      = ciphertext_bundle[ext_len_pos] as usize;
+    let ext_start    = ext_len_pos + 1;
     let cipher_start = ext_start + ext_len;
-    let tag_start   = ciphertext_bundle.len() - HASH_LEN;
+    let tag_start    = ciphertext_bundle.len() - HASH_LEN;
 
     if cipher_start > tag_start {
         return Err(CryptoError::InvalidCiphertextLength);
@@ -407,10 +459,12 @@ pub fn decrypt(
     let encrypted  = &ciphertext_bundle[cipher_start..tag_start];
     let stored_tag = &ciphertext_bundle[tag_start..];
 
-    // Phase 2: Argon2id KDF (0.05 → 0.35)
+    // Phase 2: Build KDF input and run Argon2id (0.05 → 0.35)
+    let mut kdf_input = build_kdf_input(password, effective_keyfile)?;
     let master_key = LockedBuffer::new(
-        derive_key(password, salt, timestamp, m_log2, t_cost, p_cost)?
+        derive_key(&kdf_input, salt, timestamp, m_log2, t_cost, p_cost)?
     );
+    kdf_input.zeroize();
     report(progress, 0.35);
 
     decrypt_v9(

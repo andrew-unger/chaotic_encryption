@@ -99,11 +99,11 @@ fn blr_linearity_test(rounds: usize, n_samples: usize) -> (f64, f64, f64, f64, f
         let fy = permute(&y, rounds);
         let fxy = permute(&xy, rounds);
 
-        for bit in 0..1024 {
+        for (bit, count) in linear_count.iter_mut().enumerate() {
             let lhs = get_bit(&fx, bit) ^ get_bit(&fy, bit);
             let rhs = get_bit(&fxy, bit);
             if lhs == rhs {
-                linear_count[bit] += 1;
+                *count += 1;
             }
         }
     }
@@ -216,7 +216,7 @@ fn subspace_anf_degree(rounds: usize, k: usize, bit_idx: usize, rng: &mut SplitM
     let n = 1usize << k;
     let mut truth_table = vec![0u64; n];
 
-    for mask in 0..n {
+    for (mask, entry) in truth_table.iter_mut().enumerate() {
         let mut point = base;
         for (j, dir) in directions.iter().enumerate() {
             if (mask >> j) & 1 == 1 {
@@ -226,7 +226,7 @@ fn subspace_anf_degree(rounds: usize, k: usize, bit_idx: usize, rng: &mut SplitM
             }
         }
         let out = permute(&point, rounds);
-        truth_table[mask] = get_bit(&out, bit_idx);
+        *entry = get_bit(&out, bit_idx);
     }
 
     // Möbius transform (ANF computation): in-place butterfly.
@@ -343,7 +343,7 @@ fn main() {
         } else if deg >= 10 {
             "high degree".to_string()
         } else {
-            format!("low/moderate")
+            "low/moderate".to_string()
         };
         println!("       {} |       {:>2} | {}", rounds, deg, note);
     }

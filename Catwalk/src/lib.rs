@@ -27,20 +27,22 @@
 //!
 //! let plaintext = std::fs::read("input.txt").unwrap();
 //!
-//! // Encrypt
+//! // Encrypt (no keyfile)
 //! let bundle = encrypt(
 //!     &plaintext,
 //!     "correct-horse-battery-staple-pw",
 //!     "input.txt",
 //!     &EncryptOptions { strip_metadata: false, skip_compression: true },
+//!     None,  // keyfile path (None = password-only)
 //!     None,  // progress callback
 //! ).unwrap();
 //! std::fs::write("output.catwalk", &bundle).unwrap();
 //!
-//! // Decrypt
+//! // Decrypt (no keyfile)
 //! let (recovered, extension) = decrypt(
 //!     &bundle,
 //!     "correct-horse-battery-staple-pw",
+//!     None,  // keyfile path
 //!     None,  // progress callback
 //! ).unwrap();
 //! println!("recovered {} bytes, extension: {:?}", recovered.len(), extension);

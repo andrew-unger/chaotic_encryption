@@ -22,13 +22,13 @@ fn round_trip_basic() {
     let password = "testpassword123";
     let filename = "test.txt";
 
-    let encrypted = encrypt(plaintext, password, filename, &DEFAULT_OPTS, None).expect("encryption failed");
+    let encrypted = encrypt(plaintext, password, filename, &DEFAULT_OPTS, None, None).expect("encryption failed");
 
     // Verify magic bytes and version
     assert_eq!(&encrypted[..4], b"CATW");
     assert_eq!(encrypted[4], 9); // version 9
 
-    let (decrypted, ext) = decrypt(&encrypted, password, None).expect("decryption failed");
+    let (decrypted, ext) = decrypt(&encrypted, password, None, None).expect("decryption failed");
 
     assert_eq!(decrypted, plaintext);
     assert_eq!(ext, "txt");
@@ -40,8 +40,8 @@ fn round_trip_empty() {
     let password = "pass";
     let filename = "empty.bin";
 
-    let encrypted = encrypt(plaintext, password, filename, &DEFAULT_OPTS, None).expect("encryption failed");
-    let (decrypted, ext) = decrypt(&encrypted, password, None).expect("decryption failed");
+    let encrypted = encrypt(plaintext, password, filename, &DEFAULT_OPTS, None, None).expect("encryption failed");
+    let (decrypted, ext) = decrypt(&encrypted, password, None, None).expect("decryption failed");
 
     assert_eq!(decrypted, plaintext);
     assert_eq!(ext, "bin");
@@ -54,8 +54,8 @@ fn round_trip_large() {
     let password = "strong_password!@#$%";
     let filename = "data.dat";
 
-    let encrypted = encrypt(&plaintext, password, filename, &DEFAULT_OPTS, None).expect("encryption failed");
-    let (decrypted, ext) = decrypt(&encrypted, password, None).expect("decryption failed");
+    let encrypted = encrypt(&plaintext, password, filename, &DEFAULT_OPTS, None, None).expect("encryption failed");
+    let (decrypted, ext) = decrypt(&encrypted, password, None, None).expect("decryption failed");
 
     assert_eq!(decrypted, plaintext);
     assert_eq!(ext, "dat");
@@ -67,9 +67,9 @@ fn wrong_password_fails() {
     let password = "correct_password";
     let filename = "secret.txt";
 
-    let encrypted = encrypt(plaintext, password, filename, &DEFAULT_OPTS, None).expect("encryption failed");
+    let encrypted = encrypt(plaintext, password, filename, &DEFAULT_OPTS, None, None).expect("encryption failed");
 
-    let result = decrypt(&encrypted, "wrong_password", None);
+    let result = decrypt(&encrypted, "wrong_password", None, None);
     assert!(result.is_err(), "decryption with wrong password should fail");
 }
 
@@ -79,13 +79,13 @@ fn tampered_ciphertext_fails() {
     let password = "integrity_pass";
     let filename = "test.txt";
 
-    let mut encrypted = encrypt(plaintext, password, filename, &DEFAULT_OPTS, None).expect("encryption failed");
+    let mut encrypted = encrypt(plaintext, password, filename, &DEFAULT_OPTS, None, None).expect("encryption failed");
 
     // Tamper with a byte in the ciphertext region (past the header, before tag)
     let tamper_pos = encrypted.len() - 33; // one byte before the 32-byte tag
     encrypted[tamper_pos] ^= 0xFF;
 
-    let result = decrypt(&encrypted, password, None);
+    let result = decrypt(&encrypted, password, None, None);
     assert!(result.is_err(), "tampered ciphertext should fail tag check");
 }
 
@@ -95,15 +95,15 @@ fn different_encryptions_differ() {
     let password = "same_password";
     let filename = "test.txt";
 
-    let enc1 = encrypt(plaintext, password, filename, &DEFAULT_OPTS, None).expect("encryption 1 failed");
-    let enc2 = encrypt(plaintext, password, filename, &DEFAULT_OPTS, None).expect("encryption 2 failed");
+    let enc1 = encrypt(plaintext, password, filename, &DEFAULT_OPTS, None, None).expect("encryption 1 failed");
+    let enc2 = encrypt(plaintext, password, filename, &DEFAULT_OPTS, None, None).expect("encryption 2 failed");
 
     // Different salt/nonce means different ciphertext
     assert_ne!(enc1, enc2);
 
     // But both decrypt to the same plaintext
-    let (dec1, _) = decrypt(&enc1, password, None).expect("decryption 1 failed");
-    let (dec2, _) = decrypt(&enc2, password, None).expect("decryption 2 failed");
+    let (dec1, _) = decrypt(&enc1, password, None, None).expect("decryption 1 failed");
+    let (dec2, _) = decrypt(&enc2, password, None, None).expect("decryption 2 failed");
     assert_eq!(dec1, dec2);
     assert_eq!(dec1, plaintext);
 }
@@ -115,14 +115,14 @@ fn round_trip_no_metadata() {
     let filename = "document.pdf";
 
     let opts = EncryptOptions { strip_metadata: true, skip_compression: false };
-    let encrypted = encrypt(plaintext, password, filename, &opts, None).expect("encryption failed");
+    let encrypted = encrypt(plaintext, password, filename, &opts, None, None).expect("encryption failed");
 
     // Flags byte should have bit 0 set
     assert_eq!(encrypted[5] & 0x01, 0x01);
     // Timestamp should be zero
     assert_eq!(&encrypted[22..30], &[0u8; 8]);
 
-    let (decrypted, ext) = decrypt(&encrypted, password, None).expect("decryption failed");
+    let (decrypted, ext) = decrypt(&encrypted, password, None, None).expect("decryption failed");
     assert_eq!(decrypted, plaintext);
     assert_eq!(ext, ""); // extension stripped
 }
@@ -134,12 +134,12 @@ fn round_trip_no_compress() {
     let filename = "raw.bin";
 
     let opts = EncryptOptions { strip_metadata: false, skip_compression: true };
-    let encrypted = encrypt(plaintext, password, filename, &opts, None).expect("encryption failed");
+    let encrypted = encrypt(plaintext, password, filename, &opts, None, None).expect("encryption failed");
 
     // Flags byte should have bit 1 set
     assert_eq!(encrypted[5] & 0x02, 0x02);
 
-    let (decrypted, ext) = decrypt(&encrypted, password, None).expect("decryption failed");
+    let (decrypted, ext) = decrypt(&encrypted, password, None, None).expect("decryption failed");
     assert_eq!(decrypted, plaintext);
     assert_eq!(ext, "bin");
 }
@@ -151,12 +151,12 @@ fn round_trip_both_flags() {
     let filename = "secret.docx";
 
     let opts = EncryptOptions { strip_metadata: true, skip_compression: true };
-    let encrypted = encrypt(plaintext, password, filename, &opts, None).expect("encryption failed");
+    let encrypted = encrypt(plaintext, password, filename, &opts, None, None).expect("encryption failed");
 
     // Both flag bits set
     assert_eq!(encrypted[5] & 0x03, 0x03);
 
-    let (decrypted, ext) = decrypt(&encrypted, password, None).expect("decryption failed");
+    let (decrypted, ext) = decrypt(&encrypted, password, None, None).expect("decryption failed");
     assert_eq!(decrypted, plaintext);
     assert_eq!(ext, "");
 }
@@ -168,7 +168,7 @@ fn invalid_magic_bytes_rejected() {
     let mut data = vec![0u8; MIN_HEADER_LEN + 10];
     data[0..4].copy_from_slice(b"FAKE");
     data[4] = 9; // correct version
-    let result = decrypt(&data, "password", None);
+    let result = decrypt(&data, "password", None, None);
     assert!(matches!(result, Err(CryptoError::InvalidMagicBytes)),
         "expected InvalidMagicBytes, got {:?}", result.err());
 }
@@ -177,7 +177,7 @@ fn invalid_magic_bytes_rejected() {
 fn truncated_file_rejected() {
     // Too short to be a valid header
     let data = vec![b'C', b'A', b'T', b'W', 9u8, 0u8];
-    let result = decrypt(&data, "password", None);
+    let result = decrypt(&data, "password", None, None);
     assert!(matches!(result, Err(CryptoError::InvalidCiphertextLength)),
         "expected InvalidCiphertextLength, got {:?}", result.err());
 }
@@ -189,7 +189,7 @@ fn wrong_version_byte_rejected() {
     data[0..4].copy_from_slice(b"CATW");
     data[4] = 8; // old version — now invalid
     // Fill argon2 fields with safe values so we reach the version check
-    let result = decrypt(&data, "password", None);
+    let result = decrypt(&data, "password", None, None);
     assert!(matches!(result, Err(CryptoError::InvalidVersion)),
         "expected InvalidVersion, got {:?}", result.err());
 }
@@ -209,7 +209,7 @@ fn weak_kdf_params_rejected() {
     data[47] = 4;  // t_cost = 4
     data[48] = 1;  // p_cost = 1
     // ext_len: byte 49 = 0
-    let result = decrypt(&data, "password", None);
+    let result = decrypt(&data, "password", None, None);
     assert!(matches!(result, Err(CryptoError::WeakKdfParameters)),
         "expected WeakKdfParameters, got {:?}", result.err());
 }
@@ -220,13 +220,13 @@ fn tampered_tag_fails() {
     let password = "tag_tamper_pass";
     let filename = "test.bin";
 
-    let mut encrypted = encrypt(plaintext, password, filename, &DEFAULT_OPTS, None).expect("encryption failed");
+    let mut encrypted = encrypt(plaintext, password, filename, &DEFAULT_OPTS, None, None).expect("encryption failed");
 
     // Flip a byte in the last 32 bytes (the tag)
     let last = encrypted.len();
     encrypted[last - 1] ^= 0xFF;
 
-    let result = decrypt(&encrypted, password, None);
+    let result = decrypt(&encrypted, password, None, None);
     assert!(matches!(result, Err(CryptoError::IntegrityCheckFailed)),
         "expected IntegrityCheckFailed, got {:?}", result.err());
 }
@@ -237,12 +237,12 @@ fn tampered_header_fails() {
     let password = "header_tamper_pass";
     let filename = "test.bin";
 
-    let mut encrypted = encrypt(plaintext, password, filename, &DEFAULT_OPTS, None).expect("encryption failed");
+    let mut encrypted = encrypt(plaintext, password, filename, &DEFAULT_OPTS, None, None).expect("encryption failed");
 
     // Flip a byte in the header (nonce region — bytes 30..46)
     encrypted[30] ^= 0x01;
 
-    let result = decrypt(&encrypted, password, None);
+    let result = decrypt(&encrypted, password, None, None);
     assert!(matches!(result, Err(CryptoError::IntegrityCheckFailed)),
         "expected IntegrityCheckFailed (AAD mismatch), got {:?}", result.err());
 }
@@ -252,9 +252,9 @@ fn tampered_header_fails() {
 #[test]
 fn zero_length_plaintext_with_compression() {
     let opts = EncryptOptions { strip_metadata: false, skip_compression: false };
-    let encrypted = encrypt(b"", "edge_case_pass!", "empty.txt", &opts, None)
+    let encrypted = encrypt(b"", "edge_case_pass!", "empty.txt", &opts, None, None)
         .expect("encryption failed");
-    let (decrypted, ext) = decrypt(&encrypted, "edge_case_pass!", None)
+    let (decrypted, ext) = decrypt(&encrypted, "edge_case_pass!", None, None)
         .expect("decryption failed");
     assert!(decrypted.is_empty());
     assert_eq!(ext, "txt");
@@ -269,9 +269,9 @@ fn max_extension_length() {
     let password = "max_ext_pass_test!";
     let opts = EncryptOptions { strip_metadata: false, skip_compression: true };
 
-    let encrypted = encrypt(plaintext, password, &filename, &opts, None)
+    let encrypted = encrypt(plaintext, password, &filename, &opts, None, None)
         .expect("encryption failed");
-    let (decrypted, recovered_ext) = decrypt(&encrypted, password, None)
+    let (decrypted, recovered_ext) = decrypt(&encrypted, password, None, None)
         .expect("decryption failed");
     assert_eq!(decrypted, plaintext);
     assert_eq!(recovered_ext, ext);
@@ -290,7 +290,7 @@ fn progress_is_monotone_encrypt() {
     let values = Arc::new(Mutex::new(Vec::<f32>::new()));
     let cb = collect_progress(values.clone());
     let plaintext: Vec<u8> = (0..50_000).map(|i| (i % 256) as u8).collect();
-    encrypt(&plaintext, "monotone_test_pass!", "test.bin", &DEFAULT_OPTS, Some(&cb))
+    encrypt(&plaintext, "monotone_test_pass!", "test.bin", &DEFAULT_OPTS, None, Some(&cb))
         .expect("encryption failed");
 
     let v = values.lock().unwrap();
@@ -306,12 +306,12 @@ fn progress_is_monotone_encrypt() {
 #[test]
 fn progress_is_monotone_decrypt() {
     let plaintext: Vec<u8> = (0..50_000).map(|i| (i % 256) as u8).collect();
-    let encrypted = encrypt(&plaintext, "monotone_test_pass!", "test.bin", &DEFAULT_OPTS, None)
+    let encrypted = encrypt(&plaintext, "monotone_test_pass!", "test.bin", &DEFAULT_OPTS, None, None)
         .expect("encryption failed");
 
     let values = Arc::new(Mutex::new(Vec::<f32>::new()));
     let cb = collect_progress(values.clone());
-    decrypt(&encrypted, "monotone_test_pass!", Some(&cb))
+    decrypt(&encrypted, "monotone_test_pass!", None, Some(&cb))
         .expect("decryption failed");
 
     let v = values.lock().unwrap();

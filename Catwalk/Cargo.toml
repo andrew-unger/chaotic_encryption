@@ -47,6 +47,10 @@ path = "../Support/tests/cml_sponge_tests.rs"
 name = "round_trip"
 path = "../Support/tests/round_trip.rs"
 
+[[test]]
+name = "keyfile_tests"
+path = "../Support/tests/keyfile_tests.rs"
+
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
 
