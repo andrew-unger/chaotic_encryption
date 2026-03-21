@@ -8,11 +8,10 @@
 **Coupling distances:** {1, 7, 8} (original construction; see warning below)
 **Git commit:** c2a8507 (Rename project from EDDY to CATWALK)
 
-> ⚠️ These 256 GB results were generated against the original coupling distances
-> {1, 7, 8}. Neither the v9 design ({1, 5, 11}, never deployed) nor the v10
-> design ({1, 3, 7, 11}) has been validated at 256 GB. A v10 smoke test
-> (seeds 0, 254, 255 at 8 GB each, 294 tests each) passed with 0 anomalies
-> (commit d664962). Full 256 GB re-validation against v10 is pending.
+> ⚠️ This document covers the pre-v10 {1,7,8} construction. For v10 results
+> see `docs/practrand_1tb_v10.md` (1 TB validation, seeds 0 and 1 complete with
+> zero anomalies at 397 tests each; remaining seeds in progress) and
+> `docs/practrand_raw_permutation.md` (raw permutation validation at 32 GB).
 
 ---
 

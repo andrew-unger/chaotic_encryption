@@ -12,7 +12,7 @@ REM   tools\practrand_multi_seed.bat
 setlocal enabledelayedexpansion
 
 REM ── Configuration ──────────────────────────────────────────────────────────
-set "KEYSTREAM_DUMP=target\release\keystream_dump.exe"
+set "KEYSTREAM_DUMP=target\release\cml_keystream_dump.exe"
 set "PRACTRAND=C:\Users\Unger\Documents\Code\PractRand\build\RNG_test.exe"
 set "MAX_LENGTH=16GB"
 set "SEED_COUNT=10"

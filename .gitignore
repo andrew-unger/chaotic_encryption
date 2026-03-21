@@ -2,4 +2,7 @@ target/
 testing_grounds/
 Cargo.lock
 *.exe
+*.log
+*.tmp
+tmp/
 .claude/

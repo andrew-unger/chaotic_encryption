@@ -479,21 +479,43 @@ The following attacks were considered or attempted against the CML-Sponge constr
 
 **Analysis.** PractRand 0.95 was run at `stdin64` with the full core test suite (64-bit folding).
 
-| Seed | Key type | IV type | Length | Tests | Anomalies |
-|------|----------|---------|--------|-------|-----------|
-| 0 | BLAKE3-derived | BLAKE3-derived | 256 GB | 369 | **0** |
-| 1 | BLAKE3-derived | BLAKE3-derived | 256 GB | 369 | **0** (2 transient at 2 GB, 128 GB) |
-| 2 | BLAKE3-derived | BLAKE3-derived | 256 GB | 369 | **0** |
-| 254 | 0x00 × 32 | 0x00 × 16 | 256 GB | 369 | **0** |
-| 255 | 0xFF × 32 | 0xFF × 16 | 256 GB | 369 | **0** (1 transient at 128 GB) |
+**v10 construction ({1,3,7,11} coupling):**
 
-**[EMPIRICAL]** No persistent statistical anomaly was found across 369 tests at 256 GB for any of the 5 seeds.  The "unusual" flags (severity level 1 of 4 in PractRand's scale) that appeared on seeds 1 and 255 resolved at the next doubling; at 369 concurrent tests, approximately 0.37 "unusual" events are expected by chance at each checkpoint (Poisson, λ = 0.37), so these are consistent with statistical fluctuation rather than structural bias.
+| Seed | Key type | Length | Tests | Anomalies | Source |
+|------|----------|--------|-------|-----------|--------|
+| 0 | BLAKE3-derived | **1 TB** | 397 | **0** (1 transient "unusual" at 1 TB) | `docs/practrand_1tb_v10.md` |
+| 1 | BLAKE3-derived | **1 TB** | 397 | **0** (1 transient "unusual" at 256 MB) | `docs/practrand_1tb_v10.md` |
+| 2–255 | various | 1 TB | — | — | In progress |
 
-A real weakness (complement symmetry, short period, even-bit bias, correlated outputs) would typically manifest within the first 1–4 GB and intensify as more data is accumulated.  None of the tested weaknesses were present.
+**v10 raw permutation (no Mix13):**
+
+| Seed | Key type | Length | Tests | Anomalies | Source |
+|------|----------|--------|-------|-----------|--------|
+| 0 | BLAKE3-derived | 32 GB | 325 | **0** | `docs/practrand_raw_permutation.md` |
+| 254 | 0x00 × 32 | 32 GB | 325 | **0** | `docs/practrand_raw_permutation.md` |
+| 255 | 0xFF × 32 | 32 GB | 325 | **0** | `docs/practrand_raw_permutation.md` |
+
+**Original {1,7,8} coupling (baseline):**
+
+| Seed | Key type | Length | Tests | Anomalies | Source |
+|------|----------|--------|-------|-----------|--------|
+| 0 | BLAKE3-derived | 256 GB | 369 | **0** | `docs/practrand_results.md` |
+| 1 | BLAKE3-derived | 256 GB | 369 | **0** (2 transient) | `docs/practrand_results.md` |
+| 2 | BLAKE3-derived | 256 GB | 369 | **0** | `docs/practrand_results.md` |
+| 254 | 0x00 × 32 | 256 GB | 369 | **0** | `docs/practrand_results.md` |
+| 255 | 0xFF × 32 | 256 GB | 369 | **0** (1 transient) | `docs/practrand_results.md` |
+
+**[EMPIRICAL]** No persistent statistical anomaly was found.  Results span two validation campaigns:
+
+- **v10 1 TB validation** (`docs/practrand_1tb_v10.md`): Seeds 0 and 1 each pass 397 tests at 1 TB with zero persistent anomalies (seed 0: 1 transient "unusual" at 1 TB, seed 1: 1 transient "unusual" at 256 MB — both resolved at next doubling).  Seeds 2, 3, 64, 128, 254, 255 are in progress.
+- **Original {1,7,8} coupling at 256 GB** (`docs/practrand_results.md`): Seeds 0, 1, 2, 254, 255 each pass 369 tests with zero persistent anomalies.  These results predate the v10 coupling change and serve as baseline validation of the sponge framework.
+- **v10 raw permutation at 32 GB** (`docs/practrand_raw_permutation.md`): Seeds 0, 254, 255 pass 325 tests each without Mix13, confirming the permutation produces statistically strong output at the raw lattice level.
+
+At 397 concurrent tests (1 TB checkpoint), approximately 0.4 "unusual" events are expected by chance per checkpoint (Poisson, λ = 0.4).  A real weakness would appear at earlier checkpoints and intensify; all observed anomalies are single-checkpoint appearances consistent with statistical fluctuation.
 
 **Seed 254 (all-zero key and IV) and seed 255 (all-FF key and IV):** These are the critical degenerate cases.  Complement symmetry would make these two seeds produce the same stream; the clean PASS on both, with distinct outputs, confirms that complement symmetry is broken.
 
-**Result:** No statistical distinguisher found at 256 GB × 5 seeds.
+**Result:** No statistical distinguisher found across any tested configuration.
 
 ### Reduced-Round Security Margin
 
@@ -551,9 +573,9 @@ The v9 design ({1, 5, 11}) had |λ_{min}| = 0.765 (k = 2, 6, 10, 14), which admi
 
 After 2 rounds, full diffusion makes all sites mutually dependent, collapsing this distinguisher.  **[CONJECTURE]** The 1-round partial diffusion distinguisher is not exploitable against the full 8-round construction.
 
-**Reduced-round testing** (not yet formally completed): informal inspection of 1-round output suggests the distinguisher would work at 1 round but the 2-round diffusion makes 2-round output statistically indistinguishable in practice.
+**Reduced-round testing** (formally completed — see `docs/reduced_round_analysis.md`): 1-round raw output fails PractRand catastrophically at 512 MB ([Low1/64]Gap-16:A R=+189.2, p=4.6e-162), confirming the distinguisher works at 1 round.  At 2+ rounds the raw permutation passes PractRand to 4 GB with zero failures, confirming full diffusion eliminates the distinguisher.
 
-**Result:** Theoretical attack at 1 round (expected and acceptable); no attack at 2+ rounds.
+**Result:** Confirmed attack at 1 round (expected — only local pair-wise mixing); closed at 2+ rounds by full 16-site diffusion.
 
 ### Attack 8 — Coupling Non-Injectivity (Historical; Closed in v10)
 
@@ -593,11 +615,16 @@ The Arnold's Cat Map on Z/2^N has a finite period for each N.  For N = 64, the p
 
 **What would close this:** Computation or tight lower bound on the period of [[1,1],[1,2]] mod 2^64, and a formal argument that the Weyl-counter-modified map has period ≥ 2^{512}.
 
-### 7.4 Reduced-Round Security [MEDIUM PRIORITY]
+### 7.4 Reduced-Round Security [RESOLVED]
 
-Formal reduced-round distinguisher tests have not been completed.  Empirical observation suggests that 2-round full diffusion makes 2-round output difficult to distinguish from random, but this has not been confirmed by systematic PractRand runs at reduced round counts (1, 2, 3, 4 rounds).
+**[EMPIRICAL]** Systematic reduced-round PractRand testing has been completed for all round counts 1–8, in both with-Mix13 and raw (no-Mix13) configurations, each to 4 GB (`docs/reduced_round_analysis.md`).
 
-**What would close this:** PractRand at reduced round counts to identify the minimum round count at which statistical distinguishers fail, and a formal argument for why the full 8 rounds provide a sufficient security margin above this threshold.
+Key findings:
+- **Raw permutation (no Mix13):** 1 round FAILS at 512 MB ([Low1/64]Gap-16, catastrophic).  2+ rounds pass clean to 4 GB.  Minimum passing round count: **2**.
+- **With Mix13:** All round counts 1–8 pass 4 GB.  Mix13 fully masks the 1-round permutation weakness.
+- **Security margin:** The 8-round design provides a **4× margin** (8/2) over the raw permutation distinguisher threshold, and **≥8×** with Mix13.  The conservative 4× figure is used because it is independent of Mix13.
+
+This question is resolved.  See also the "Reduced-Round Security Margin" subsection in §6.
 
 ### 7.5 Side-Channel Analysis [MEDIUM PRIORITY]
 
@@ -716,10 +743,10 @@ For the benefit of external reviewers:
 
 3. **No independent implementation review.** The codebase has been reviewed only by its author.
 
-4. **No reduced-round PractRand.** Statistical testing at 1–4 rounds would help establish the round security margin empirically.
+4. **Reduced-round PractRand: COMPLETED.** Rounds 1–8 tested in both with-Mix13 and raw configurations to 4 GB each.  Raw permutation achieves full statistical indistinguishability at 2 rounds; 8-round design has 4× margin.  See `docs/reduced_round_analysis.md`.
 
 5. **No formal side-channel analysis.** Cache timing, power analysis, and fault attack vectors have not been studied.
 
-6. **No comparison to established designs.** The security properties have not been compared to those of ChaCha20, AES-GCM, or other vetted stream ciphers in a formal framework.
+6. **No comparison to established designs.** The security properties have not been compared to those of ChaCha20, AES-GCM, or other vetted stream ciphers in a formal framework.  An empirical security margin comparison (ChaCha20 2.9×, AES-128 1.7×, CATWALK 4×) is documented in `docs/reduced_round_analysis.md`, but this compares statistical distinguisher thresholds only — not algebraic or differential attacks.
 
-7. **PractRand coverage.** Five seeds (0, 1, 2, 254, 255) at 256 GB each have been tested.  This covers normal, all-zero, and all-FF inputs.  Additional seeds have not been tested at full length, and no multi-stream correlation tests (e.g., NIST SP 800-22 pairwise tests) have been run.
+7. **PractRand coverage.** v10 validation: seeds 0 and 1 at 1 TB each (397 tests, zero persistent anomalies); seeds 2, 3, 64, 128, 254, 255 at 1 TB in progress.  Original {1,7,8} coupling: 5 seeds at 256 GB each (369 tests, zero anomalies).  Raw permutation: 3 seeds at 32 GB (325 tests each, zero anomalies).  No multi-stream correlation tests (e.g., NIST SP 800-22 pairwise tests) have been run.
