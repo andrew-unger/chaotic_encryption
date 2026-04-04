@@ -1,19 +1,18 @@
 use std::collections::VecDeque;
-use std::io::{Cursor, Read as IoRead, Write as IoWrite};
+use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
-use std::fs;
 
 use eframe::egui;
 use zeroize::Zeroize;
-use zip::write::SimpleFileOptions;
 
 extern crate catwalk;
-use catwalk::crypto::{encrypt, decrypt, validate_password, EncryptOptions, ProgressFn};
-use catwalk::crypto::constants::{FLAG_KEYFILE, FLAGS_OFFSET};
+use catwalk::crypto::constants::{FLAGS_OFFSET, FLAG_KEYFILE};
+use catwalk::crypto::{decrypt, encrypt, validate_password, EncryptOptions, ProgressFn};
 use catwalk::error::CryptoError;
-use catwalk::utils::{parse_file_info, format_byte_size};
+use catwalk::utils::{format_byte_size, parse_file_info};
 
 // ── Entropy Pool ──────────────────────────────────────────────────────────────
 // Collects raw entropy from UI events (mouse movement, click timestamps,
@@ -30,6 +29,12 @@ pub struct EntropyPool {
     /// Visual history for the waveform display.
     history: VecDeque<f32>,
     history_max: usize,
+}
+
+impl Default for EntropyPool {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl EntropyPool {
@@ -106,91 +111,71 @@ impl EntropyPool {
     }
 }
 
-const ARCHIVE_EXTENSION: &str = "catwalkarchive";
+use catwalk::archive::ARCHIVE_EXTENSION;
 
 // ── Color Palette ─────────────────────────────────────────────────────────────
 // "Catwalk" — sleek runway aesthetic: cool neutrals with a soft violet accent.
 
-const ACCENT:      egui::Color32 = egui::Color32::from_rgb(160, 140, 200);
-const ACCENT_DIM:  egui::Color32 = egui::Color32::from_rgb(120, 110, 150);
-const ACCENT_HOVER:egui::Color32 = egui::Color32::from_rgb(180, 165, 220);
-const SUCCESS:     egui::Color32 = egui::Color32::from_rgb(100, 200, 140);
-const ERROR:       egui::Color32 = egui::Color32::from_rgb(220,  90,  90);
-const MUTED:       egui::Color32 = egui::Color32::from_rgb(140, 140, 150);
-const PANEL_BG:    egui::Color32 = egui::Color32::from_rgb( 35,  35,  42);
-const SURFACE:     egui::Color32 = egui::Color32::from_rgb( 28,  28,  34);
-const FRAME_STROKE:egui::Color32 = egui::Color32::from_rgb( 50,  50,  58);
-const BTN_WIDTH:   f32 = 68.0;
-const H_MARGIN:    i8 = 20;
+const ACCENT: egui::Color32 = egui::Color32::from_rgb(160, 140, 200);
+const ACCENT_DIM: egui::Color32 = egui::Color32::from_rgb(120, 110, 150);
+const ACCENT_HOVER: egui::Color32 = egui::Color32::from_rgb(180, 165, 220);
+const SUCCESS: egui::Color32 = egui::Color32::from_rgb(100, 200, 140);
+const ERROR: egui::Color32 = egui::Color32::from_rgb(220, 90, 90);
+const MUTED: egui::Color32 = egui::Color32::from_rgb(140, 140, 150);
+const PANEL_BG: egui::Color32 = egui::Color32::from_rgb(35, 35, 42);
+const SURFACE: egui::Color32 = egui::Color32::from_rgb(28, 28, 34);
+const FRAME_STROKE: egui::Color32 = egui::Color32::from_rgb(50, 50, 58);
+const BTN_WIDTH: f32 = 82.0;
+const H_MARGIN: f32 = 20.0;
+const SECTION_MARGIN: f32 = 12.0;
 
 // ── Diceware word list (short, for passphrase generation) ─────────────────────
 
 const WORDLIST: &[&str] = &[
-    "acid", "acme", "aged", "also", "arch", "army", "atom", "aunt",
-    "avid", "axis", "back", "ball", "band", "bank", "barn", "base",
-    "bath", "bead", "beam", "bear", "bell", "belt", "bend", "bike",
-    "bind", "bird", "bite", "blow", "blue", "blur", "boat", "body",
-    "bolt", "bomb", "bond", "bone", "book", "born", "boss", "bowl",
-    "bulk", "bump", "burn", "busy", "buzz", "cafe", "cage", "cake",
-    "calm", "came", "camp", "cape", "card", "care", "cart", "case",
-    "cash", "cast", "cave", "chat", "chip", "chop", "city", "clad",
-    "clan", "clap", "clay", "clip", "club", "clue", "coal", "coat",
-    "code", "coil", "coin", "cold", "cole", "come", "cone", "cook",
-    "cool", "cope", "copy", "cord", "core", "corn", "cost", "cozy",
-    "crew", "crop", "crow", "cube", "cult", "cups", "cure", "curl",
-    "cute", "dale", "dame", "damp", "dare", "dark", "dart", "dash",
-    "data", "date", "dawn", "deal", "dear", "debt", "deck", "deep",
-    "deer", "demo", "dent", "deny", "desk", "dial", "dice", "diet",
-    "dirt", "disc", "dish", "disk", "dive", "dock", "does", "dome",
-    "done", "doom", "door", "dose", "dove", "down", "drag", "draw",
-    "drip", "drop", "drum", "dual", "duel", "duke", "dull", "dune",
-    "dusk", "dust", "duty", "dyed", "each", "earl", "earn", "ease",
-    "east", "easy", "echo", "edge", "edit", "else", "emit", "ends",
-    "envy", "epic", "even", "ever", "evil", "exam", "exec", "exit",
-    "expo", "face", "fact", "fade", "fail", "fair", "fake", "fall",
-    "fame", "fang", "fare", "farm", "fast", "fate", "fawn", "feed",
-    "feel", "feet", "fell", "felt", "fern", "file", "fill", "film",
-    "find", "fine", "fire", "firm", "fish", "fist", "five", "flag",
-    "flame","flap", "flat", "fled", "flew", "flex", "flip", "flog",
-    "flow", "flux", "foam", "foil", "fold", "folk", "fond", "font",
-    "fool", "fork", "form", "fort", "foul", "four", "fowl", "free",
-    "frog", "from", "fuel", "full", "fund", "fury", "fuse", "fuzz",
-    "gait", "gale", "game", "gang", "gate", "gave", "gaze", "gear",
-    "gems", "gift", "gild", "gist", "give", "glad", "glen", "glow",
-    "glue", "goat", "goes", "gold", "golf", "gone", "good", "grab",
-    "gram", "gray", "grew", "grid", "grim", "grin", "grip", "grow",
-    "gulf", "gust", "guts", "hack", "hail", "hair", "hale", "half",
-    "hall", "halt", "hand", "hang", "hare", "harm", "harp", "haste",
-    "hate", "haul", "have", "hawk", "haze", "head", "heal", "heap",
-    "hear", "heat", "heel", "held", "helm", "help", "herb", "herd",
-    "here", "hero", "hide", "high", "hike", "hill", "hilt", "hind",
-    "hint", "hire", "hive", "hock", "hold", "hole", "holy", "home",
-    "hood", "hook", "hope", "horn", "hose", "host", "hour", "howl",
-    "huge", "hull", "hump", "hung", "hunt", "hurl", "hymn", "icon",
-    "idea", "idle", "inch", "info", "into", "iris", "iron", "isle",
-    "item", "jack", "jade", "jail", "jamb", "jars", "java", "jazz",
-    "jest", "jets", "jobs", "join", "joke", "jolt", "jump", "june",
-    "jury", "just", "keen", "keep", "kelp", "kept", "kick", "kids",
-    "kill", "kind", "king", "kite", "knob", "knot", "know", "lace",
-    "lack", "laid", "lake", "lamb", "lamp", "land", "lane", "lard",
-    "lark", "lash", "last", "late", "lawn", "lazy", "lead", "leaf",
-    "lean", "leap", "left", "lend", "lens", "less", "levy", "liar",
-    "lick", "lied", "life", "lift", "like", "limb", "lime", "limp",
-    "line", "link", "lion", "lips", "list", "live", "load", "loaf",
-    "loan", "lock", "loft", "logo", "lone", "long", "look", "loop",
-    "lord", "lore", "lose", "loss", "lost", "lots", "loud", "love",
-    "luck", "lull", "lump", "lung", "lure", "lurk", "lush", "lust",
-    "lynx", "mace", "made", "maid", "mail", "main", "make", "male",
-    "mall", "malt", "mane", "many", "maps", "mare", "mark", "mars",
-    "mash", "mask", "mass", "mast", "mate", "maze", "meal", "mean",
-    "meat", "meet", "meld", "melt", "memo", "mend", "menu", "mere",
-    "mesh", "mess", "mild", "mile", "milk", "mill", "mime", "mind",
-    "mine", "mint", "miss", "mist", "moan", "moat", "mock", "mode",
-    "mold", "monk", "mood", "moon", "moor", "more", "moss", "most",
-    "moth", "move", "much", "mule", "muse", "mush", "must", "mute",
-    "myth", "nail", "name", "navy", "near", "neat", "neck", "need",
-    "nest", "nets", "news", "next", "nice", "nine", "node", "none",
-    "norm", "nose", "note", "noun", "null", "numb",
+    "acid", "acme", "aged", "also", "arch", "army", "atom", "aunt", "avid", "axis", "back", "ball",
+    "band", "bank", "barn", "base", "bath", "bead", "beam", "bear", "bell", "belt", "bend", "bike",
+    "bind", "bird", "bite", "blow", "blue", "blur", "boat", "body", "bolt", "bomb", "bond", "bone",
+    "book", "born", "boss", "bowl", "bulk", "bump", "burn", "busy", "buzz", "cafe", "cage", "cake",
+    "calm", "came", "camp", "cape", "card", "care", "cart", "case", "cash", "cast", "cave", "chat",
+    "chip", "chop", "city", "clad", "clan", "clap", "clay", "clip", "club", "clue", "coal", "coat",
+    "code", "coil", "coin", "cold", "cole", "come", "cone", "cook", "cool", "cope", "copy", "cord",
+    "core", "corn", "cost", "cozy", "crew", "crop", "crow", "cube", "cult", "cups", "cure", "curl",
+    "cute", "dale", "dame", "damp", "dare", "dark", "dart", "dash", "data", "date", "dawn", "deal",
+    "dear", "debt", "deck", "deep", "deer", "demo", "dent", "deny", "desk", "dial", "dice", "diet",
+    "dirt", "disc", "dish", "disk", "dive", "dock", "does", "dome", "done", "doom", "door", "dose",
+    "dove", "down", "drag", "draw", "drip", "drop", "drum", "dual", "duel", "duke", "dull", "dune",
+    "dusk", "dust", "duty", "dyed", "each", "earl", "earn", "ease", "east", "easy", "echo", "edge",
+    "edit", "else", "emit", "ends", "envy", "epic", "even", "ever", "evil", "exam", "exec", "exit",
+    "expo", "face", "fact", "fade", "fail", "fair", "fake", "fall", "fame", "fang", "fare", "farm",
+    "fast", "fate", "fawn", "feed", "feel", "feet", "fell", "felt", "fern", "file", "fill", "film",
+    "find", "fine", "fire", "firm", "fish", "fist", "five", "flag", "flame", "flap", "flat",
+    "fled", "flew", "flex", "flip", "flog", "flow", "flux", "foam", "foil", "fold", "folk", "fond",
+    "font", "fool", "fork", "form", "fort", "foul", "four", "fowl", "free", "frog", "from", "fuel",
+    "full", "fund", "fury", "fuse", "fuzz", "gait", "gale", "game", "gang", "gate", "gave", "gaze",
+    "gear", "gems", "gift", "gild", "gist", "give", "glad", "glen", "glow", "glue", "goat", "goes",
+    "gold", "golf", "gone", "good", "grab", "gram", "gray", "grew", "grid", "grim", "grin", "grip",
+    "grow", "gulf", "gust", "guts", "hack", "hail", "hair", "hale", "half", "hall", "halt", "hand",
+    "hang", "hare", "harm", "harp", "haste", "hate", "haul", "have", "hawk", "haze", "head",
+    "heal", "heap", "hear", "heat", "heel", "held", "helm", "help", "herb", "herd", "here", "hero",
+    "hide", "high", "hike", "hill", "hilt", "hind", "hint", "hire", "hive", "hock", "hold", "hole",
+    "holy", "home", "hood", "hook", "hope", "horn", "hose", "host", "hour", "howl", "huge", "hull",
+    "hump", "hung", "hunt", "hurl", "hymn", "icon", "idea", "idle", "inch", "info", "into", "iris",
+    "iron", "isle", "item", "jack", "jade", "jail", "jamb", "jars", "java", "jazz", "jest", "jets",
+    "jobs", "join", "joke", "jolt", "jump", "june", "jury", "just", "keen", "keep", "kelp", "kept",
+    "kick", "kids", "kill", "kind", "king", "kite", "knob", "knot", "know", "lace", "lack", "laid",
+    "lake", "lamb", "lamp", "land", "lane", "lard", "lark", "lash", "last", "late", "lawn", "lazy",
+    "lead", "leaf", "lean", "leap", "left", "lend", "lens", "less", "levy", "liar", "lick", "lied",
+    "life", "lift", "like", "limb", "lime", "limp", "line", "link", "lion", "lips", "list", "live",
+    "load", "loaf", "loan", "lock", "loft", "logo", "lone", "long", "look", "loop", "lord", "lore",
+    "lose", "loss", "lost", "lots", "loud", "love", "luck", "lull", "lump", "lung", "lure", "lurk",
+    "lush", "lust", "lynx", "mace", "made", "maid", "mail", "main", "make", "male", "mall", "malt",
+    "mane", "many", "maps", "mare", "mark", "mars", "mash", "mask", "mass", "mast", "mate", "maze",
+    "meal", "mean", "meat", "meet", "meld", "melt", "memo", "mend", "menu", "mere", "mesh", "mess",
+    "mild", "mile", "milk", "mill", "mime", "mind", "mine", "mint", "miss", "mist", "moan", "moat",
+    "mock", "mode", "mold", "monk", "mood", "moon", "moor", "more", "moss", "most", "moth", "move",
+    "much", "mule", "muse", "mush", "must", "mute", "myth", "nail", "name", "navy", "near", "neat",
+    "neck", "need", "nest", "nets", "news", "next", "nice", "nine", "node", "none", "norm", "nose",
+    "note", "noun", "null", "numb",
 ];
 
 // ── Config file for recent files ──────────────────────────────────────────────
@@ -224,11 +209,19 @@ fn load_recent_files() -> Vec<String> {
 fn save_recent_files(recent: &[String]) {
     let path = config_path();
     let content = recent.join("\n");
-    let _ = fs::write(&path, content);
+    if let Err(e) = fs::write(&path, content) {
+        eprintln!(
+            "Warning: could not save recent files list to '{}': {}",
+            path.display(),
+            e
+        );
+    }
 }
 
 fn add_to_recent(recent: &mut Vec<String>, path: &str) {
-    if path.is_empty() { return; }
+    if path.is_empty() {
+        return;
+    }
     recent.retain(|p| p != path);
     recent.insert(0, path.to_string());
     recent.truncate(MAX_RECENT);
@@ -364,11 +357,13 @@ fn apply_theme(ctx: &egui::Context) {
     visuals.faint_bg_color = PANEL_BG;
 
     visuals.widgets.noninteractive.bg_fill = PANEL_BG;
-    visuals.widgets.noninteractive.fg_stroke = egui::Stroke::new(1.0, egui::Color32::from_rgb(190, 190, 200));
+    visuals.widgets.noninteractive.fg_stroke =
+        egui::Stroke::new(1.0, egui::Color32::from_rgb(190, 190, 200));
     visuals.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0, FRAME_STROKE);
 
     visuals.widgets.inactive.bg_fill = egui::Color32::from_rgb(50, 50, 58);
-    visuals.widgets.inactive.fg_stroke = egui::Stroke::new(1.0, egui::Color32::from_rgb(180, 180, 190));
+    visuals.widgets.inactive.fg_stroke =
+        egui::Stroke::new(1.0, egui::Color32::from_rgb(180, 180, 190));
     visuals.widgets.inactive.weak_bg_fill = egui::Color32::from_rgb(45, 45, 52);
 
     visuals.widgets.hovered.bg_fill = egui::Color32::from_rgb(60, 58, 72);
@@ -399,16 +394,38 @@ fn apply_theme(ctx: &egui::Context) {
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 /// A grouped section with a title label and rounded frame.
+///
+/// NOTE: egui's `Frame::inner_margin` shifts the cursor for the left margin
+/// but does not reduce `max_rect.right`, so `available_width()` inside the
+/// frame is wider than it should be and content bleeds to the right border.
+/// We work around this by explicitly constraining `max_width` after the frame
+/// creates its child UI.
 fn section_frame(ui: &mut egui::Ui, title: &str, add_body: impl FnOnce(&mut egui::Ui)) {
     ui.add_space(4.0);
-    ui.label(egui::RichText::new(title).size(13.0).strong().color(ACCENT_DIM));
+    ui.label(
+        egui::RichText::new(title)
+            .size(13.0)
+            .strong()
+            .color(ACCENT_DIM),
+    );
     ui.add_space(2.0);
     egui::Frame::NONE
         .fill(PANEL_BG)
         .corner_radius(6.0)
-        .inner_margin(egui::Margin::same(12))
+        .inner_margin(egui::Margin::same(SECTION_MARGIN as i8))
         .stroke(egui::Stroke::new(1.0, FRAME_STROKE))
-        .show(ui, add_body);
+        .show(ui, |ui| {
+            ui.set_max_width(ui.available_width() - SECTION_MARGIN);
+            add_body(ui);
+        });
+}
+
+/// Frame used for the top and bottom chrome panels.
+fn chrome_panel_frame() -> egui::Frame {
+    egui::Frame::NONE
+        .fill(PANEL_BG)
+        .inner_margin(egui::Margin::symmetric(H_MARGIN as i8, 8))
+        .stroke(egui::Stroke::new(1.0, FRAME_STROKE))
 }
 
 /// A text field + right-aligned fixed-width button on one row.
@@ -416,14 +433,13 @@ fn file_row(ui: &mut egui::Ui, text: &mut String, hint: &str, btn_label: &str) -
     let mut clicked = false;
     ui.horizontal(|ui| {
         let spacing = ui.spacing().item_spacing.x;
-        let edit_width = ui.available_width() - BTN_WIDTH - spacing;
+        let edit_width = (ui.available_width() - BTN_WIDTH - spacing).max(80.0);
         ui.add(
             egui::TextEdit::singleline(text)
                 .desired_width(edit_width)
                 .hint_text(hint),
         );
-        let btn = egui::Button::new(btn_label)
-            .min_size(egui::vec2(BTN_WIDTH, 0.0));
+        let btn = egui::Button::new(btn_label).min_size(egui::vec2(BTN_WIDTH, 0.0));
         if ui.add(btn).clicked() {
             clicked = true;
         }
@@ -435,7 +451,11 @@ fn file_row(ui: &mut egui::Ui, text: &mut String, hint: &str, btn_label: &str) -
 fn mode_toggle(ui: &mut egui::Ui, current: &mut Mode, value: Mode, label: &str) {
     let selected = *current == value;
     let text = egui::RichText::new(label).size(13.0).strong();
-    let text = if selected { text.color(ACCENT) } else { text.color(MUTED) };
+    let text = if selected {
+        text.color(ACCENT)
+    } else {
+        text.color(MUTED)
+    };
 
     let fill = if selected {
         egui::Color32::from_rgb(55, 50, 68)
@@ -456,14 +476,19 @@ fn mode_toggle(ui: &mut egui::Ui, current: &mut Mode, value: Mode, label: &str) 
 /// Full-width action button with accent coloring.
 fn action_button(ui: &mut egui::Ui, label: &str, enabled: bool) -> bool {
     let width = ui.available_width();
-    let text = egui::RichText::new(label).strong().size(15.0).color(
-        if enabled {
+    let text = egui::RichText::new(label)
+        .strong()
+        .size(15.0)
+        .color(if enabled {
             egui::Color32::WHITE
         } else {
             egui::Color32::from_rgb(100, 100, 110)
-        },
-    );
-    let fill = if enabled { ACCENT_DIM } else { egui::Color32::from_rgb(45, 45, 52) };
+        });
+    let fill = if enabled {
+        ACCENT_DIM
+    } else {
+        egui::Color32::from_rgb(45, 45, 52)
+    };
     let btn = egui::Button::new(text)
         .fill(fill)
         .corner_radius(6.0)
@@ -486,39 +511,7 @@ fn generate_passphrase(word_count: usize) -> String {
 
 /// Securely overwrite a file with random data, then delete it.
 fn secure_delete_file(path: &Path) -> Result<(), String> {
-    let meta = fs::metadata(path).map_err(|e| format!("Cannot read file: {}", e))?;
-    let size = meta.len() as usize;
-
-    // Three-pass overwrite: random, zeros, random
-    use rand::RngCore;
-    let mut rng = rand::thread_rng();
-
-    for pass in 0..3 {
-        let mut f = fs::OpenOptions::new()
-            .write(true)
-            .open(path)
-            .map_err(|e| format!("Cannot open for overwrite: {}", e))?;
-
-        let mut buf = vec![0u8; 8192.min(size.max(1))];
-        let mut remaining = size;
-        while remaining > 0 {
-            let chunk = remaining.min(buf.len());
-            if pass == 1 {
-                // Middle pass: zeros (buf is already zeroed)
-                for b in buf[..chunk].iter_mut() { *b = 0; }
-            } else {
-                rng.fill_bytes(&mut buf[..chunk]);
-            }
-            use std::io::Write;
-            f.write_all(&buf[..chunk])
-                .map_err(|e| format!("Overwrite failed: {}", e))?;
-            remaining -= chunk;
-        }
-        f.sync_all().map_err(|e| format!("Sync failed: {}", e))?;
-    }
-
-    fs::remove_file(path).map_err(|e| format!("Delete failed: {}", e))?;
-    Ok(())
+    catwalk::utils::secure_delete_file(path).map_err(|e| e.to_string())
 }
 
 // ── eframe::App ───────────────────────────────────────────────────────────────
@@ -532,10 +525,8 @@ impl eframe::App for CatwalkGui {
         if let Some(path) = self.pending_secure_delete.take() {
             match secure_delete_file(&path) {
                 Ok(()) => {
-                    self.status_message = format!(
-                        "{} | Original securely deleted",
-                        self.status_message
-                    );
+                    self.status_message =
+                        format!("{} | Original securely deleted", self.status_message);
                 }
                 Err(e) => {
                     self.status_message = format!(
@@ -569,7 +560,7 @@ impl CatwalkGui {
         }
         let path = PathBuf::from(&self.input_path);
         let mut f = match fs::File::open(&path) {
-            Ok(f)  => f,
+            Ok(f) => f,
             Err(_) => return false,
         };
         // Read just enough to reach the flags byte.
@@ -641,7 +632,8 @@ impl CatwalkGui {
         let (rect, response) = ui.allocate_exact_size(desired_size, egui::Sense::click_and_drag());
 
         // Canvas background
-        ui.painter().rect_filled(rect, 4.0, egui::Color32::from_rgb(20, 20, 30));
+        ui.painter()
+            .rect_filled(rect, 4.0, egui::Color32::from_rgb(20, 20, 30));
 
         // Canvas border — green when ready, dimmed otherwise
         let border_color = if self.entropy_pool.is_ready() {
@@ -659,14 +651,14 @@ impl CatwalkGui {
         // Entropy waveform
         let history: Vec<f32> = self.entropy_pool.history_iter().collect();
         if history.len() >= 2 {
-            let n    = history.len();
+            let n = history.len();
             let step = rect.width() / n as f32;
             let heat = self.entropy_pool.fullness();
             for i in 1..n {
                 let x0 = rect.left() + (i - 1) as f32 * step;
                 let x1 = rect.left() + i as f32 * step;
                 let y0 = rect.bottom() - history[i - 1] * rect.height();
-                let y1 = rect.bottom() - history[i]     * rect.height();
+                let y1 = rect.bottom() - history[i] * rect.height();
                 let color = egui::Color32::from_rgb(
                     (50.0 + heat * 150.0) as u8,
                     (150.0_f32 - heat * 50.0) as u8,
@@ -683,11 +675,17 @@ impl CatwalkGui {
         if let Some(mp) = response.hover_pos() {
             let dim = egui::Color32::from_rgba_premultiplied(255, 255, 255, 60);
             ui.painter().line_segment(
-                [egui::pos2(mp.x, rect.top()), egui::pos2(mp.x, rect.bottom())],
+                [
+                    egui::pos2(mp.x, rect.top()),
+                    egui::pos2(mp.x, rect.bottom()),
+                ],
                 egui::Stroke::new(1.0, dim),
             );
             ui.painter().line_segment(
-                [egui::pos2(rect.left(), mp.y), egui::pos2(rect.right(), mp.y)],
+                [
+                    egui::pos2(rect.left(), mp.y),
+                    egui::pos2(rect.right(), mp.y),
+                ],
                 egui::Stroke::new(1.0, dim),
             );
         }
@@ -774,7 +772,10 @@ impl CatwalkGui {
         // ── Save + Cancel buttons ─────────────────────────────────────────────
         ui.horizontal(|ui| {
             let save_enabled = self.entropy_pool.is_ready();
-            if ui.add_enabled(save_enabled, egui::Button::new("Save Keyfile…")).clicked() {
+            if ui
+                .add_enabled(save_enabled, egui::Button::new("Save Keyfile…"))
+                .clicked()
+            {
                 if let Some(path) = rfd::FileDialog::new()
                     .set_title("Save Keyfile")
                     .set_file_name("catwalk.key")
@@ -823,10 +824,7 @@ impl CatwalkGui {
 
     fn render_top_panel(&mut self, ctx: &egui::Context) {
         egui::TopBottomPanel::top("header")
-            .frame(egui::Frame::NONE
-                .fill(PANEL_BG)
-                .inner_margin(egui::Margin::symmetric(H_MARGIN, 8))
-                .stroke(egui::Stroke::new(1.0, FRAME_STROKE)))
+            .frame(chrome_panel_frame())
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     ui.label(
@@ -860,10 +858,7 @@ impl CatwalkGui {
 
     fn render_bottom_panel(&mut self, ctx: &egui::Context) {
         egui::TopBottomPanel::bottom("status")
-            .frame(egui::Frame::NONE
-                .fill(PANEL_BG)
-                .inner_margin(egui::Margin::symmetric(H_MARGIN, 8))
-                .stroke(egui::Stroke::new(1.0, FRAME_STROKE)))
+            .frame(chrome_panel_frame())
             .show(ctx, |ui| {
                 let color = if self.status_is_error {
                     ERROR
@@ -903,50 +898,51 @@ impl CatwalkGui {
 
     fn render_central_panel(&mut self, ctx: &egui::Context) {
         egui::CentralPanel::default()
-            .frame(egui::Frame::NONE.fill(SURFACE))
+            .frame(
+                egui::Frame::NONE
+                    .fill(SURFACE)
+                    .inner_margin(egui::Margin::symmetric(H_MARGIN as i8, 8)),
+            )
             .show(ctx, |ui| {
                 // Drag-and-drop overlay
                 if !ctx.input(|i| i.raw.hovered_files.is_empty()) {
                     let painter = ui.painter();
                     let rect = ui.max_rect();
-                    painter.rect_filled(rect, 10.0, egui::Color32::from_rgba_premultiplied(30, 28, 40, 220));
-                    painter.rect_stroke(rect, 10.0, egui::Stroke::new(2.0, ACCENT), egui::StrokeKind::Outside);
+                    painter.rect_filled(
+                        rect,
+                        10.0,
+                        egui::Color32::from_rgba_premultiplied(30, 28, 40, 220),
+                    );
+                    painter.rect_stroke(
+                        rect,
+                        10.0,
+                        egui::Stroke::new(2.0, ACCENT),
+                        egui::StrokeKind::Outside,
+                    );
                     painter.text(
                         rect.center(),
                         egui::Align2::CENTER_CENTER,
-                        if self.mode == Mode::Archive { "Drop files to add to archive" } else { "Drop file to set as input" },
+                        if self.mode == Mode::Archive {
+                            "Drop files to add to archive"
+                        } else {
+                            "Drop file to set as input"
+                        },
                         egui::FontId::proportional(22.0),
                         ACCENT,
                     );
                     return;
                 }
 
-                // Apply only horizontal margins via an explicit content_rect.
-                // We do NOT cap max.y here — the ScrollArea below handles the
-                // vertical extent, allowing content to scroll rather than clip.
-                // Using allocate_new_ui with an explicit Rect is the only reliable
-                // way to constrain *both* left and right boundaries in egui, because
-                // inner_margin.right does not reduce max_rect.right on panels.
-                let h_margin = 20.0_f32;
-                let full = ui.max_rect();
-                let content_rect = egui::Rect::from_min_max(
-                    egui::pos2(full.min.x + h_margin, full.min.y),
-                    egui::pos2(full.max.x - h_margin, full.max.y),
-                );
+                // Enforce right margin that inner_margin fails to apply.
+                ui.set_max_width(ui.available_width() - H_MARGIN);
 
-                ui.allocate_new_ui(egui::UiBuilder::new().max_rect(content_rect), |ui| {
-                    egui::ScrollArea::vertical()
-                        .auto_shrink([false, false])
-                        .show(ui, |ui| {
-                            ui.add_space(8.0); // top padding
-                            match self.mode {
-                                Mode::Info    => self.render_info_mode(ui),
-                                Mode::Archive => self.render_batch_mode(ui),
-                                _             => self.render_single_mode(ui),
-                            }
-                            ui.add_space(8.0); // bottom padding
-                        });
-                });
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| match self.mode {
+                        Mode::Info => self.render_info_mode(ui),
+                        Mode::Archive => self.render_batch_mode(ui),
+                        _ => self.render_single_mode(ui),
+                    });
             });
     }
 
@@ -982,7 +978,12 @@ impl CatwalkGui {
         // File selection
         section_frame(ui, "FILES", |ui| {
             ui.label(egui::RichText::new("Input").small().color(MUTED));
-            if file_row(ui, &mut self.input_path, "Select a file or drag and drop...", "Browse") {
+            if file_row(
+                ui,
+                &mut self.input_path,
+                "Select a file or drag and drop...",
+                "Browse",
+            ) {
                 self.browse_input();
             }
             if !self.input_path.is_empty() {
@@ -1063,8 +1064,9 @@ impl CatwalkGui {
 
             ui.add_space(4.0);
 
-            // File list
-            let available_height = (ui.available_height() - 280.0).max(60.0);
+            // File list — use a fixed height since we're inside a ScrollArea
+            // where available_height() returns infinity.
+            let available_height = 200.0_f32;
             egui::Frame::NONE
                 .fill(SURFACE)
                 .corner_radius(4.0)
@@ -1077,9 +1079,11 @@ impl CatwalkGui {
                                 ui.vertical_centered(|ui| {
                                     ui.add_space(24.0);
                                     ui.label(
-                                        egui::RichText::new("Drag files here, click Add Files, or Add Folder")
-                                            .color(MUTED)
-                                            .size(14.0),
+                                        egui::RichText::new(
+                                            "Drag files here, click Add Files, or Add Folder",
+                                        )
+                                        .color(MUTED)
+                                        .size(14.0),
                                     );
                                     ui.add_space(24.0);
                                 });
@@ -1090,8 +1094,18 @@ impl CatwalkGui {
                                     .num_columns(3)
                                     .min_col_width(60.0)
                                     .show(ui, |ui| {
-                                        ui.label(egui::RichText::new("File").small().strong().color(MUTED));
-                                        ui.label(egui::RichText::new("Size").small().strong().color(MUTED));
+                                        ui.label(
+                                            egui::RichText::new("File")
+                                                .small()
+                                                .strong()
+                                                .color(MUTED),
+                                        );
+                                        ui.label(
+                                            egui::RichText::new("Size")
+                                                .small()
+                                                .strong()
+                                                .color(MUTED),
+                                        );
                                         ui.label("");
                                         ui.end_row();
 
@@ -1162,7 +1176,12 @@ impl CatwalkGui {
         section_frame(ui, "FILE INSPECTOR", |ui| {
             ui.label(egui::RichText::new("Select a CATWALK encrypted file").color(MUTED));
             ui.add_space(4.0);
-            if file_row(ui, &mut self.input_path, "Select .catwalk file...", "Browse") {
+            if file_row(
+                ui,
+                &mut self.input_path,
+                "Select .catwalk file...",
+                "Browse",
+            ) {
                 self.browse_input();
             }
         });
@@ -1190,9 +1209,7 @@ impl CatwalkGui {
         if !self.file_info_text.is_empty() {
             ui.add_space(8.0);
             section_frame(ui, "FILE INFORMATION", |ui| {
-                ui.label(
-                    egui::RichText::new(&self.file_info_text).monospace(),
-                );
+                ui.label(egui::RichText::new(&self.file_info_text).monospace());
             });
         }
     }
@@ -1203,7 +1220,7 @@ impl CatwalkGui {
         // Password input + Show/Hide button (aligned with Browse buttons)
         ui.horizontal(|ui| {
             let spacing = ui.spacing().item_spacing.x;
-            let edit_width = ui.available_width() - BTN_WIDTH - spacing;
+            let edit_width = (ui.available_width() - BTN_WIDTH - spacing).max(80.0);
             let mut edit = egui::TextEdit::singleline(&mut self.password)
                 .desired_width(edit_width)
                 .hint_text("Enter password...");
@@ -1235,7 +1252,7 @@ impl CatwalkGui {
             ui.label(egui::RichText::new("Confirm").small().color(MUTED));
             ui.horizontal(|ui| {
                 let spacing = ui.spacing().item_spacing.x;
-                let edit_width = ui.available_width() - BTN_WIDTH - spacing;
+                let edit_width = (ui.available_width() - BTN_WIDTH - spacing).max(80.0);
                 let mut edit = egui::TextEdit::singleline(&mut self.confirm_password)
                     .desired_width(edit_width)
                     .hint_text("Confirm password...");
@@ -1244,9 +1261,8 @@ impl CatwalkGui {
                 }
                 ui.add(edit);
 
-                let gen_btn = egui::Button::new(
-                    egui::RichText::new("Generate").color(ACCENT_DIM),
-                ).min_size(egui::vec2(BTN_WIDTH, 0.0));
+                let gen_btn = egui::Button::new(egui::RichText::new("Generate").color(ACCENT_DIM))
+                    .min_size(egui::vec2(BTN_WIDTH, 0.0));
                 if ui.add(gen_btn).clicked() {
                     let passphrase = generate_passphrase(6);
                     self.password = passphrase.clone();
@@ -1259,9 +1275,17 @@ impl CatwalkGui {
 
             if !self.password.is_empty() && !self.confirm_password.is_empty() {
                 if self.password == self.confirm_password {
-                    ui.label(egui::RichText::new("Passwords match").small().color(SUCCESS));
+                    ui.label(
+                        egui::RichText::new("Passwords match")
+                            .small()
+                            .color(SUCCESS),
+                    );
                 } else {
-                    ui.label(egui::RichText::new("Passwords do not match").small().color(ERROR));
+                    ui.label(
+                        egui::RichText::new("Passwords do not match")
+                            .small()
+                            .color(ERROR),
+                    );
                 }
             }
 
@@ -1269,19 +1293,34 @@ impl CatwalkGui {
             ui.separator();
             ui.add_space(4.0);
             ui.label(egui::RichText::new("Options").small().strong().color(MUTED));
-            ui.checkbox(&mut self.strip_metadata, "Strip metadata (no timestamp/extension)");
-            ui.checkbox(&mut self.skip_compression, "Skip compression (no pattern fingerprinting)");
-            ui.checkbox(&mut self.secure_delete, "Secure delete original after encryption");
+            ui.checkbox(
+                &mut self.strip_metadata,
+                "Strip metadata (no timestamp/extension)",
+            );
+            ui.checkbox(
+                &mut self.skip_compression,
+                "Skip compression (no pattern fingerprinting)",
+            );
+            ui.checkbox(
+                &mut self.secure_delete,
+                "Secure delete original after encryption",
+            );
 
             // ── Keyfile picker (encrypt / archive) ────────────────────────────
             ui.add_space(4.0);
             ui.separator();
             ui.add_space(4.0);
-            ui.label(egui::RichText::new("Keyfile (optional)").small().strong().color(MUTED));
+            ui.label(
+                egui::RichText::new("Keyfile (optional)")
+                    .small()
+                    .strong()
+                    .color(MUTED),
+            );
             ui.horizontal(|ui| {
                 match &self.encrypt_keyfile {
                     Some(path) => {
-                        let name = path.file_name()
+                        let name = path
+                            .file_name()
                             .unwrap_or_default()
                             .to_string_lossy()
                             .to_string();
@@ -1312,8 +1351,10 @@ impl CatwalkGui {
                 ui.label(
                     egui::RichText::new(
                         "⚠ You must use this exact keyfile to decrypt.\n\
-                         Store it separately from the encrypted file."
-                    ).small().color(egui::Color32::from_rgb(220, 180, 50))
+                         Store it separately from the encrypted file.",
+                    )
+                    .small()
+                    .color(egui::Color32::from_rgb(220, 180, 50)),
                 );
             }
         }
@@ -1331,13 +1372,19 @@ impl CatwalkGui {
                     "⚠ This file was encrypted with a keyfile",
                 );
             } else {
-                ui.label(egui::RichText::new("Keyfile (optional)").small().strong().color(MUTED));
+                ui.label(
+                    egui::RichText::new("Keyfile (optional)")
+                        .small()
+                        .strong()
+                        .color(MUTED),
+                );
             }
 
             ui.horizontal(|ui| {
                 match &self.decrypt_keyfile {
                     Some(path) => {
-                        let name = path.file_name()
+                        let name = path
+                            .file_name()
                             .unwrap_or_default()
                             .to_string_lossy()
                             .to_string();
@@ -1369,7 +1416,13 @@ impl CatwalkGui {
     // ── Drag and Drop ───────────────────────────────────────────────────────────
 
     fn handle_dropped_files(&mut self, ctx: &egui::Context) {
-        let dropped: Vec<egui::DroppedFile> = ctx.input(|i| i.raw.dropped_files.clone());
+        let dropped: Vec<egui::DroppedFile> = ctx.input(|i| {
+            if i.raw.dropped_files.is_empty() {
+                vec![]
+            } else {
+                i.raw.dropped_files.clone()
+            }
+        });
         if dropped.is_empty() {
             return;
         }
@@ -1387,9 +1440,15 @@ impl CatwalkGui {
                         });
                     }
                     if self.batch_output_path.is_empty() {
-                        let dir = if path.is_dir() { path.as_path() } else { path.parent().unwrap_or(path) };
-                        self.batch_output_path =
-                            dir.join(format!("archive.{}", ARCHIVE_EXTENSION)).to_string_lossy().to_string();
+                        let dir = if path.is_dir() {
+                            path.as_path()
+                        } else {
+                            path.parent().unwrap_or(path)
+                        };
+                        self.batch_output_path = dir
+                            .join(format!("archive.{}", ARCHIVE_EXTENSION))
+                            .to_string_lossy()
+                            .to_string();
                     }
                 }
             }
@@ -1397,10 +1456,7 @@ impl CatwalkGui {
             if let Some(path) = &first.path {
                 self.auto_detect_mode(path);
                 self.input_path = path.to_string_lossy().to_string();
-                self.output_path = self
-                    .compute_output_path(path)
-                    .to_string_lossy()
-                    .to_string();
+                self.output_path = self.compute_output_path(path).to_string_lossy().to_string();
             }
         }
     }
@@ -1438,26 +1494,26 @@ impl CatwalkGui {
                 let size = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
                 if self.batch_output_path.is_empty() {
                     if let Some(dir) = path.parent() {
-                        self.batch_output_path =
-                            dir.join(format!("archive.{}", ARCHIVE_EXTENSION)).to_string_lossy().to_string();
+                        self.batch_output_path = dir
+                            .join(format!("archive.{}", ARCHIVE_EXTENSION))
+                            .to_string_lossy()
+                            .to_string();
                     }
                 }
-                self.batch_files.push(BatchFileEntry {
-                    path,
-                    size,
-                });
+                self.batch_files.push(BatchFileEntry { path, size });
             }
         }
     }
 
     fn browse_batch_folder(&mut self) {
-        let dialog = rfd::FileDialog::new()
-            .set_title("Select Folder to Archive");
+        let dialog = rfd::FileDialog::new().set_title("Select Folder to Archive");
         if let Some(dir) = dialog.pick_folder() {
             self.add_folder_contents(&dir);
             if self.batch_output_path.is_empty() {
-                self.batch_output_path =
-                    dir.join(format!("archive.{}", ARCHIVE_EXTENSION)).to_string_lossy().to_string();
+                self.batch_output_path = dir
+                    .join(format!("archive.{}", ARCHIVE_EXTENSION))
+                    .to_string_lossy()
+                    .to_string();
             }
         }
     }
@@ -1565,11 +1621,11 @@ impl CatwalkGui {
         };
 
         let mode = self.mode;
-        let input_path  = PathBuf::from(&self.input_path);
+        let input_path = PathBuf::from(&self.input_path);
         let output_path = PathBuf::from(&self.output_path);
-        let password    = self.password.clone();
+        let password = self.password.clone();
         let options = EncryptOptions {
-            strip_metadata:   self.strip_metadata,
+            strip_metadata: self.strip_metadata,
             skip_compression: self.skip_compression,
         };
         // Clone keyfile paths for the worker thread.
@@ -1579,7 +1635,7 @@ impl CatwalkGui {
         // Add to recent files
         add_to_recent(&mut self.recent_files, &input_str);
 
-        let progress_tx  = tx.clone();
+        let progress_tx = tx.clone();
         let progress_ctx = ctx.clone();
         let progress_cb: ProgressFn = Box::new(move |v: f32| {
             let _ = progress_tx.send(WorkerMessage::Progress(v));
@@ -1589,15 +1645,22 @@ impl CatwalkGui {
         std::thread::spawn(move || {
             let result = match mode {
                 Mode::Encrypt => encrypt_file(
-                    &input_path, &output_path, &password, &options,
-                    encrypt_keyfile.as_deref(), Some(&progress_cb),
+                    &input_path,
+                    &output_path,
+                    &password,
+                    &options,
+                    encrypt_keyfile.as_deref(),
+                    Some(&progress_cb),
                 ),
                 Mode::Decrypt => decrypt_file(
-                    &input_path, &output_path, &password,
-                    decrypt_keyfile.as_deref(), Some(&progress_cb),
+                    &input_path,
+                    &output_path,
+                    &password,
+                    decrypt_keyfile.as_deref(),
+                    Some(&progress_cb),
                 ),
                 Mode::Archive => unreachable!("Archive uses start_batch_operation"),
-                Mode::Info    => show_file_info(&input_path),
+                Mode::Info => show_file_info(&input_path),
             };
             let _ = tx.send(WorkerMessage::Complete(result));
             let _ = tx.send(WorkerMessage::AllDone);
@@ -1621,15 +1684,15 @@ impl CatwalkGui {
         self.operation_start = Some(Instant::now());
 
         let files: Vec<PathBuf> = self.batch_files.iter().map(|e| e.path.clone()).collect();
-        let output_path     = PathBuf::from(&self.batch_output_path);
-        let password        = self.password.clone();
+        let output_path = PathBuf::from(&self.batch_output_path);
+        let password = self.password.clone();
         let options = EncryptOptions {
-            strip_metadata:   self.strip_metadata,
+            strip_metadata: self.strip_metadata,
             skip_compression: self.skip_compression,
         };
         let encrypt_keyfile = self.encrypt_keyfile.clone();
 
-        let progress_tx  = tx.clone();
+        let progress_tx = tx.clone();
         let progress_ctx = ctx.clone();
         let progress_cb: ProgressFn = Box::new(move |v: f32| {
             let _ = progress_tx.send(WorkerMessage::Progress(v));
@@ -1638,8 +1701,12 @@ impl CatwalkGui {
 
         std::thread::spawn(move || {
             let result = encrypt_archive(
-                &files, &output_path, &password, &options,
-                encrypt_keyfile.as_deref(), Some(&progress_cb),
+                &files,
+                &output_path,
+                &password,
+                &options,
+                encrypt_keyfile.as_deref(),
+                Some(&progress_cb),
             );
             let _ = tx.send(WorkerMessage::Complete(result));
             let _ = tx.send(WorkerMessage::AllDone);
@@ -1701,12 +1768,26 @@ fn encrypt_file(
     progress: Option<&ProgressFn>,
 ) -> Result<String, String> {
     let data = fs::read(input_path).map_err(|e| format!("Failed to read input: {}", e))?;
-    let result = encrypt(&data, password, &input_path.to_string_lossy(), options, keyfile_path, progress)
-        .map_err(|e| format!("Encryption failed: {}", e))?;
-    if let Some(cb) = &progress { cb(0.90); }
+    let result = encrypt(
+        &data,
+        password,
+        &input_path.to_string_lossy(),
+        options,
+        keyfile_path,
+        progress,
+    )
+    .map_err(|e| format!("Encryption failed: {}", e))?;
+    if let Some(cb) = &progress {
+        cb(0.90);
+    }
     fs::write(output_path, &result).map_err(|e| format!("Failed to write output: {}", e))?;
-    if let Some(cb) = &progress { cb(1.0); }
-    Ok(format!("Encrypted successfully: {}", output_path.to_string_lossy()))
+    if let Some(cb) = &progress {
+        cb(1.0);
+    }
+    Ok(format!(
+        "Encrypted successfully: {}",
+        output_path.to_string_lossy()
+    ))
 }
 
 fn decrypt_file(
@@ -1717,16 +1798,18 @@ fn decrypt_file(
     progress: Option<&ProgressFn>,
 ) -> Result<String, String> {
     let data = fs::read(input_path).map_err(|e| format!("Failed to read input: {}", e))?;
-    let (result, extension) = decrypt(&data, password, keyfile_path, progress).map_err(|e| match e {
-        CryptoError::IntegrityCheckFailed => {
-            // Do NOT distinguish between wrong password and wrong keyfile.
-            "Decryption failed: wrong password, wrong keyfile, or corrupted file.".to_string()
-        }
-        CryptoError::KeyfileRequired => {
-            "This file was encrypted with a keyfile. Please select the keyfile and try again.".to_string()
-        }
-        _ => format!("Decryption failed: {}", e),
-    })?;
+    let (result, extension) =
+        decrypt(&data, password, keyfile_path, progress).map_err(|e| match e {
+            CryptoError::IntegrityCheckFailed => {
+                // Do NOT distinguish between wrong password and wrong keyfile.
+                "Decryption failed: wrong password, wrong keyfile, or corrupted file.".to_string()
+            }
+            CryptoError::KeyfileRequired => {
+                "This file was encrypted with a keyfile. Please select the keyfile and try again."
+                    .to_string()
+            }
+            _ => format!("Decryption failed: {}", e),
+        })?;
 
     if extension == ARCHIVE_EXTENSION {
         let extract_dir = output_path.with_extension("");
@@ -1743,10 +1826,13 @@ fn decrypt_file(
         final_output.set_extension(&extension);
     }
 
-    if let Some(cb) = &progress { cb(0.90); }
-    fs::write(&final_output, result)
-        .map_err(|e| format!("Failed to write output: {}", e))?;
-    if let Some(cb) = &progress { cb(1.0); }
+    if let Some(cb) = &progress {
+        cb(0.90);
+    }
+    fs::write(&final_output, result).map_err(|e| format!("Failed to write output: {}", e))?;
+    if let Some(cb) = &progress {
+        cb(1.0);
+    }
     Ok(format!(
         "Decrypted successfully: {}",
         final_output.to_string_lossy()
@@ -1761,14 +1847,24 @@ fn encrypt_archive(
     keyfile_path: Option<&Path>,
     progress: Option<&ProgressFn>,
 ) -> Result<String, String> {
-    let archive  = create_archive(files)?;
+    let archive = create_archive(files)?;
     let filename = format!("archive.{}", ARCHIVE_EXTENSION);
-    let result = encrypt(&archive, password, &filename, options, keyfile_path, progress)
-        .map_err(|e| format!("Encryption failed: {}", e))?;
-    if let Some(cb) = &progress { cb(0.90); }
-    fs::write(output_path, &result)
-        .map_err(|e| format!("Failed to write output: {}", e))?;
-    if let Some(cb) = &progress { cb(1.0); }
+    let result = encrypt(
+        &archive,
+        password,
+        &filename,
+        options,
+        keyfile_path,
+        progress,
+    )
+    .map_err(|e| format!("Encryption failed: {}", e))?;
+    if let Some(cb) = &progress {
+        cb(0.90);
+    }
+    fs::write(output_path, &result).map_err(|e| format!("Failed to write output: {}", e))?;
+    if let Some(cb) = &progress {
+        cb(1.0);
+    }
     Ok(format!(
         "Encrypted {} file(s) into {}",
         files.len(),
@@ -1777,57 +1873,11 @@ fn encrypt_archive(
 }
 
 fn create_archive(files: &[PathBuf]) -> Result<Vec<u8>, String> {
-    let buf = Vec::new();
-    let mut zip = zip::ZipWriter::new(Cursor::new(buf));
-    let options = SimpleFileOptions::default()
-        .compression_method(zip::CompressionMethod::Deflated);
-
-    for path in files {
-        let name = path
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| "unknown".into());
-        zip.start_file(&name, options)
-            .map_err(|e| format!("Failed to add {}: {}", name, e))?;
-        let data = fs::read(path)
-            .map_err(|e| format!("Failed to read {}: {}", name, e))?;
-        zip.write_all(&data)
-            .map_err(|e| format!("Failed to write {}: {}", name, e))?;
-    }
-
-    let cursor = zip.finish().map_err(|e| format!("Failed to finalize archive: {}", e))?;
-    Ok(cursor.into_inner())
+    catwalk::archive::create_archive(files).map_err(|e| e.to_string())
 }
 
 fn extract_archive(data: &[u8], output_dir: &Path) -> Result<usize, String> {
-    let cursor = Cursor::new(data);
-    let mut archive = zip::ZipArchive::new(cursor)
-        .map_err(|e| format!("Failed to open archive: {}", e))?;
-
-    fs::create_dir_all(output_dir)
-        .map_err(|e| format!("Failed to create directory: {}", e))?;
-
-    let count = archive.len();
-    for i in 0..count {
-        let mut file = archive
-            .by_index(i)
-            .map_err(|e| format!("Archive error: {}", e))?;
-        let raw_name = file.name().to_string();
-        let safe_name = Path::new(&raw_name)
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_default();
-        if safe_name.is_empty() || safe_name.contains("..") {
-            continue;
-        }
-        let out_path = output_dir.join(&safe_name);
-        let mut out_file = fs::File::create(&out_path)
-            .map_err(|e| format!("Failed to create {}: {}", safe_name, e))?;
-        std::io::copy(&mut file, &mut out_file)
-            .map_err(|e| format!("Failed to extract {}: {}", safe_name, e))?;
-    }
-
-    Ok(count)
+    catwalk::archive::extract_archive(data, output_dir).map_err(|e| e.to_string())
 }
 
 fn show_file_info(input_path: &Path) -> Result<String, String> {
@@ -1878,7 +1928,7 @@ fn render_password_strength(ui: &mut egui::Ui, strength: PasswordStrength) {
 pub fn run_gui() -> Result<(), String> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([750.0, 600.0])
+            .with_inner_size([900.0, 700.0])
             .with_min_inner_size([540.0, 460.0])
             .with_drag_and_drop(true),
         ..Default::default()

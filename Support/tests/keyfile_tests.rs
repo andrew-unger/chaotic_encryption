@@ -3,13 +3,16 @@
 // NOTE: passwords here are intentionally short — encrypt/decrypt do not call
 // validate_password; that is the CLI/GUI's responsibility.
 
+use catwalk::crypto::constants::FLAG_KEYFILE;
+use catwalk::crypto::{decrypt, encrypt, EncryptOptions};
+use catwalk::error::CryptoError;
 use std::fs;
 use std::path::PathBuf;
-use catwalk::crypto::{encrypt, decrypt, EncryptOptions};
-use catwalk::error::CryptoError;
-use catwalk::crypto::constants::FLAG_KEYFILE;
 
-const OPTS: EncryptOptions = EncryptOptions { strip_metadata: false, skip_compression: true };
+const OPTS: EncryptOptions = EncryptOptions {
+    strip_metadata: false,
+    skip_compression: true,
+};
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 
@@ -27,9 +30,9 @@ fn write_tmp(name: &str, data: &[u8]) -> PathBuf {
 
 #[test]
 fn keyfile_round_trip() {
-    let plaintext  = b"keyfile round-trip test payload";
-    let password   = "correcthorsebattery";
-    let keyfile    = write_tmp("kf1.key", b"super secret keyfile bytes for test 1");
+    let plaintext = b"keyfile round-trip test payload";
+    let password = "correcthorsebattery";
+    let keyfile = write_tmp("kf1.key", b"super secret keyfile bytes for test 1");
 
     let encrypted = encrypt(plaintext, password, "test.txt", &OPTS, Some(&keyfile), None)
         .expect("encryption with keyfile failed");
@@ -48,17 +51,25 @@ fn keyfile_round_trip() {
 #[test]
 fn wrong_keyfile_rejected() {
     let plaintext = b"protected by keyfile a";
-    let password  = "correcthorsebattery";
+    let password = "correcthorsebattery";
     let keyfile_a = write_tmp("kf2a.key", b"keyfile A contents - primary");
     let keyfile_b = write_tmp("kf2b.key", b"keyfile B contents - wrong one");
 
-    let encrypted = encrypt(plaintext, password, "test.txt", &OPTS, Some(&keyfile_a), None)
-        .expect("encryption failed");
+    let encrypted = encrypt(
+        plaintext,
+        password,
+        "test.txt",
+        &OPTS,
+        Some(&keyfile_a),
+        None,
+    )
+    .expect("encryption failed");
 
     let result = decrypt(&encrypted, password, Some(&keyfile_b), None);
     assert!(
         matches!(result, Err(CryptoError::IntegrityCheckFailed)),
-        "expected IntegrityCheckFailed with wrong keyfile, got {:?}", result.err()
+        "expected IntegrityCheckFailed with wrong keyfile, got {:?}",
+        result.err()
     );
 
     let _ = fs::remove_file(keyfile_a);
@@ -70,8 +81,8 @@ fn wrong_keyfile_rejected() {
 #[test]
 fn missing_keyfile_rejected() {
     let plaintext = b"protected - you must have the keyfile";
-    let password  = "correcthorsebattery";
-    let keyfile   = write_tmp("kf3.key", b"the required keyfile");
+    let password = "correcthorsebattery";
+    let keyfile = write_tmp("kf3.key", b"the required keyfile");
 
     let encrypted = encrypt(plaintext, password, "data.bin", &OPTS, Some(&keyfile), None)
         .expect("encryption failed");
@@ -80,7 +91,8 @@ fn missing_keyfile_rejected() {
     let result = decrypt(&encrypted, password, None, None);
     assert!(
         matches!(result, Err(CryptoError::KeyfileRequired)),
-        "expected KeyfileRequired, got {:?}", result.err()
+        "expected KeyfileRequired, got {:?}",
+        result.err()
     );
 
     let _ = fs::remove_file(keyfile);
@@ -92,15 +104,19 @@ fn missing_keyfile_rejected() {
 fn spurious_keyfile_ignored() {
     // Encrypt WITHOUT a keyfile, then try to decrypt WITH one.
     // The keyfile flag is not set in the header; the extra keyfile is ignored.
-    let plaintext    = b"no keyfile was used during encryption";
-    let password     = "correcthorsebattery";
-    let spurious_kf  = write_tmp("kf4.key", b"an unnecessary keyfile");
+    let plaintext = b"no keyfile was used during encryption";
+    let password = "correcthorsebattery";
+    let spurious_kf = write_tmp("kf4.key", b"an unnecessary keyfile");
 
     let encrypted = encrypt(plaintext, password, "data.bin", &OPTS, None, None)
         .expect("encryption without keyfile failed");
 
     // Verify FLAG_KEYFILE is NOT set.
-    assert_eq!(encrypted[5] & FLAG_KEYFILE, 0, "FLAG_KEYFILE should not be set");
+    assert_eq!(
+        encrypted[5] & FLAG_KEYFILE,
+        0,
+        "FLAG_KEYFILE should not be set"
+    );
 
     let (decrypted, _) = decrypt(&encrypted, password, Some(&spurious_kf), None)
         .expect("decryption should succeed; spurious keyfile must be silently ignored");
@@ -123,10 +139,18 @@ fn keyfile_too_large_rejected() {
         f.set_len(2_000_000_000).expect("set file length to ~2 GB");
     }
 
-    let result = encrypt(b"payload", "correcthorsebattery", "x.bin", &OPTS, Some(&huge_path), None);
+    let result = encrypt(
+        b"payload",
+        "correcthorsebattery",
+        "x.bin",
+        &OPTS,
+        Some(&huge_path),
+        None,
+    );
     assert!(
         matches!(result, Err(CryptoError::KeyfileTooLarge)),
-        "expected KeyfileTooLarge for a 2 GB keyfile, got {:?}", result.err()
+        "expected KeyfileTooLarge for a 2 GB keyfile, got {:?}",
+        result.err()
     );
 
     let _ = fs::remove_file(huge_path);
@@ -136,14 +160,15 @@ fn keyfile_too_large_rejected() {
 
 #[test]
 fn flag_keyfile_set_in_header() {
-    let keyfile   = write_tmp("kf6.key", b"a modest keyfile for header flag test");
-    let password  = "correcthorsebattery";
+    let keyfile = write_tmp("kf6.key", b"a modest keyfile for header flag test");
+    let password = "correcthorsebattery";
 
     // With keyfile — FLAG_KEYFILE (0x04) must be set.
     let encrypted_with = encrypt(b"payload", password, "x.bin", &OPTS, Some(&keyfile), None)
         .expect("encryption with keyfile");
     assert_eq!(
-        encrypted_with[5] & FLAG_KEYFILE, FLAG_KEYFILE,
+        encrypted_with[5] & FLAG_KEYFILE,
+        FLAG_KEYFILE,
         "FLAG_KEYFILE should be set when a keyfile is provided"
     );
 
@@ -151,7 +176,8 @@ fn flag_keyfile_set_in_header() {
     let encrypted_without = encrypt(b"payload", password, "x.bin", &OPTS, None, None)
         .expect("encryption without keyfile");
     assert_eq!(
-        encrypted_without[5] & FLAG_KEYFILE, 0,
+        encrypted_without[5] & FLAG_KEYFILE,
+        0,
         "FLAG_KEYFILE should not be set when no keyfile is provided"
     );
 
@@ -163,9 +189,9 @@ fn flag_keyfile_set_in_header() {
 #[test]
 fn different_keyfiles_produce_different_ciphertext() {
     let plaintext = b"same plaintext, same password, different keyfiles";
-    let password  = "correcthorsebattery";
-    let kf_a      = write_tmp("kf7a.key", b"keyfile alpha contents");
-    let kf_b      = write_tmp("kf7b.key", b"keyfile beta  contents");
+    let password = "correcthorsebattery";
+    let kf_a = write_tmp("kf7a.key", b"keyfile alpha contents");
+    let kf_b = write_tmp("kf7b.key", b"keyfile beta  contents");
 
     let enc_a = encrypt(plaintext, password, "x.bin", &OPTS, Some(&kf_a), None)
         .expect("encryption with keyfile A");
@@ -175,7 +201,10 @@ fn different_keyfiles_produce_different_ciphertext() {
     // The ciphertexts must differ (different KDF inputs → different keys).
     // (They would also differ due to random salt/nonce, but distinct KDF input
     // ensures they're not accidentally equal even with the same random material.)
-    assert_ne!(enc_a, enc_b, "different keyfiles must produce different ciphertext");
+    assert_ne!(
+        enc_a, enc_b,
+        "different keyfiles must produce different ciphertext"
+    );
 
     let _ = fs::remove_file(kf_a);
     let _ = fs::remove_file(kf_b);
@@ -211,11 +240,17 @@ fn entropy_pool_derive_is_deterministic_for_same_pool() {
 
     let out1 = derive(&pool_bytes);
     let out2 = derive(&pool_bytes);
-    assert_eq!(out1, out2, "BLAKE3 derivation must be deterministic for same inputs");
+    assert_eq!(
+        out1, out2,
+        "BLAKE3 derivation must be deterministic for same inputs"
+    );
 
     // Different pool → different output.
     let mut other_pool = pool_bytes.clone();
     other_pool[0] ^= 0xFF;
     let out3 = derive(&other_pool);
-    assert_ne!(out1, out3, "different pool bytes must produce different derived keyfile");
+    assert_ne!(
+        out1, out3,
+        "different pool bytes must produce different derived keyfile"
+    );
 }

@@ -26,7 +26,7 @@
 //!   Seed 255:  All-ones degenerate (key = [0xFF; 32], iv = [0xFF; 16]).
 
 use std::env;
-use std::io::{self, Write, BufWriter};
+use std::io::{self, BufWriter, Write};
 use std::process;
 
 use catwalk::cml_sponge::{cipher_init, cml_permute_r, raw_rate_bytes};

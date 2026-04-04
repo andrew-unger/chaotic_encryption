@@ -178,8 +178,7 @@ fn stochastic_degree_estimate(rounds: usize, max_d: usize, n_trials: usize) -> u
         let mut found_nonzero = false;
         for _ in 0..n_trials {
             let base = rng.random_lattice();
-            let directions: Vec<[u64; 16]> =
-                (0..d).map(|_| rng.random_lattice()).collect();
+            let directions: Vec<[u64; 16]> = (0..d).map(|_| rng.random_lattice()).collect();
 
             for &bit in &sample_bits {
                 if divided_difference(&base, &directions, rounds, bit) != 0 {

@@ -13,7 +13,7 @@
 use catwalk::cml_sponge::{cipher_init_r, keystream_r};
 
 const SAMPLE_BYTES: usize = 1_000_000; // 1 MB per test
-const SEEDS: usize = 5;                // multiple seeds per round count
+const SEEDS: usize = 5; // multiple seeds per round count
 
 /// Expected fraction of full-rank 8×8 GF(2) matrices for uniform random data.
 /// P = ∏_{k=0..7} (1 − 2^{k-8}) ≈ 0.2888
@@ -33,12 +33,16 @@ fn keystream_r_bytes(rounds: usize, seed: u8) -> Vec<u8> {
 
 fn chi_squared(data: &[u8]) -> f64 {
     let mut freq = [0u64; 256];
-    for &b in data { freq[b as usize] += 1; }
+    for &b in data {
+        freq[b as usize] += 1;
+    }
     let expected = data.len() as f64 / 256.0;
-    freq.iter().map(|&f| {
-        let d = f as f64 - expected;
-        d * d / expected
-    }).sum()
+    freq.iter()
+        .map(|&f| {
+            let d = f as f64 - expected;
+            d * d / expected
+        })
+        .sum()
 }
 
 fn monobit_z(data: &[u8]) -> f64 {
@@ -59,7 +63,11 @@ fn serial_correlation(data: &[u8]) -> f64 {
             num += xi * (data[i + 1] as f64 - mean);
         }
     }
-    if den.abs() < 1e-10 { 0.0 } else { num / den }
+    if den.abs() < 1e-10 {
+        0.0
+    } else {
+        num / den
+    }
 }
 
 /// GF(2) rank of an 8×8 matrix where each byte is one row.
@@ -86,7 +94,8 @@ fn gf2_rank_8x8(rows: &[u8; 8]) -> usize {
 /// σ = sqrt(p*(1-p)/n) where n = sample_bytes/8.
 fn rank_test(data: &[u8]) -> (f64, f64) {
     let matrices: usize = data.len() / 8;
-    let full_rank = data.chunks_exact(8)
+    let full_rank = data
+        .chunks_exact(8)
         .filter(|c| gf2_rank_8x8(<&[u8; 8]>::try_from(*c).unwrap()) == 8)
         .count();
     let observed = full_rank as f64 / matrices as f64;
@@ -98,11 +107,19 @@ fn rank_test(data: &[u8]) -> (f64, f64) {
 fn main() {
     println!("CML-Sponge Reduced-Round Distinguisher Analysis");
     println!("================================================");
-    println!("Sample: {} bytes × {} seeds per round count", SAMPLE_BYTES, SEEDS);
-    println!("Expected GF(2) 8×8 full-rank fraction (random): {:.4}\n", EXPECTED_RANK8_FRAC);
+    println!(
+        "Sample: {} bytes × {} seeds per round count",
+        SAMPLE_BYTES, SEEDS
+    );
+    println!(
+        "Expected GF(2) 8×8 full-rank fraction (random): {:.4}\n",
+        EXPECTED_RANK8_FRAC
+    );
 
-    println!("{:<8} {:<10} {:<10} {:<12} {:<10} {:<12} {:<8}",
-        "Rounds", "ChiSq", "Monobit|z|", "SerialCorr", "Rank%", "RankZ", "Result");
+    println!(
+        "{:<8} {:<10} {:<10} {:<12} {:<10} {:<12} {:<8}",
+        "Rounds", "ChiSq", "Monobit|z|", "SerialCorr", "Rank%", "RankZ", "Result"
+    );
     println!("{}", "-".repeat(74));
 
     let chi_range = 175.0..=350.0f64;
@@ -129,9 +146,15 @@ fn main() {
 
         let chi_mean = chi_vals.iter().sum::<f64>() / SEEDS as f64;
         let mono_max = mono_vals.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-        let serial_max = serial_vals.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        let serial_max = serial_vals
+            .iter()
+            .cloned()
+            .fold(f64::NEG_INFINITY, f64::max);
         let rank_pct_mean = rank_pct_vals.iter().sum::<f64>() / SEEDS as f64;
-        let rank_z_max = rank_z_vals.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        let rank_z_max = rank_z_vals
+            .iter()
+            .cloned()
+            .fold(f64::NEG_INFINITY, f64::max);
 
         let chi_ok = chi_vals.iter().all(|&v| chi_range.contains(&v));
         let mono_ok = mono_max < mono_thresh;
@@ -141,7 +164,8 @@ fn main() {
         let pass = chi_ok && mono_ok && serial_ok && rank_ok;
         let marker = if rounds == 8 { " ← standard" } else { "" };
 
-        println!("{:<8} {:<10.1} {:<10.4} {:<12.6} {:<10.4} {:<12.3} {:<8}{}",
+        println!(
+            "{:<8} {:<10.1} {:<10.4} {:<12.6} {:<10.4} {:<12.3} {:<8}{}",
             rounds,
             chi_mean,
             mono_max,

@@ -25,7 +25,7 @@
 ///   Seed 255:    All-ones degenerate case.
 ///                key = [0xFF; 32], iv = [0xFF; 16]
 use std::env;
-use std::io::{self, Write, BufWriter};
+use std::io::{self, BufWriter, Write};
 
 use catwalk::cml_sponge::{cipher_init, keystream};
 
@@ -41,11 +41,15 @@ fn main() {
         254 => ([0x00u8; 32], [0x00u8; 16]),
         255 => ([0xFFu8; 32], [0xFFu8; 16]),
         128 => ([0x80u8; 32], [0x80u8; 16]),
-        64  => {
+        64 => {
             let mut key = [0u8; 32];
-            let mut iv  = [0u8; 16];
-            for (i, b) in key.iter_mut().enumerate() { *b = if i % 2 == 0 { 0xAA } else { 0x55 }; }
-            for (i, b) in iv.iter_mut().enumerate()  { *b = if i % 2 == 0 { 0xAA } else { 0x55 }; }
+            let mut iv = [0u8; 16];
+            for (i, b) in key.iter_mut().enumerate() {
+                *b = if i % 2 == 0 { 0xAA } else { 0x55 };
+            }
+            for (i, b) in iv.iter_mut().enumerate() {
+                *b = if i % 2 == 0 { 0xAA } else { 0x55 };
+            }
             (key, iv)
         }
         idx => {

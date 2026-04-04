@@ -14,22 +14,19 @@ use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Through
 
 use argon2::{Algorithm, Argon2, Params, Version};
 use catwalk::cml_sponge::{
-    absorb_aad, aead_decrypt_chunk, aead_encrypt_chunk, aead_finalize, cipher_init,
-    cml_permute_r, keystream,
+    absorb_aad, aead_decrypt_chunk, aead_encrypt_chunk, aead_finalize, cipher_init, cml_permute_r,
+    keystream,
 };
 
 // ── Fixed test vectors ──────────────────────────────────────────────────────
 
 const KEY: [u8; 32] = [
-    0x6a, 0x09, 0xe6, 0x67, 0xbb, 0x67, 0xae, 0x85,
-    0x3c, 0x6e, 0xf3, 0x72, 0xa5, 0x4f, 0xf5, 0x3a,
-    0x51, 0x0e, 0x52, 0x7f, 0x9b, 0x05, 0x68, 0x8c,
-    0x1f, 0x83, 0xd9, 0xab, 0x5b, 0xe0, 0xcd, 0x19,
+    0x6a, 0x09, 0xe6, 0x67, 0xbb, 0x67, 0xae, 0x85, 0x3c, 0x6e, 0xf3, 0x72, 0xa5, 0x4f, 0xf5, 0x3a,
+    0x51, 0x0e, 0x52, 0x7f, 0x9b, 0x05, 0x68, 0x8c, 0x1f, 0x83, 0xd9, 0xab, 0x5b, 0xe0, 0xcd, 0x19,
 ];
 
 const IV: [u8; 16] = [
-    0x19, 0x8c, 0xb0, 0x4a, 0x2a, 0x71, 0xb5, 0x14,
-    0x58, 0x9f, 0xd1, 0x5c, 0x16, 0x2e, 0xd5, 0xda,
+    0x19, 0x8c, 0xb0, 0x4a, 0x2a, 0x71, 0xb5, 0x14, 0x58, 0x9f, 0xd1, 0x5c, 0x16, 0x2e, 0xd5, 0xda,
 ];
 
 const AAD: &[u8] = b"CATWALK benchmark AAD";
@@ -40,7 +37,7 @@ fn aead_encrypt(plaintext: &[u8]) -> (Vec<u8>, [u8; 32]) {
     let mut state = cipher_init(&KEY, &IV);
     absorb_aad(&mut state, AAD);
     let mut ct = plaintext.to_vec();
-    aead_encrypt_chunk(&mut state, &mut ct);
+    aead_encrypt_chunk(&mut state, &mut ct, &mut vec![]);
     let tag = aead_finalize(&mut state);
     (ct, tag)
 }
@@ -70,11 +67,7 @@ fn bench_keystream_64b(c: &mut Criterion) {
 // ── Benchmark: AEAD encrypt at multiple payload sizes ──────────────────────
 
 fn bench_encrypt(c: &mut Criterion) {
-    let sizes: &[(&str, usize)] = &[
-        ("1KB",  1024),
-        ("64KB", 65536),
-        ("1MB",  1048576),
-    ];
+    let sizes: &[(&str, usize)] = &[("1KB", 1024), ("64KB", 65536), ("1MB", 1048576)];
 
     let mut group = c.benchmark_group("aead_encrypt");
     for (label, size) in sizes {
@@ -85,7 +78,8 @@ fn bench_encrypt(c: &mut Criterion) {
                 let mut state = cipher_init(&KEY, &IV);
                 absorb_aad(&mut state, AAD);
                 let mut ct = plaintext.clone();
-                aead_encrypt_chunk(&mut state, &mut ct);
+                let mut scratch = vec![];
+                aead_encrypt_chunk(&mut state, &mut ct, &mut scratch);
                 aead_finalize(&mut state)
             });
         });
@@ -96,11 +90,7 @@ fn bench_encrypt(c: &mut Criterion) {
 // ── Benchmark: AEAD decrypt at multiple payload sizes ──────────────────────
 
 fn bench_decrypt(c: &mut Criterion) {
-    let sizes: &[(&str, usize)] = &[
-        ("1KB",  1024),
-        ("64KB", 65536),
-        ("1MB",  1048576),
-    ];
+    let sizes: &[(&str, usize)] = &[("1KB", 1024), ("64KB", 65536), ("1MB", 1048576)];
 
     let mut group = c.benchmark_group("aead_decrypt");
     for (label, size) in sizes {
@@ -113,7 +103,8 @@ fn bench_decrypt(c: &mut Criterion) {
                 let mut state = cipher_init(&KEY, &IV);
                 absorb_aad(&mut state, AAD);
                 let mut buf = ct.clone();
-                aead_decrypt_chunk(&mut state, &mut buf);
+                let mut scratch = vec![];
+                aead_decrypt_chunk(&mut state, &mut buf, &mut scratch);
                 aead_finalize(&mut state)
             });
         });
@@ -133,8 +124,8 @@ fn bench_decrypt(c: &mut Criterion) {
 
 fn bench_kdf(c: &mut Criterion) {
     const SALT: [u8; 16] = [
-        0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
-        0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10,
+        0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f,
+        0x10,
     ];
     const PASSWORD: &[u8] = b"bench password for kdf benchmark";
 
@@ -146,7 +137,9 @@ fn bench_kdf(c: &mut Criterion) {
     c.bench_function("kdf_only (m=64MB t=2 p=1)", |b| {
         let mut out = [0u8; 32];
         b.iter(|| {
-            argon2.hash_password_into(PASSWORD, &SALT, &mut out).unwrap();
+            argon2
+                .hash_password_into(PASSWORD, &SALT, &mut out)
+                .unwrap();
         });
     });
 }

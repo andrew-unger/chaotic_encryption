@@ -1,26 +1,46 @@
-use flate2::read::ZlibDecoder;
-use flate2::write::ZlibEncoder;
-use flate2::Compression;
-use std::fmt;
-use std::io::{Read, Write};
-use crate::error::CryptoError;
 use crate::crypto::constants::*;
+use crate::error::CryptoError;
+use flate2::read::ZlibDecoder;
+use std::fmt;
+use std::fs;
+use std::io::{Read, Write};
+use std::path::Path;
 
 const MAX_DECOMPRESSED_SIZE: u64 = 4 * 1024 * 1024 * 1024; // 4 GB
 
+/// Compress data using zstd (level 1 — fast, good ratio).
 pub fn compress_data(data: &[u8]) -> Result<Vec<u8>, CryptoError> {
-    let mut encoder = ZlibEncoder::new(Vec::new(), Compression::fast());
-    encoder.write_all(data)?;
-    Ok(encoder.finish()?)
+    zstd::encode_all(data, 1).map_err(CryptoError::IoError)
 }
 
+/// Decompress zstd-compressed data with a 4 GB size limit.
 pub fn decompress_data(data: &[u8]) -> Result<Vec<u8>, CryptoError> {
+    let mut decoder = zstd::Decoder::new(data).map_err(CryptoError::IoError)?;
+    let mut decompressed = Vec::new();
+    let mut buf = [0u8; 65536];
+    loop {
+        let n = decoder.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        if decompressed.len() as u64 + n as u64 > MAX_DECOMPRESSED_SIZE {
+            return Err(CryptoError::DecompressionTooLarge);
+        }
+        decompressed.extend_from_slice(&buf[..n]);
+    }
+    Ok(decompressed)
+}
+
+/// Decompress zlib-compressed data (backward compat for pre-zstd files).
+pub fn decompress_data_zlib(data: &[u8]) -> Result<Vec<u8>, CryptoError> {
     let mut decoder = ZlibDecoder::new(data);
     let mut decompressed = Vec::new();
     let mut buf = [0u8; 65536];
     loop {
         let n = decoder.read(&mut buf)?;
-        if n == 0 { break; }
+        if n == 0 {
+            break;
+        }
         if decompressed.len() as u64 + n as u64 > MAX_DECOMPRESSED_SIZE {
             return Err(CryptoError::DecompressionTooLarge);
         }
@@ -45,10 +65,23 @@ pub struct FileInfo {
 impl FileInfo {
     pub fn flags_display(&self) -> String {
         let mut parts = Vec::new();
-        if self.flags & FLAG_STRIP_METADATA != 0 { parts.push("STRIP_METADATA"); }
-        if self.flags & FLAG_NO_COMPRESS    != 0 { parts.push("NO_COMPRESS"); }
-        if self.flags & FLAG_KEYFILE        != 0 { parts.push("KEYFILE"); }
-        if parts.is_empty() { "none".to_string() } else { parts.join(", ") }
+        if self.flags & FLAG_STRIP_METADATA != 0 {
+            parts.push("STRIP_METADATA");
+        }
+        if self.flags & FLAG_NO_COMPRESS != 0 {
+            parts.push("NO_COMPRESS");
+        }
+        if self.flags & FLAG_KEYFILE != 0 {
+            parts.push("KEYFILE");
+        }
+        if self.flags & FLAG_ZSTD != 0 {
+            parts.push("ZSTD");
+        }
+        if parts.is_empty() {
+            "none".to_string()
+        } else {
+            parts.join(", ")
+        }
     }
 
     pub fn argon2_memory_mb(&self) -> u64 {
@@ -99,7 +132,12 @@ pub fn parse_file_info(data: &[u8]) -> Result<FileInfo, CryptoError> {
 
     let flags = data[5];
     let ts_start = 6 + SALT_LEN;
-    let timestamp = u64::from_le_bytes(data[ts_start..ts_start + 8].try_into().unwrap());
+    // data.len() >= MIN_HEADER_LEN was verified above; this 8-byte slice is within bounds.
+    let timestamp = u64::from_le_bytes(
+        data[ts_start..ts_start + 8]
+            .try_into()
+            .unwrap_or_else(|_| unreachable!()),
+    );
     let argon_start = ts_start + TIMESTAMP_LEN + NONCE_LEN;
     let m_log2 = data[argon_start];
     let t_cost = data[argon_start + 1];
@@ -132,6 +170,39 @@ pub fn display_file_info(data: &[u8]) -> Result<(), CryptoError> {
     println!("----------------------");
     Ok(())
 }
+
+// ── Secure Delete ──────────────────────────────────────────────────────────
+
+/// Securely overwrite a file with three passes (random, zeros, random),
+/// then delete it.
+pub fn secure_delete_file(path: &Path) -> Result<(), CryptoError> {
+    use rand::RngCore;
+
+    let size = fs::metadata(path)?.len() as usize;
+    let mut rng = rand::thread_rng();
+
+    for pass in 0..3 {
+        let mut f = fs::OpenOptions::new().write(true).open(path)?;
+        let mut buf = vec![0u8; 8192.min(size.max(1))];
+        let mut remaining = size;
+        while remaining > 0 {
+            let chunk = remaining.min(buf.len());
+            if pass == 1 {
+                buf[..chunk].fill(0);
+            } else {
+                rng.fill_bytes(&mut buf[..chunk]);
+            }
+            f.write_all(&buf[..chunk])?;
+            remaining -= chunk;
+        }
+        f.sync_all()?;
+    }
+
+    fs::remove_file(path)?;
+    Ok(())
+}
+
+// ── Formatting ─────────────────────────────────────────────────────────────
 
 pub fn format_byte_size(bytes: u64) -> String {
     const KB: f64 = 1024.0;

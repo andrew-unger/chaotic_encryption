@@ -11,14 +11,22 @@
 //! Example: cml_rr_raw_dump 3 | RNG_test stdin64 -tlmax 4GB
 
 use std::env;
-use std::io::{self, Write, BufWriter};
+use std::io::{self, BufWriter, Write};
 
 use catwalk::cml_sponge::{cipher_init_r, cml_permute_r, raw_rate_bytes};
 
 fn main() {
     let args: Vec<String> = env::args().collect();
-    let rounds: usize = if args.len() > 1 { args[1].parse().unwrap_or(8) } else { 8 };
-    let seed_index: u8 = if args.len() > 2 { args[2].parse().unwrap_or(0) } else { 0 };
+    let rounds: usize = if args.len() > 1 {
+        args[1].parse().unwrap_or(8)
+    } else {
+        8
+    };
+    let seed_index: u8 = if args.len() > 2 {
+        args[2].parse().unwrap_or(0)
+    } else {
+        0
+    };
 
     // Same key derivation as cml_rr_dump for comparability.
     let mut seed_material = b"cml-sponge.rr.eval.v1".to_vec();

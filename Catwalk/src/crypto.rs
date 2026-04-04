@@ -2,6 +2,7 @@ use argon2::{Algorithm, Argon2, Params, Version};
 use blake3;
 use rand::Rng;
 use std::fs;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 use subtle::ConstantTimeEq;
@@ -9,10 +10,13 @@ use zeroize::Zeroize;
 
 use crate::cml_sponge;
 use crate::error::CryptoError;
-use crate::utils::{compress_data, decompress_data};
+use crate::utils::{compress_data, decompress_data, decompress_data_zlib};
 
 /// Progress callback type: receives a value in [0.0, 1.0].
 pub type ProgressFn = Box<dyn Fn(f32) + Send>;
+
+const KEYFILE_MAX_BYTES: u64 = 1_073_741_824; // 1 GiB
+const STREAM_CHUNK: usize = 65_536; // encrypt/decrypt chunk size
 
 /// Call the progress callback if present.
 #[inline]
@@ -32,16 +36,29 @@ extern "system" {
 
 #[cfg(target_os = "windows")]
 fn lock_memory(ptr: *const u8, size: usize) -> bool {
+    // SAFETY: `ptr` points to the first byte of a live heap allocation of exactly
+    // `size` bytes (a `Box<[u8; 32]>` allocated by `LockedBuffer::new`).  The
+    // pointer is valid for the lifetime of that box, and `VirtualLock` only reads
+    // the address range — it does not dereference Rust-managed memory itself.
+    // No Rust aliasing or ownership invariants are violated by this call.
     unsafe { VirtualLock(ptr, size) != 0 }
 }
 
 #[cfg(target_os = "windows")]
 fn unlock_memory(ptr: *const u8, size: usize) {
-    unsafe { let _ = VirtualUnlock(ptr, size); }
+    // SAFETY: Same invariants as `lock_memory` above.  `VirtualUnlock` is called
+    // on the same pointer and size that were passed to `VirtualLock` in
+    // `LockedBuffer::new`, and is called from `LockedBuffer::drop` before the
+    // box is freed, so the allocation is still live.
+    unsafe {
+        let _ = VirtualUnlock(ptr, size);
+    }
 }
 
 #[cfg(not(target_os = "windows"))]
-fn lock_memory(_ptr: *const u8, _size: usize) -> bool { true }
+fn lock_memory(_ptr: *const u8, _size: usize) -> bool {
+    true
+}
 
 #[cfg(not(target_os = "windows"))]
 fn unlock_memory(_ptr: *const u8, _size: usize) {}
@@ -60,7 +77,10 @@ impl LockedBuffer {
         src.zeroize();
         let ptr = boxed.as_ptr();
         let locked = lock_memory(ptr, 32);
-        Self { data: boxed, locked }
+        Self {
+            data: boxed,
+            locked,
+        }
     }
 
     fn get(&self) -> &[u8; 32] {
@@ -91,12 +111,12 @@ pub mod constants {
 
     // Argon2id defaults
     pub const ARGON2_M_LOG2: u8 = 18; // 2^18 = 262144 KiB = 256 MB
-    pub const ARGON2_T_COST: u8 = 4;  // 4 iterations
-    pub const ARGON2_P_COST: u8 = 1;  // 1 lane
+    pub const ARGON2_T_COST: u8 = 4; // 4 iterations
+    pub const ARGON2_P_COST: u8 = 1; // 1 lane
 
     // Minimum safe Argon2id parameters accepted on decryption.
     pub const ARGON2_M_LOG2_MIN: u8 = 16; // 64 MB minimum
-    pub const ARGON2_T_COST_MIN: u8 = 2;  // 2 iterations minimum
+    pub const ARGON2_T_COST_MIN: u8 = 2; // 2 iterations minimum
 
     // Password policy
     pub const MIN_PASSWORD_LEN: usize = 18;
@@ -106,16 +126,19 @@ pub mod constants {
     // Bit 0 — strip timestamp and file extension from header.
     pub const FLAG_STRIP_METADATA: u8 = 0x01;
     // Bit 1 — ciphertext is stored uncompressed.
-    pub const FLAG_NO_COMPRESS:    u8 = 0x02;
+    pub const FLAG_NO_COMPRESS: u8 = 0x02;
     // Bit 2 — a keyfile was mixed into the KDF input.
-    // NOTE: 0x01 and 0x02 were already taken; this is the next available bit.
-    pub const FLAG_KEYFILE:        u8 = 0x04;
+    pub const FLAG_KEYFILE: u8 = 0x04;
+    // Bit 3 — compression uses zstd instead of zlib.
+    // When unset and compression is enabled, zlib is assumed (backward compat).
+    pub const FLAG_ZSTD: u8 = 0x08;
 
     /// Byte index of the flags field within the CATWALK header.
     pub const FLAGS_OFFSET: usize = 5;
 
     // Minimum header size: magic(4) + ver(1) + flags(1) + salt(16) + ts(8) + nonce(16) + argon(3) + ext_len(1) + tag(32)
-    pub const MIN_HEADER_LEN: usize = 4 + 1 + 1 + SALT_LEN + TIMESTAMP_LEN + NONCE_LEN + 3 + 1 + HASH_LEN;
+    pub const MIN_HEADER_LEN: usize =
+        4 + 1 + 1 + SALT_LEN + TIMESTAMP_LEN + NONCE_LEN + 3 + 1 + HASH_LEN;
 }
 
 use constants::*;
@@ -150,14 +173,11 @@ impl Default for EncryptOptions {
 /// The keyfile is hashed before combining so Argon2id always receives a
 /// fixed-length input regardless of keyfile size (up to 1 GB).
 /// The null-byte separator prevents length-extension ambiguity.
-fn build_kdf_input(
-    password: &str,
-    keyfile_path: Option<&Path>,
-) -> Result<Vec<u8>, CryptoError> {
+fn build_kdf_input(password: &str, keyfile_path: Option<&Path>) -> Result<Vec<u8>, CryptoError> {
     if let Some(path) = keyfile_path {
         // Check size via metadata first to avoid loading a huge file.
         let file_len = fs::metadata(path)?.len();
-        if file_len > 1_073_741_824 {
+        if file_len > KEYFILE_MAX_BYTES {
             return Err(CryptoError::KeyfileTooLarge);
         }
         let contents = fs::read(path)?;
@@ -296,9 +316,18 @@ pub fn encrypt(
     let ext_len = extension.len() as u8;
 
     let mut flags: u8 = 0;
-    if options.strip_metadata  { flags |= FLAG_STRIP_METADATA; }
-    if options.skip_compression { flags |= FLAG_NO_COMPRESS; }
-    if keyfile_path.is_some()   { flags |= FLAG_KEYFILE; }
+    if options.strip_metadata {
+        flags |= FLAG_STRIP_METADATA;
+    }
+    if options.skip_compression {
+        flags |= FLAG_NO_COMPRESS;
+    }
+    if keyfile_path.is_some() {
+        flags |= FLAG_KEYFILE;
+    }
+    if !options.skip_compression {
+        flags |= FLAG_ZSTD;
+    } // new files use zstd
 
     let m_log2 = ARGON2_M_LOG2;
     let t_cost = ARGON2_T_COST;
@@ -306,9 +335,9 @@ pub fn encrypt(
 
     // Phase 2: Build KDF input and run Argon2id (0.05 → 0.35)
     let mut kdf_input = build_kdf_input(password, keyfile_path)?;
-    let master_key = LockedBuffer::new(
-        derive_key(&kdf_input, &salt, &timestamp, m_log2, t_cost, p_cost)?
-    );
+    let master_key = LockedBuffer::new(derive_key(
+        &kdf_input, &salt, &timestamp, m_log2, t_cost, p_cost,
+    )?);
     kdf_input.zeroize();
     let cipher_key = LockedBuffer::new(derive_cipher_key_v9(master_key.get()));
     report(progress, 0.35);
@@ -335,13 +364,14 @@ pub fn encrypt(
 
     // Phase 3: Stream encrypt + authenticate (0.35 → 0.85)
     let mut ciphertext = data;
-    const CHUNK: usize = 65536;
+    let mut scratch = Vec::with_capacity(STREAM_CHUNK);
+
     let total_len = ciphertext.len();
     if total_len > 0 {
         let mut offset = 0;
         while offset < total_len {
-            let end = (offset + CHUNK).min(total_len);
-            cml_sponge::aead_encrypt_chunk(&mut sponge, &mut ciphertext[offset..end]);
+            let end = (offset + STREAM_CHUNK).min(total_len);
+            cml_sponge::aead_encrypt_chunk(&mut sponge, &mut ciphertext[offset..end], &mut scratch);
             offset = end;
             if progress.is_some() {
                 let frac = offset as f32 / total_len as f32;
@@ -349,6 +379,7 @@ pub fn encrypt(
             }
         }
     }
+    scratch.zeroize();
     report(progress, 0.85);
 
     // Phase 4: Finalise tag + assemble output (0.85 → 0.90)
@@ -414,18 +445,18 @@ pub fn decrypt(
 
     let flags = ciphertext_bundle[FLAGS_OFFSET];
 
-    let salt_start  = 6;
-    let ts_start    = salt_start + SALT_LEN;
+    let salt_start = 6;
+    let ts_start = salt_start + SALT_LEN;
     let nonce_start = ts_start + TIMESTAMP_LEN;
     let argon_start = nonce_start + NONCE_LEN;
     let ext_len_pos = argon_start + 3;
 
-    let salt        = &ciphertext_bundle[salt_start..ts_start];
-    let timestamp   = &ciphertext_bundle[ts_start..nonce_start];
+    let salt = &ciphertext_bundle[salt_start..ts_start];
+    let timestamp = &ciphertext_bundle[ts_start..nonce_start];
     let nonce_bytes = &ciphertext_bundle[nonce_start..argon_start];
-    let m_log2      = ciphertext_bundle[argon_start];
-    let t_cost      = ciphertext_bundle[argon_start + 1];
-    let p_cost      = ciphertext_bundle[argon_start + 2];
+    let m_log2 = ciphertext_bundle[argon_start];
+    let t_cost = ciphertext_bundle[argon_start + 1];
+    let p_cost = ciphertext_bundle[argon_start + 2];
 
     // Reject downgraded Argon2 parameters before running KDF (timing oracle defence).
     if m_log2 < ARGON2_M_LOG2_MIN || t_cost < ARGON2_T_COST_MIN {
@@ -439,31 +470,31 @@ pub fn decrypt(
     let effective_keyfile = if (flags & FLAG_KEYFILE) != 0 {
         match keyfile_path {
             Some(p) => Some(p),
-            None    => return Err(CryptoError::KeyfileRequired),
+            None => return Err(CryptoError::KeyfileRequired),
         }
     } else {
         // File encrypted without a keyfile; ignore any keyfile supplied.
         None
     };
 
-    let ext_len      = ciphertext_bundle[ext_len_pos] as usize;
-    let ext_start    = ext_len_pos + 1;
+    let ext_len = ciphertext_bundle[ext_len_pos] as usize;
+    let ext_start = ext_len_pos + 1;
     let cipher_start = ext_start + ext_len;
-    let tag_start    = ciphertext_bundle.len() - HASH_LEN;
+    let tag_start = ciphertext_bundle.len() - HASH_LEN;
 
     if cipher_start > tag_start {
         return Err(CryptoError::InvalidCiphertextLength);
     }
 
-    let extension  = &ciphertext_bundle[ext_start..cipher_start];
-    let encrypted  = &ciphertext_bundle[cipher_start..tag_start];
+    let extension = &ciphertext_bundle[ext_start..cipher_start];
+    let encrypted = &ciphertext_bundle[cipher_start..tag_start];
     let stored_tag = &ciphertext_bundle[tag_start..];
 
     // Phase 2: Build KDF input and run Argon2id (0.05 → 0.35)
     let mut kdf_input = build_kdf_input(password, effective_keyfile)?;
-    let master_key = LockedBuffer::new(
-        derive_key(&kdf_input, salt, timestamp, m_log2, t_cost, p_cost)?
-    );
+    let master_key = LockedBuffer::new(derive_key(
+        &kdf_input, salt, timestamp, m_log2, t_cost, p_cost,
+    )?);
     kdf_input.zeroize();
     report(progress, 0.35);
 
@@ -477,6 +508,322 @@ pub fn decrypt(
         extension,
         progress,
     )
+}
+
+// ── Streaming I/O ───────────────────────────────────────────────────────────
+
+/// Read from `reader` until `buf` is full or EOF.  Returns bytes read.
+fn read_full<R: Read + ?Sized>(reader: &mut R, buf: &mut [u8]) -> Result<usize, std::io::Error> {
+    let mut total = 0;
+    while total < buf.len() {
+        match reader.read(&mut buf[total..]) {
+            Ok(0) => break,
+            Ok(n) => total += n,
+            Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(total)
+}
+
+/// Encrypt from a reader to a writer without loading the entire file into memory.
+///
+/// The output format is identical to [`encrypt`] — header, ciphertext, tag.
+/// If compression is enabled (`!options.skip_compression`), the input is
+/// stream-compressed through zlib before encryption.
+///
+/// `input_len` is used only for progress reporting and may be `None`.
+#[allow(clippy::too_many_arguments)]
+pub fn encrypt_stream<R: Read, W: Write>(
+    reader: &mut R,
+    writer: &mut W,
+    password: &str,
+    input_filename: &str,
+    options: &EncryptOptions,
+    keyfile_path: Option<&Path>,
+    progress: Option<&ProgressFn>,
+    input_len: Option<u64>,
+) -> Result<(), CryptoError> {
+    let progress = &progress;
+    report(progress, 0.0);
+
+    // Generate random salt and nonce.
+    let mut salt = [0u8; SALT_LEN];
+    rand::thread_rng().fill(&mut salt);
+    let mut nonce = [0u8; NONCE_LEN];
+    rand::thread_rng().fill(&mut nonce);
+
+    let timestamp = if options.strip_metadata {
+        [0u8; 8]
+    } else {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| CryptoError::SystemTimeError)?
+            .as_secs()
+            .to_le_bytes()
+    };
+
+    let extension = if options.strip_metadata {
+        Vec::new()
+    } else {
+        Path::new(input_filename)
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .unwrap_or("")
+            .as_bytes()
+            .to_vec()
+    };
+    let ext_len = extension.len() as u8;
+
+    let mut flags: u8 = 0;
+    if options.strip_metadata {
+        flags |= FLAG_STRIP_METADATA;
+    }
+    if options.skip_compression {
+        flags |= FLAG_NO_COMPRESS;
+    }
+    if keyfile_path.is_some() {
+        flags |= FLAG_KEYFILE;
+    }
+    if !options.skip_compression {
+        flags |= FLAG_ZSTD;
+    } // new files use zstd
+
+    let m_log2 = ARGON2_M_LOG2;
+    let t_cost = ARGON2_T_COST;
+    let p_cost = ARGON2_P_COST;
+
+    // KDF (0.05 → 0.35)
+    report(progress, 0.05);
+    let mut kdf_input = build_kdf_input(password, keyfile_path)?;
+    let master_key = LockedBuffer::new(derive_key(
+        &kdf_input, &salt, &timestamp, m_log2, t_cost, p_cost,
+    )?);
+    kdf_input.zeroize();
+    let cipher_key = LockedBuffer::new(derive_cipher_key_v9(master_key.get()));
+    report(progress, 0.35);
+
+    // Build and write header.
+    let mut header = Vec::with_capacity(50 + extension.len());
+    header.extend_from_slice(MAGIC);
+    header.push(VERSION);
+    header.push(flags);
+    header.extend_from_slice(&salt);
+    header.extend_from_slice(&timestamp);
+    header.extend_from_slice(&nonce);
+    header.push(m_log2);
+    header.push(t_cost);
+    header.push(p_cost);
+    header.push(ext_len);
+    header.extend_from_slice(&extension);
+    writer.write_all(&header)?;
+
+    // Init sponge and absorb header as AAD.
+    let mut sponge = cml_sponge::cipher_init(cipher_key.get(), &nonce);
+    cml_sponge::absorb_aad(&mut sponge, &header);
+
+    // Stream encrypt (0.35 → 0.85).
+    let mut buf = vec![0u8; STREAM_CHUNK];
+    let mut scratch = Vec::with_capacity(STREAM_CHUNK);
+    let mut bytes_out: u64 = 0;
+
+    // Inner loop: read from source, encrypt chunk, write to output.
+    let mut encrypt_loop = |source: &mut dyn Read| -> Result<(), CryptoError> {
+        loop {
+            let n = read_full(source, &mut buf)?;
+            if n == 0 {
+                break;
+            }
+            cml_sponge::aead_encrypt_chunk(&mut sponge, &mut buf[..n], &mut scratch);
+            writer.write_all(&buf[..n])?;
+            bytes_out += n as u64;
+            if let Some(total) = input_len {
+                if total > 0 {
+                    let frac = (bytes_out as f32 / total as f32).min(1.0);
+                    report(progress, 0.35 + frac * 0.50);
+                }
+            }
+        }
+        Ok(())
+    };
+
+    if options.skip_compression {
+        encrypt_loop(reader)?;
+    } else {
+        let mut compressor =
+            zstd::stream::read::Encoder::new(reader, 1).map_err(CryptoError::IoError)?;
+        encrypt_loop(&mut compressor)?;
+    }
+    scratch.zeroize();
+    report(progress, 0.85);
+
+    // Finalize tag and write it.
+    let tag = cml_sponge::aead_finalize(&mut sponge);
+    writer.write_all(&tag)?;
+    report(progress, 0.90);
+
+    Ok(())
+}
+
+/// Decrypt from a seekable reader to a writer without loading the entire file
+/// into memory.
+///
+/// Returns the original file extension (empty string if metadata was stripped).
+///
+/// # Security note
+///
+/// Unlike [`decrypt`], this function writes decrypted data to `writer`
+/// **before** the authentication tag is verified.  If the tag check fails,
+/// the caller is responsible for deleting or discarding the output.
+/// This trade-off is inherent to streaming AEAD decryption and is standard
+/// practice (cf. `age`, `gpg`).
+pub fn decrypt_stream<R: Read + Seek, W: Write>(
+    reader: &mut R,
+    writer: &mut W,
+    password: &str,
+    keyfile_path: Option<&Path>,
+    progress: Option<&ProgressFn>,
+) -> Result<String, CryptoError> {
+    let progress = &progress;
+    report(progress, 0.0);
+
+    // Determine file size via seek.
+    let file_size = reader.seek(SeekFrom::End(0))? as usize;
+    reader.seek(SeekFrom::Start(0))?;
+
+    if file_size < MIN_HEADER_LEN {
+        return Err(CryptoError::InvalidCiphertextLength);
+    }
+
+    // Read fixed-size header prefix:
+    //   magic(4) + ver(1) + flags(1) + salt(16) + ts(8) + nonce(16) + argon(3) + ext_len(1) = 50
+    let fixed_len = 4 + 1 + 1 + SALT_LEN + TIMESTAMP_LEN + NONCE_LEN + 3 + 1;
+    let mut fixed = vec![0u8; fixed_len];
+    reader.read_exact(&mut fixed)?;
+
+    if &fixed[..4] != MAGIC {
+        return Err(CryptoError::InvalidMagicBytes);
+    }
+    if fixed[4] != VERSION {
+        return Err(CryptoError::InvalidVersion);
+    }
+
+    let flags = fixed[FLAGS_OFFSET];
+
+    let salt_start = 6;
+    let ts_start = salt_start + SALT_LEN;
+    let nonce_start = ts_start + TIMESTAMP_LEN;
+    let argon_start = nonce_start + NONCE_LEN;
+    let ext_len_pos = argon_start + 3;
+
+    let mut salt = [0u8; SALT_LEN];
+    salt.copy_from_slice(&fixed[salt_start..ts_start]);
+    let mut ts = [0u8; TIMESTAMP_LEN];
+    ts.copy_from_slice(&fixed[ts_start..nonce_start]);
+    let mut nonce = [0u8; NONCE_LEN];
+    nonce.copy_from_slice(&fixed[nonce_start..argon_start]);
+
+    let m_log2 = fixed[argon_start];
+    let t_cost = fixed[argon_start + 1];
+    let p_cost = fixed[argon_start + 2];
+
+    if m_log2 < ARGON2_M_LOG2_MIN || t_cost < ARGON2_T_COST_MIN {
+        return Err(CryptoError::WeakKdfParameters);
+    }
+
+    let effective_keyfile = if (flags & FLAG_KEYFILE) != 0 {
+        match keyfile_path {
+            Some(p) => Some(p),
+            None => return Err(CryptoError::KeyfileRequired),
+        }
+    } else {
+        None
+    };
+
+    let ext_len = fixed[ext_len_pos] as usize;
+    let mut ext_bytes = vec![0u8; ext_len];
+    if ext_len > 0 {
+        reader.read_exact(&mut ext_bytes)?;
+    }
+
+    let header_len = fixed_len + ext_len;
+    if header_len + HASH_LEN > file_size {
+        return Err(CryptoError::InvalidCiphertextLength);
+    }
+    let cipher_len = file_size - header_len - HASH_LEN;
+
+    // Read the stored tag from the end of the file, then seek back.
+    let cipher_pos = reader.stream_position()?;
+    reader.seek(SeekFrom::Start((file_size - HASH_LEN) as u64))?;
+    let mut stored_tag = [0u8; HASH_LEN];
+    reader.read_exact(&mut stored_tag)?;
+    reader.seek(SeekFrom::Start(cipher_pos))?;
+
+    // Reconstruct the full header for AAD.
+    let mut header = Vec::with_capacity(header_len);
+    header.extend_from_slice(&fixed);
+    header.extend_from_slice(&ext_bytes);
+
+    // KDF (0.05 → 0.35)
+    report(progress, 0.05);
+    let mut kdf_input = build_kdf_input(password, effective_keyfile)?;
+    let master_key = LockedBuffer::new(derive_key(&kdf_input, &salt, &ts, m_log2, t_cost, p_cost)?);
+    kdf_input.zeroize();
+    let cipher_key = LockedBuffer::new(derive_cipher_key_v9(master_key.get()));
+    report(progress, 0.35);
+
+    // Init sponge and absorb header as AAD.
+    let mut sponge = cml_sponge::cipher_init(cipher_key.get(), &nonce);
+    cml_sponge::absorb_aad(&mut sponge, &header);
+
+    // Stream decrypt (0.40 → 0.85).
+    let no_compress = (flags & FLAG_NO_COMPRESS) != 0;
+    let mut buf = vec![0u8; STREAM_CHUNK];
+    let mut scratch = Vec::with_capacity(STREAM_CHUNK * 2);
+    let mut remaining = cipher_len;
+
+    // Inner loop: read ciphertext chunk, decrypt, write to sink.
+    let mut decrypt_loop = |sink: &mut dyn Write| -> Result<(), CryptoError> {
+        while remaining > 0 {
+            let to_read = remaining.min(STREAM_CHUNK);
+            reader.read_exact(&mut buf[..to_read])?;
+            cml_sponge::aead_decrypt_chunk(&mut sponge, &mut buf[..to_read], &mut scratch);
+            sink.write_all(&buf[..to_read])?;
+            remaining -= to_read;
+            // cipher_len.max(1) avoids division by zero when cipher_len == 0
+            // (empty ciphertext body); in that case remaining == 0 and the loop
+            // never executes, so this line is unreachable, but the guard is kept
+            // for clarity.
+            let frac = (cipher_len - remaining) as f32 / cipher_len.max(1) as f32;
+            report(progress, 0.40 + frac * 0.45);
+        }
+        Ok(())
+    };
+
+    let use_zstd = (flags & FLAG_ZSTD) != 0;
+    if no_compress {
+        decrypt_loop(writer)?;
+    } else if use_zstd {
+        let mut decoder =
+            zstd::stream::write::Decoder::new(writer).map_err(CryptoError::IoError)?;
+        decrypt_loop(&mut decoder)?;
+        decoder.flush().map_err(CryptoError::IoError)?;
+    } else {
+        let mut decoder = flate2::write::ZlibDecoder::new(writer);
+        decrypt_loop(&mut decoder)?;
+        decoder.finish().map_err(CryptoError::IoError)?;
+    }
+    scratch.zeroize();
+    report(progress, 0.85);
+
+    // Verify authentication tag (constant-time).
+    let computed_tag = cml_sponge::aead_finalize(&mut sponge);
+    if computed_tag.ct_eq(&stored_tag).unwrap_u8() != 1 {
+        return Err(CryptoError::IntegrityCheckFailed);
+    }
+    report(progress, 0.90);
+
+    Ok(String::from_utf8_lossy(&ext_bytes).to_string())
 }
 
 // ── v9 decryption (CML-Sponge AEAD) ─────────────────────────────────────────
@@ -504,13 +851,14 @@ fn decrypt_v9(
 
     // Phase 3: Stream decrypt (0.40 → 0.85)
     let mut decrypted = encrypted.to_vec();
-    const CHUNK: usize = 65536;
+    let mut scratch = Vec::with_capacity(STREAM_CHUNK * 2);
+
     let total_len = decrypted.len();
     if total_len > 0 {
         let mut offset = 0;
         while offset < total_len {
-            let end = (offset + CHUNK).min(total_len);
-            cml_sponge::aead_decrypt_chunk(&mut sponge, &mut decrypted[offset..end]);
+            let end = (offset + STREAM_CHUNK).min(total_len);
+            cml_sponge::aead_decrypt_chunk(&mut sponge, &mut decrypted[offset..end], &mut scratch);
             offset = end;
             if progress.is_some() {
                 let frac = offset as f32 / total_len as f32;
@@ -518,6 +866,7 @@ fn decrypt_v9(
             }
         }
     }
+    scratch.zeroize();
     report(progress, 0.85);
 
     // Verify authentication tag (constant-time).
@@ -529,7 +878,14 @@ fn decrypt_v9(
 
     // Phase 4: Decompression (0.88 → 0.90)
     let no_compress = (flags & FLAG_NO_COMPRESS) != 0;
-    let plaintext = if no_compress { decrypted } else { decompress_data(&decrypted)? };
+    let use_zstd = (flags & FLAG_ZSTD) != 0;
+    let plaintext = if no_compress {
+        decrypted
+    } else if use_zstd {
+        decompress_data(&decrypted)?
+    } else {
+        decompress_data_zlib(&decrypted)?
+    };
     report(progress, 0.90);
 
     let extension_str = String::from_utf8_lossy(extension).to_string();

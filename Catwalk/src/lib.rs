@@ -54,7 +54,10 @@
 //! research.  Callers are responsible for nonce management and tag verification.
 //! See [`cml_sponge::aead_finalize`] for the no-output-before-verification contract.
 
+pub mod cml_sponge;
 pub mod crypto;
 pub mod error;
 pub mod utils;
-pub mod cml_sponge;
+
+#[cfg(feature = "archive")]
+pub mod archive;
