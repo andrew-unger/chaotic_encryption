@@ -249,12 +249,15 @@ fn main() -> Result<(), CryptoError> {
                 std::process::exit(1);
             }
 
-            let confirm = prompt_password("Confirm password: ").expect("Failed to read password");
+            let mut confirm =
+                prompt_password("Confirm password: ").expect("Failed to read password");
             if password != confirm {
                 eprintln!("Error: Passwords do not match.");
                 password.clear();
+                confirm.clear();
                 std::process::exit(1);
             }
+            confirm.clear(); // no longer needed
 
             let options = EncryptOptions {
                 strip_metadata: no_metadata,
@@ -463,12 +466,15 @@ fn main() -> Result<(), CryptoError> {
                 std::process::exit(1);
             }
 
-            let confirm = prompt_password("Confirm password: ").expect("Failed to read password");
+            let mut confirm =
+                prompt_password("Confirm password: ").expect("Failed to read password");
             if password != confirm {
                 eprintln!("Error: Passwords do not match.");
                 password.clear();
+                confirm.clear();
                 std::process::exit(1);
             }
+            confirm.clear(); // no longer needed
 
             eprintln!("Creating archive from {} file(s)...", files.len());
             let archive_data = create_archive(&files)?;

@@ -146,7 +146,8 @@ pub fn parse_file_info(data: &[u8]) -> Result<FileInfo, CryptoError> {
     let ext_start = argon_start + 4;
 
     let extension = if data.len() >= ext_start + ext_len {
-        String::from_utf8_lossy(&data[ext_start..ext_start + ext_len]).to_string()
+        String::from_utf8(data[ext_start..ext_start + ext_len].to_vec())
+            .unwrap_or_else(|_| "???".to_string())
     } else {
         "???".into()
     };

@@ -50,6 +50,12 @@ fn unlock_memory(ptr: *const u8, size: usize) {
     // on the same pointer and size that were passed to `VirtualLock` in
     // `LockedBuffer::new`, and is called from `LockedBuffer::drop` before the
     // box is freed, so the allocation is still live.
+    //
+    // Importantly, `VirtualUnlock` uses the address and size only for page-range
+    // bookkeeping (updating the working-set lock count for the affected pages);
+    // it does NOT dereference through `ptr` or read memory contents.  It is
+    // therefore safe to call `VirtualUnlock` after the buffer has been zeroed by
+    // `LockedBuffer::drop` — the zero contents are irrelevant to the OS call.
     unsafe {
         let _ = VirtualUnlock(ptr, size);
     }
@@ -231,7 +237,7 @@ fn derive_cipher_key_v9(master_key: &[u8; 32]) -> [u8; 32] {
 
 /// Validate that a password meets minimum complexity requirements.
 pub fn validate_password(password: &str) -> Result<(), &'static str> {
-    if password.len() < MIN_PASSWORD_LEN {
+    if password.chars().count() < MIN_PASSWORD_LEN {
         return Err("Password must be at least 18 characters");
     }
     let mut run: usize = 1;
@@ -823,7 +829,7 @@ pub fn decrypt_stream<R: Read + Seek, W: Write>(
     }
     report(progress, 0.90);
 
-    Ok(String::from_utf8_lossy(&ext_bytes).to_string())
+    Ok(String::from_utf8(ext_bytes).unwrap_or_else(|_| "???".to_string()))
 }
 
 // ── v9 decryption (CML-Sponge AEAD) ─────────────────────────────────────────
@@ -888,6 +894,6 @@ fn decrypt_v9(
     };
     report(progress, 0.90);
 
-    let extension_str = String::from_utf8_lossy(extension).to_string();
+    let extension_str = String::from_utf8(extension.to_vec()).unwrap_or_else(|_| "???".to_string());
     Ok((plaintext, extension_str))
 }

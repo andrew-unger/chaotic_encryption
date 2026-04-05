@@ -486,13 +486,18 @@ pub fn aead_finalize(state: &mut CmlSpongeState) -> [u8; 32] {
         let w = stafford_mix13(state.lattice[i]);
         tag[i * 8..(i + 1) * 8].copy_from_slice(&w.to_le_bytes());
     }
+    // Invalidate the internal keystream buffer.  The absorb call above permuted
+    // the state; any bytes still cached in `buf` are pre-finalization keystream
+    // and must not be returned by a subsequent `keystream` call.
+    state.buf_pos = BLOCK_BYTES;
     tag
 }
 
 // ── Reduced-round variant (for cryptanalysis) ─────────────────────────────────
 
 /// Permutation with an explicit round count — used for reduced-round analysis.
-/// `rounds` should be in 1..=N_ROUNDS; values outside this range are clamped.
+/// `rounds` is clamped to a maximum of 32 (4× N_ROUNDS), allowing up to 4×
+/// the standard round count for analysis purposes.
 pub fn cml_permute_r(state: &mut CmlSpongeState, rounds: usize) {
     for _ in 0..rounds.min(32) {
         cml_round(&mut state.lattice, &mut state.counter);
