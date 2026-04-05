@@ -65,8 +65,13 @@ name = "archive_tests"
 path = "../Support/tests/archive_tests.rs"
 required-features = ["archive"]
 
+[[test]]
+name = "proptest_tests"
+path = "../Support/tests/proptest_tests.rs"
+
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
+proptest = "1"
 
 [profile.release]
 opt-level = 3

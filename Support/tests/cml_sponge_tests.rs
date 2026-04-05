@@ -607,6 +607,124 @@ fn arnold_cat_map_area_preserving() {
     );
 }
 
+// ── Rate-boundary plaintext tests ─────────────────────────────────────────────
+//
+// These tests verify correct behaviour at and around the 64-byte rate boundary,
+// catching off-by-one errors in the chunk/block logic.
+
+#[test]
+fn aead_roundtrip_63_bytes() {
+    // One byte under a rate block — exercises partial-block logic.
+    let key = [0x11u8; 32];
+    let iv = [0x22u8; 16];
+    let aad = b"aad-63";
+    let mut pt = vec![0xAAu8; 63];
+    let mut buf = Vec::new();
+
+    let mut enc = cipher_init(&key, &iv);
+    absorb_aad(&mut enc, aad);
+    aead_encrypt_chunk(&mut enc, &mut pt, &mut buf);
+    let enc_tag = aead_finalize(&mut enc);
+
+    let ct = pt.clone();
+    let mut dec_ct = ct.clone();
+    let mut dec = cipher_init(&key, &iv);
+    absorb_aad(&mut dec, aad);
+    aead_decrypt_chunk(&mut dec, &mut dec_ct, &mut buf);
+    let dec_tag = aead_finalize(&mut dec);
+
+    assert_eq!(enc_tag, dec_tag, "tags must match for 63-byte plaintext");
+    assert_eq!(
+        dec_ct,
+        vec![0xAAu8; 63],
+        "63-byte plaintext must decrypt correctly"
+    );
+}
+
+#[test]
+fn aead_roundtrip_64_bytes() {
+    // Exactly one rate block — boundary case.
+    let key = [0x33u8; 32];
+    let iv = [0x44u8; 16];
+    let aad = b"aad-64";
+    let mut pt = vec![0xBBu8; 64];
+    let mut buf = Vec::new();
+
+    let mut enc = cipher_init(&key, &iv);
+    absorb_aad(&mut enc, aad);
+    aead_encrypt_chunk(&mut enc, &mut pt, &mut buf);
+    let enc_tag = aead_finalize(&mut enc);
+
+    let mut dec_ct = pt.clone();
+    let mut dec = cipher_init(&key, &iv);
+    absorb_aad(&mut dec, aad);
+    aead_decrypt_chunk(&mut dec, &mut dec_ct, &mut buf);
+    let dec_tag = aead_finalize(&mut dec);
+
+    assert_eq!(enc_tag, dec_tag, "tags must match for 64-byte plaintext");
+    assert_eq!(
+        dec_ct,
+        vec![0xBBu8; 64],
+        "64-byte plaintext must decrypt correctly"
+    );
+}
+
+#[test]
+fn aead_roundtrip_65_bytes() {
+    // One byte over a rate block — crosses into the second block.
+    let key = [0x55u8; 32];
+    let iv = [0x66u8; 16];
+    let aad = b"aad-65";
+    let mut pt = vec![0xCCu8; 65];
+    let mut buf = Vec::new();
+
+    let mut enc = cipher_init(&key, &iv);
+    absorb_aad(&mut enc, aad);
+    aead_encrypt_chunk(&mut enc, &mut pt, &mut buf);
+    let enc_tag = aead_finalize(&mut enc);
+
+    let mut dec_ct = pt.clone();
+    let mut dec = cipher_init(&key, &iv);
+    absorb_aad(&mut dec, aad);
+    aead_decrypt_chunk(&mut dec, &mut dec_ct, &mut buf);
+    let dec_tag = aead_finalize(&mut dec);
+
+    assert_eq!(enc_tag, dec_tag, "tags must match for 65-byte plaintext");
+    assert_eq!(
+        dec_ct,
+        vec![0xCCu8; 65],
+        "65-byte plaintext must decrypt correctly"
+    );
+}
+
+#[test]
+fn aead_roundtrip_128_bytes() {
+    // Exactly two rate blocks.
+    let key = [0x77u8; 32];
+    let iv = [0x88u8; 16];
+    let aad = b"aad-128";
+    let mut pt = vec![0xDDu8; 128];
+    let mut buf = Vec::new();
+
+    let mut enc = cipher_init(&key, &iv);
+    absorb_aad(&mut enc, aad);
+    aead_encrypt_chunk(&mut enc, &mut pt, &mut buf);
+    let enc_tag = aead_finalize(&mut enc);
+
+    let mut dec_ct = pt.clone();
+    let mut dec = cipher_init(&key, &iv);
+    absorb_aad(&mut dec, aad);
+    aead_decrypt_chunk(&mut dec, &mut dec_ct, &mut buf);
+    let dec_tag = aead_finalize(&mut dec);
+
+    assert_eq!(enc_tag, dec_tag, "tags must match for 128-byte plaintext");
+    assert_eq!(
+        dec_ct,
+        vec![0xDDu8; 128],
+        "128-byte plaintext must decrypt correctly"
+    );
+}
+
 #[test]
 fn arnold_cat_map_no_complement_symmetry() {
     // Arnold's Cat Map: cat_map(x,y) ≠ cat_map(MAX-x, MAX-y) for generic inputs.

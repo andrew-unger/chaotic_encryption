@@ -336,3 +336,82 @@ fn oversized_ext_len_rejected() {
         result.err()
     );
 }
+
+// ── Unicode password tests (covers chars().count() fix) ───────────────────────
+
+#[test]
+fn unicode_password_18_chars_but_over_18_bytes_accepted() {
+    // 18 alternating emoji = 18 Unicode scalar values but 72 bytes.
+    // Alternating ensures no consecutive-run violation.
+    // The policy is chars().count() >= 18, so this must PASS.
+    let pw = "🔑🗝🔑🗝🔑🗝🔑🗝🔑🗝🔑🗝🔑🗝🔑🗝🔑🗝"; // 9×(🔑🗝) = 18 chars
+    assert_eq!(pw.chars().count(), 18);
+    assert!(pw.len() > 18, "sanity: emoji is multi-byte");
+    let result = validate_password(pw);
+    assert!(
+        result.is_ok(),
+        "18 emoji chars must be accepted: {:?}",
+        result
+    );
+}
+
+#[test]
+fn unicode_password_17_chars_rejected_even_if_over_18_bytes() {
+    // 17 emoji = 17 chars but 68 bytes.
+    // The policy requires >= 18 CHARS, so this must FAIL.
+    let pw = "🔑🔑🔑🔑🔑🔑🔑🔑🔑🔑🔑🔑🔑🔑🔑🔑🔑"; // 17 🔑
+    assert_eq!(pw.chars().count(), 17);
+    assert!(pw.len() > 18, "sanity: still more than 18 bytes");
+    let result = validate_password(pw);
+    assert!(
+        result.is_err(),
+        "17 emoji chars must be rejected (below 18-char minimum)"
+    );
+}
+
+// ── KDF parameter floor tests ─────────────────────────────────────────────────
+
+#[test]
+fn weak_t_cost_rejected_at_decrypt() {
+    // Craft a header with t_cost = 1 (below minimum of 2).
+    // decrypt() must return WeakKdfParameters before running the KDF.
+    let mut data = vec![0u8; MIN_HEADER_LEN + 1]; // +1 for at least 1 ciphertext byte
+    data[0..4].copy_from_slice(b"CATW");
+    data[4] = 9; // version
+    data[5] = 0; // flags
+                 // salt: bytes 6..22 (leave as zero)
+                 // timestamp: bytes 22..30 (leave as zero)
+                 // nonce: bytes 30..46 (leave as zero)
+                 // argon params at bytes 46..49:
+    data[46] = 18; // m_log2 = 18 (meets floor)
+    data[47] = 1; // t_cost = 1  (BELOW minimum of 2)
+    data[48] = 1; // p_cost = 1
+    data[49] = 0; // ext_len = 0
+
+    let result = decrypt(&data, "somepassword-that-is-long-enough", None, None);
+    assert!(
+        matches!(result, Err(CryptoError::WeakKdfParameters)),
+        "t_cost = 1 must be rejected as WeakKdfParameters, got {:?}",
+        result.err()
+    );
+}
+
+#[test]
+fn weak_m_log2_rejected_at_decrypt() {
+    // Craft a header with m_log2 = 15 (below minimum of 16).
+    let mut data = vec![0u8; MIN_HEADER_LEN + 1];
+    data[0..4].copy_from_slice(b"CATW");
+    data[4] = 9; // version
+    data[5] = 0; // flags
+    data[46] = 15; // m_log2 = 15 (BELOW minimum of 16)
+    data[47] = 2; // t_cost = 2 (meets floor)
+    data[48] = 1; // p_cost = 1
+    data[49] = 0; // ext_len = 0
+
+    let result = decrypt(&data, "somepassword-that-is-long-enough", None, None);
+    assert!(
+        matches!(result, Err(CryptoError::WeakKdfParameters)),
+        "m_log2 = 15 must be rejected as WeakKdfParameters, got {:?}",
+        result.err()
+    );
+}
