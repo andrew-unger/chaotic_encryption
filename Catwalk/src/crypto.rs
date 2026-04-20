@@ -96,10 +96,14 @@ impl LockedBuffer {
 
 impl Drop for LockedBuffer {
     fn drop(&mut self) {
-        self.data.zeroize();
+        // Unlock before zeroize: on Windows `VirtualUnlock` only does page-range
+        // bookkeeping so ordering is safe either way, but a future non-Windows
+        // port using a backend that reads bytes during unlock would be broken
+        // by zeroing first. This ordering matches libsodium / memsec.
         if self.locked {
             unlock_memory(self.data.as_ptr(), 32);
         }
+        self.data.zeroize();
     }
 }
 
@@ -123,6 +127,7 @@ pub mod constants {
     // Minimum safe Argon2id parameters accepted on decryption.
     pub const ARGON2_M_LOG2_MIN: u8 = 16; // 64 MB minimum
     pub const ARGON2_T_COST_MIN: u8 = 2; // 2 iterations minimum
+    pub const ARGON2_P_COST_MIN: u8 = 1; // at least 1 lane (argon2 crate rejects 0 internally)
 
     // Password policy
     pub const MIN_PASSWORD_LEN: usize = 18;
@@ -186,8 +191,9 @@ fn build_kdf_input(password: &str, keyfile_path: Option<&Path>) -> Result<Vec<u8
         if file_len > KEYFILE_MAX_BYTES {
             return Err(CryptoError::KeyfileTooLarge);
         }
-        let contents = fs::read(path)?;
+        let mut contents = fs::read(path)?;
         let digest = blake3::hash(&contents);
+        contents.zeroize();
         let mut material = password.as_bytes().to_vec();
         material.push(0x00); // separator — prevents length-extension ambiguity
         material.extend_from_slice(digest.as_bytes());
@@ -222,10 +228,18 @@ fn derive_key(
     combined_salt.extend_from_slice(salt);
     combined_salt.extend_from_slice(timestamp);
 
-    argon2
-        .hash_password_into(kdf_input, &combined_salt, &mut key)
-        .map_err(|_| CryptoError::KeyDerivationFailed)?;
-    Ok(key)
+    let result = argon2.hash_password_into(kdf_input, &combined_salt, &mut key);
+    // Salt is not secret, but zero it anyway for defense-in-depth consistency.
+    combined_salt.zeroize();
+    match result {
+        Ok(()) => Ok(key),
+        Err(_) => {
+            // Clear any partial KDF output that may have been written to `key`
+            // before the failure.
+            key.zeroize();
+            Err(CryptoError::KeyDerivationFailed)
+        }
+    }
 }
 
 /// Derive the v9 cipher key from the master key via BLAKE3 domain derivation.
@@ -319,6 +333,9 @@ pub fn encrypt(
             .as_bytes()
             .to_vec()
     };
+    if extension.len() > u8::MAX as usize {
+        return Err(CryptoError::ExtensionTooLong);
+    }
     let ext_len = extension.len() as u8;
 
     let mut flags: u8 = 0;
@@ -465,7 +482,7 @@ pub fn decrypt(
     let p_cost = ciphertext_bundle[argon_start + 2];
 
     // Reject downgraded Argon2 parameters before running KDF (timing oracle defence).
-    if m_log2 < ARGON2_M_LOG2_MIN || t_cost < ARGON2_T_COST_MIN {
+    if m_log2 < ARGON2_M_LOG2_MIN || t_cost < ARGON2_T_COST_MIN || p_cost < ARGON2_P_COST_MIN {
         return Err(CryptoError::WeakKdfParameters);
     }
 
@@ -579,6 +596,9 @@ pub fn encrypt_stream<R: Read, W: Write>(
             .as_bytes()
             .to_vec()
     };
+    if extension.len() > u8::MAX as usize {
+        return Err(CryptoError::ExtensionTooLong);
+    }
     let ext_len = extension.len() as u8;
 
     let mut flags: u8 = 0;
@@ -683,6 +703,21 @@ pub fn encrypt_stream<R: Read, W: Write>(
 /// the caller is responsible for deleting or discarding the output.
 /// This trade-off is inherent to streaming AEAD decryption and is standard
 /// practice (cf. `age`, `gpg`).
+///
+/// Callers **must** treat the emitted bytes as unauthenticated until this
+/// function returns `Ok(())`. In particular:
+///
+/// - When `writer` is a file, delete the file on `Err` (the CATWALK CLI does
+///   this via [`std::fs::remove_file`]).
+/// - When `writer` is stdout, a pipe, or any unseekable sink, downstream
+///   consumers may have already read unauthenticated data before the tag is
+///   checked. Document this to end users and advise them not to act on the
+///   output until the process exits with code 0.
+/// - When `writer` is an in-memory buffer, clear it on `Err` before reuse.
+///
+/// If any of these post-conditions cannot be guaranteed by the caller, use
+/// the non-streaming [`decrypt`] function instead — it verifies the tag before
+/// returning any plaintext.
 pub fn decrypt_stream<R: Read + Seek, W: Write>(
     reader: &mut R,
     writer: &mut W,
@@ -733,7 +768,7 @@ pub fn decrypt_stream<R: Read + Seek, W: Write>(
     let t_cost = fixed[argon_start + 1];
     let p_cost = fixed[argon_start + 2];
 
-    if m_log2 < ARGON2_M_LOG2_MIN || t_cost < ARGON2_T_COST_MIN {
+    if m_log2 < ARGON2_M_LOG2_MIN || t_cost < ARGON2_T_COST_MIN || p_cost < ARGON2_P_COST_MIN {
         return Err(CryptoError::WeakKdfParameters);
     }
 
@@ -896,4 +931,60 @@ fn decrypt_v9(
 
     let extension_str = String::from_utf8(extension.to_vec()).unwrap_or_else(|_| "???".to_string());
     Ok((plaintext, extension_str))
+}
+
+// ── Unit tests ─────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // `validate_password` enforces BOTH a minimum length (18 chars) and a cap on
+    // consecutive identical characters (max 3).  The length check fires first,
+    // so we pad test inputs to exceed the length minimum when exercising the
+    // repeat cap.
+
+    #[test]
+    fn validate_password_accepts_three_consecutive_repeats() {
+        // "aaa" + 15 varied chars = 18 chars total, max run = 3 → OK
+        let pw = "aaaBcDeFgHiJkLmNoP";
+        assert_eq!(pw.len(), 18);
+        assert!(validate_password(pw).is_ok());
+    }
+
+    #[test]
+    fn validate_password_rejects_four_consecutive_repeats() {
+        // "aaaa" + 14 varied chars = 18 chars total, max run = 4 → FAIL
+        let pw = "aaaaBcDeFgHiJkLmNo";
+        assert_eq!(pw.len(), 18);
+        let res = validate_password(pw);
+        assert!(res.is_err());
+        assert!(res.unwrap_err().contains("consecutive"));
+    }
+
+    #[test]
+    fn validate_password_rejects_short_password() {
+        assert!(validate_password("short").is_err());
+        assert!(validate_password("seventeencharsxx").is_err()); // 16 chars
+    }
+
+    #[test]
+    fn derive_key_rejects_p_cost_zero_via_explicit_floor_check() {
+        // `derive_key` itself does not enforce the floor — the floor is applied
+        // in `decrypt`/`decrypt_stream` via ARGON2_P_COST_MIN.  With `p_cost = 0`
+        // the underlying argon2 crate also rejects the Params, producing a
+        // KeyDerivationFailed.  This test exercises that internal path.
+        let salt = [0u8; 16];
+        let ts = [0u8; 8];
+        let result = derive_key(b"some-kdf-input", &salt, &ts, 16, 2, 0);
+        assert!(matches!(result, Err(CryptoError::KeyDerivationFailed)));
+    }
+
+    #[test]
+    fn argon2_parameter_floor_constants() {
+        // Sanity check — the floor values are what the plan + docs assert.
+        assert_eq!(constants::ARGON2_T_COST_MIN, 2);
+        assert_eq!(constants::ARGON2_M_LOG2_MIN, 16);
+        assert_eq!(constants::ARGON2_P_COST_MIN, 1);
+    }
 }

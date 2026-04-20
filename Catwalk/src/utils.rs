@@ -176,6 +176,24 @@ pub fn display_file_info(data: &[u8]) -> Result<(), CryptoError> {
 
 /// Securely overwrite a file with three passes (random, zeros, random),
 /// then delete it.
+///
+/// # Limitations
+///
+/// This is a **best-effort** overwrite and is **not cryptographically reliable**
+/// on modern storage. In particular:
+///
+/// - **SSDs / flash storage**: wear-leveling remaps logical blocks to different
+///   physical cells, so the overwritten bytes may persist in retired cells.
+/// - **Copy-on-write filesystems** (BTRFS, ZFS, APFS, ReFS): a write goes to
+///   a new block; the original block remains until garbage collection.
+/// - **Journaled filesystems** (NTFS, ext4, HFS+): a copy of data may exist in
+///   the journal.
+/// - **Virtual machines / hypervisor storage**: snapshots or thin-provisioned
+///   images may retain prior contents.
+///
+/// For genuine data destruction on SSD-era hardware, use full-disk encryption
+/// (BitLocker, FileVault, LUKS) and destroy the key, or use the vendor's
+/// secure-erase utility.
 pub fn secure_delete_file(path: &Path) -> Result<(), CryptoError> {
     use rand::RngCore;
 

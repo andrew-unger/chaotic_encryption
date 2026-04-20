@@ -27,6 +27,9 @@ pub enum CryptoError {
     /// Archive creation or extraction failed.
     #[error("Archive error: {0}")]
     ArchiveError(String),
+    /// File extension exceeds 255 bytes (maximum storable in u8 ext_len header field).
+    #[error("File extension exceeds maximum length of 255 bytes")]
+    ExtensionTooLong,
     #[error("IO Error: {0}")]
     IoError(#[from] io::Error),
 }

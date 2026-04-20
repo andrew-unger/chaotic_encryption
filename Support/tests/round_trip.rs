@@ -615,3 +615,40 @@ fn progress_is_monotone_decrypt() {
         assert!(w[1] >= w[0], "progress regressed: {} then {}", w[0], w[1]);
     }
 }
+
+// ── Extension length boundary ─────────────────────────────────────────────────
+//
+// The file header stores extension length in a single u8 byte, so extensions
+// longer than 255 bytes must be rejected with ExtensionTooLong rather than
+// silently truncated.
+
+#[test]
+fn extension_exactly_255_bytes_is_accepted() {
+    let plaintext = b"boundary check";
+    let password = "boundary_test_pass!";
+    // Build a filename of the form "file.<ext>" where <ext> is exactly 255 bytes.
+    let long_ext: String = "a".repeat(255);
+    let filename = format!("file.{}", long_ext);
+
+    let encrypted = encrypt(plaintext, password, &filename, &DEFAULT_OPTS, None, None)
+        .expect("encryption with 255-byte ext must succeed");
+    let (decrypted, ext) = decrypt(&encrypted, password, None, None).expect("decryption failed");
+
+    assert_eq!(decrypted, plaintext);
+    assert_eq!(ext.len(), 255);
+}
+
+#[test]
+fn extension_256_bytes_returns_extension_too_long() {
+    let plaintext = b"boundary check";
+    let password = "boundary_test_pass!";
+    let long_ext: String = "a".repeat(256);
+    let filename = format!("file.{}", long_ext);
+
+    let result = encrypt(plaintext, password, &filename, &DEFAULT_OPTS, None, None);
+    assert!(
+        matches!(result, Err(CryptoError::ExtensionTooLong)),
+        "expected ExtensionTooLong, got {:?}",
+        result.err()
+    );
+}

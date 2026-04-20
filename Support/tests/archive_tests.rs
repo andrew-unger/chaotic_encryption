@@ -15,7 +15,7 @@
 mod archive {
     use catwalk::archive::{create_archive, extract_archive};
     use std::fs;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     fn tmp_dir(name: &str) -> PathBuf {
         let p = std::env::temp_dir().join(format!("catwalk_archtest_{}", name));
@@ -24,7 +24,7 @@ mod archive {
         p
     }
 
-    fn write_file(dir: &PathBuf, name: &str, content: &[u8]) -> PathBuf {
+    fn write_file(dir: &Path, name: &str, content: &[u8]) -> PathBuf {
         let p = dir.join(name);
         fs::write(&p, content).expect("write test file");
         p

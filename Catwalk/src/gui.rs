@@ -6,7 +6,8 @@ use std::sync::mpsc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use eframe::egui;
-use zeroize::Zeroize;
+use subtle::ConstantTimeEq;
+use zeroize::{Zeroize, Zeroizing};
 
 extern crate catwalk;
 use catwalk::crypto::constants::{FLAGS_OFFSET, FLAG_KEYFILE};
@@ -88,17 +89,32 @@ impl EntropyPool {
     /// Uses BLAKE3-XOF to compress and whiten all accumulated entropy.
     /// System time is mixed in so two pools with identical raw input (extremely
     /// unlikely) still produce different keyfiles.
+    ///
+    /// A 32-byte OS-randomness floor is also mixed in so that even in
+    /// degenerate cases (scripted invocation with no user input, heartbeat
+    /// counter dominating the pool) the derived keyfile retains full entropy
+    /// from the kernel CSPRNG.
     pub fn derive_keyfile(&self) -> [u8; 64] {
+        use rand::{rngs::OsRng, RngCore};
+
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos() as u64;
+
+        // OS-randomness floor: unconditional 32 bytes from the kernel CSPRNG.
+        let mut os_entropy = [0u8; 32];
+        OsRng.fill_bytes(&mut os_entropy);
+
         let mut hasher = blake3::Hasher::new();
         hasher.update(&self.pool);
         hasher.update(&now.to_le_bytes());
+        hasher.update(&os_entropy);
         hasher.update(b"catwalk-keyfile-v1");
         let mut output = [0u8; 64];
         hasher.finalize_xof().fill(&mut output);
+
+        os_entropy.zeroize();
         output
     }
 
@@ -1274,7 +1290,11 @@ impl CatwalkGui {
             });
 
             if !self.password.is_empty() && !self.confirm_password.is_empty() {
-                if self.password == self.confirm_password {
+                if bool::from(
+                    self.password
+                        .as_bytes()
+                        .ct_eq(self.confirm_password.as_bytes()),
+                ) {
                     ui.label(
                         egui::RichText::new("Passwords match")
                             .small()
@@ -1304,6 +1324,11 @@ impl CatwalkGui {
             ui.checkbox(
                 &mut self.secure_delete,
                 "Secure delete original after encryption",
+            )
+            .on_hover_text(
+                "Best-effort overwrite + delete. Unreliable on SSDs (wear leveling), \
+                 copy-on-write filesystems (BTRFS/ZFS/APFS/ReFS), and journaled filesystems. \
+                 For true cryptographic erasure, use full-disk encryption and destroy the key.",
             );
 
             // ── Keyfile picker (encrypt / archive) ────────────────────────────
@@ -1583,13 +1608,21 @@ impl CatwalkGui {
                 !self.input_path.is_empty()
                     && !self.output_path.is_empty()
                     && validate_password(&self.password).is_ok()
-                    && self.password == self.confirm_password
+                    && bool::from(
+                        self.password
+                            .as_bytes()
+                            .ct_eq(self.confirm_password.as_bytes()),
+                    )
             }
             Mode::Archive => {
                 !self.batch_files.is_empty()
                     && !self.batch_output_path.is_empty()
                     && validate_password(&self.password).is_ok()
-                    && self.password == self.confirm_password
+                    && bool::from(
+                        self.password
+                            .as_bytes()
+                            .ct_eq(self.confirm_password.as_bytes()),
+                    )
             }
             Mode::Decrypt => {
                 !self.input_path.is_empty()
@@ -1623,7 +1656,9 @@ impl CatwalkGui {
         let mode = self.mode;
         let input_path = PathBuf::from(&self.input_path);
         let output_path = PathBuf::from(&self.output_path);
-        let password = self.password.clone();
+        // Wrap the cloned password so it is zeroized when the worker thread's
+        // closure is dropped (on normal completion, panic, or early return).
+        let password = Zeroizing::new(self.password.clone());
         let options = EncryptOptions {
             strip_metadata: self.strip_metadata,
             skip_compression: self.skip_compression,
@@ -1647,7 +1682,7 @@ impl CatwalkGui {
                 Mode::Encrypt => encrypt_file(
                     &input_path,
                     &output_path,
-                    &password,
+                    password.as_str(),
                     &options,
                     encrypt_keyfile.as_deref(),
                     Some(&progress_cb),
@@ -1655,7 +1690,7 @@ impl CatwalkGui {
                 Mode::Decrypt => decrypt_file(
                     &input_path,
                     &output_path,
-                    &password,
+                    password.as_str(),
                     decrypt_keyfile.as_deref(),
                     Some(&progress_cb),
                 ),
@@ -1665,6 +1700,8 @@ impl CatwalkGui {
             let _ = tx.send(WorkerMessage::Complete(result));
             let _ = tx.send(WorkerMessage::AllDone);
             ctx.request_repaint();
+            // `password` (Zeroizing<String>) zeroes its heap allocation here
+            // when the closure is dropped.
         });
 
         // Queue secure delete for after worker completes
@@ -1685,7 +1722,9 @@ impl CatwalkGui {
 
         let files: Vec<PathBuf> = self.batch_files.iter().map(|e| e.path.clone()).collect();
         let output_path = PathBuf::from(&self.batch_output_path);
-        let password = self.password.clone();
+        // Wrap the cloned password so it zeroizes when the worker thread's
+        // closure is dropped.
+        let password = Zeroizing::new(self.password.clone());
         let options = EncryptOptions {
             strip_metadata: self.strip_metadata,
             skip_compression: self.skip_compression,
@@ -1703,7 +1742,7 @@ impl CatwalkGui {
             let result = encrypt_archive(
                 &files,
                 &output_path,
-                &password,
+                password.as_str(),
                 &options,
                 encrypt_keyfile.as_deref(),
                 Some(&progress_cb),
@@ -1711,6 +1750,7 @@ impl CatwalkGui {
             let _ = tx.send(WorkerMessage::Complete(result));
             let _ = tx.send(WorkerMessage::AllDone);
             ctx.request_repaint();
+            // `password` (Zeroizing<String>) zeroes its heap allocation here.
         });
     }
 

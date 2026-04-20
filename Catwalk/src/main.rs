@@ -8,10 +8,36 @@ use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand};
 use rpassword::prompt_password;
+use subtle::ConstantTimeEq;
+use zeroize::Zeroize;
 
 use catwalk::crypto::{
     decrypt_stream, encrypt_stream, validate_password, EncryptOptions, ProgressFn,
 };
+
+/// RAII wrapper that zeroizes a password `String` on drop (including all
+/// `?`-operator early exits, panics, and normal scope end).
+struct PasswordGuard(String);
+
+impl PasswordGuard {
+    fn new(s: String) -> Self {
+        Self(s)
+    }
+    fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl Drop for PasswordGuard {
+    fn drop(&mut self) {
+        self.0.zeroize();
+    }
+}
+
+/// Constant-time byte comparison for user-supplied confirmations.
+fn ct_str_eq(a: &str, b: &str) -> bool {
+    a.as_bytes().ct_eq(b.as_bytes()).into()
+}
 
 // The in-memory API is used by the archive subcommand (feature-gated).
 #[cfg(feature = "archive")]
@@ -56,7 +82,9 @@ enum Command {
         /// Optional keyfile for two-factor encryption
         #[arg(long, value_name = "PATH")]
         keyfile: Option<PathBuf>,
-        /// Securely overwrite the input file after successful encryption
+        /// Best-effort overwrite + delete the input file after successful
+        /// encryption. Unreliable on SSDs, CoW filesystems (BTRFS/ZFS/APFS),
+        /// and journaled filesystems; use full-disk encryption for real erasure.
         #[arg(long)]
         secure_delete: bool,
     },
@@ -107,7 +135,9 @@ enum Command {
         /// Optional keyfile for two-factor encryption
         #[arg(long, value_name = "PATH")]
         keyfile: Option<PathBuf>,
-        /// Securely overwrite the input files after successful encryption
+        /// Best-effort overwrite + delete the input files after successful
+        /// encryption. Unreliable on SSDs, CoW filesystems (BTRFS/ZFS/APFS),
+        /// and journaled filesystems; use full-disk encryption for real erasure.
         #[arg(long)]
         secure_delete: bool,
     },
@@ -146,7 +176,10 @@ fn make_progress_cb() -> ProgressFn {
     });
 
     Box::new(move |v: f32| {
-        let mut st = state.lock().unwrap();
+        // Recover from a poisoned mutex: the progress state is purely cosmetic
+        // (elapsed time + phase label), so a panic in another thread must not
+        // disable progress reporting for the remainder of the run.
+        let mut st = state.lock().unwrap_or_else(|p| p.into_inner());
         let pct = v * 100.0;
 
         // Detect phase transitions and label them.
@@ -240,24 +273,23 @@ fn main() -> Result<(), CryptoError> {
                 std::process::exit(1);
             }
 
-            let mut password =
-                prompt_password("Enter password: ").expect("Failed to read password");
+            let password = PasswordGuard::new(
+                prompt_password("Enter password: ").expect("Failed to read password"),
+            );
 
-            if let Err(reason) = validate_password(&password) {
+            if let Err(reason) = validate_password(password.as_str()) {
                 eprintln!("Password rejected: {}", reason);
-                password.clear();
                 std::process::exit(1);
             }
 
-            let mut confirm =
-                prompt_password("Confirm password: ").expect("Failed to read password");
-            if password != confirm {
+            let confirm = PasswordGuard::new(
+                prompt_password("Confirm password: ").expect("Failed to read password"),
+            );
+            if !ct_str_eq(password.as_str(), confirm.as_str()) {
                 eprintln!("Error: Passwords do not match.");
-                password.clear();
-                confirm.clear();
                 std::process::exit(1);
             }
-            confirm.clear(); // no longer needed
+            drop(confirm); // no longer needed; Drop zeroes it
 
             let options = EncryptOptions {
                 strip_metadata: no_metadata,
@@ -278,7 +310,7 @@ fn main() -> Result<(), CryptoError> {
                     encrypt_stream(
                         $r,
                         $w,
-                        &password,
+                        password.as_str(),
                         filename,
                         &options,
                         keyfile.as_deref(),
@@ -304,7 +336,7 @@ fn main() -> Result<(), CryptoError> {
                 }
             }
             eprintln!();
-            password.clear();
+            // `password` zeroes on scope end via PasswordGuard::drop.
 
             eprintln!("Encryption completed successfully.");
 
@@ -324,7 +356,9 @@ fn main() -> Result<(), CryptoError> {
             let from_stdin = input == "-";
             let to_stdout = output == "-";
 
-            let password = prompt_password("Enter password: ").expect("Failed to read password");
+            let password = PasswordGuard::new(
+                prompt_password("Enter password: ").expect("Failed to read password"),
+            );
 
             if !to_stdout && Path::new(&output).exists() && !force {
                 eprintln!(
@@ -340,7 +374,13 @@ fn main() -> Result<(), CryptoError> {
             // stdin must be buffered into a Cursor (not seekable).
             macro_rules! do_decrypt {
                 ($r:expr, $w:expr) => {
-                    decrypt_stream($r, $w, &password, keyfile.as_deref(), Some(&progress_cb))
+                    decrypt_stream(
+                        $r,
+                        $w,
+                        password.as_str(),
+                        keyfile.as_deref(),
+                        Some(&progress_cb),
+                    )
                 };
             }
 
@@ -457,24 +497,23 @@ fn main() -> Result<(), CryptoError> {
                 }
             }
 
-            let mut password =
-                prompt_password("Enter password: ").expect("Failed to read password");
+            let password = PasswordGuard::new(
+                prompt_password("Enter password: ").expect("Failed to read password"),
+            );
 
-            if let Err(reason) = validate_password(&password) {
+            if let Err(reason) = validate_password(password.as_str()) {
                 eprintln!("Password rejected: {}", reason);
-                password.clear();
                 std::process::exit(1);
             }
 
-            let mut confirm =
-                prompt_password("Confirm password: ").expect("Failed to read password");
-            if password != confirm {
+            let confirm = PasswordGuard::new(
+                prompt_password("Confirm password: ").expect("Failed to read password"),
+            );
+            if !ct_str_eq(password.as_str(), confirm.as_str()) {
                 eprintln!("Error: Passwords do not match.");
-                password.clear();
-                confirm.clear();
                 std::process::exit(1);
             }
-            confirm.clear(); // no longer needed
+            drop(confirm); // no longer needed; Drop zeroes it
 
             eprintln!("Creating archive from {} file(s)...", files.len());
             let archive_data = create_archive(&files)?;
@@ -487,14 +526,14 @@ fn main() -> Result<(), CryptoError> {
             let progress_cb = make_progress_cb();
             let result = encrypt(
                 &archive_data,
-                &password,
+                password.as_str(),
                 &format!("archive.{}", ARCHIVE_EXTENSION),
                 &options,
                 keyfile.as_deref(),
                 Some(&progress_cb),
             )?;
             eprintln!();
-            password.clear();
+            // `password` zeroes on scope end via PasswordGuard::drop.
 
             let mut file = fs::File::create(&output)?;
             file.write_all(&result)?;
@@ -522,12 +561,18 @@ fn main() -> Result<(), CryptoError> {
         } => {
             use catwalk::archive::{extract_archive, ARCHIVE_EXTENSION};
 
-            let password = prompt_password("Enter password: ").expect("Failed to read password");
+            let password = PasswordGuard::new(
+                prompt_password("Enter password: ").expect("Failed to read password"),
+            );
 
             let data = fs::read(&input)?;
             let progress_cb = make_progress_cb();
-            let (result, extension) =
-                decrypt(&data, &password, keyfile.as_deref(), Some(&progress_cb))?;
+            let (result, extension) = decrypt(
+                &data,
+                password.as_str(),
+                keyfile.as_deref(),
+                Some(&progress_cb),
+            )?;
             eprintln!();
 
             if extension != ARCHIVE_EXTENSION {
@@ -594,4 +639,32 @@ fn main() -> Result<(), CryptoError> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ct_str_eq_accepts_equal_strings() {
+        assert!(ct_str_eq("correct_horse_battery", "correct_horse_battery"));
+        assert!(ct_str_eq("", ""));
+    }
+
+    #[test]
+    fn ct_str_eq_rejects_different_strings() {
+        assert!(!ct_str_eq("correct_horse_battery", "correct_horse_batter!"));
+        assert!(!ct_str_eq("short", "short_but_longer"));
+        assert!(!ct_str_eq("a", "b"));
+    }
+
+    #[test]
+    fn password_guard_zeroizes_on_drop() {
+        // We cannot observe the zeroize directly after drop without unsafe
+        // ptr peeking, but we can at least confirm Drop runs without panic
+        // and that the guard exposes the expected string while alive.
+        let g = PasswordGuard::new("hunter2hunter2hunter2".to_string());
+        assert_eq!(g.as_str(), "hunter2hunter2hunter2");
+        drop(g);
+    }
 }

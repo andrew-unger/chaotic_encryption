@@ -23,7 +23,7 @@ blake3 = "1.4.1"
 clap = { version = "4", features = ["derive"] }
 flate2 = "1.0.26"
 zstd = "0.13"
-rand = "0.8.5"
+rand = "0.8.6"
 rpassword = "7.2.0"
 subtle = "2.5.0"
 zeroize = "1.6.0"
