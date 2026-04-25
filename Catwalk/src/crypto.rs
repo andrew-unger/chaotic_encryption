@@ -522,6 +522,55 @@ pub fn validate_password(password: &str) -> Result<(), &'static str> {
     Ok(())
 }
 
+// ── AEAD session helpers (shared by encrypt/decrypt, in-memory and streaming) ─
+
+/// Initialise the CML-sponge with the cipher key + nonce and absorb the
+/// header bytes as Associated Data.  Replaces the `cipher_init` + `absorb_aad`
+/// pair that appears in `encrypt`, `encrypt_stream`, `decrypt_v9`, and
+/// `decrypt_stream`.
+#[inline]
+fn init_aead_sponge(
+    cipher_key: &[u8; 32],
+    nonce: &[u8; NONCE_LEN],
+    header_bytes: &[u8],
+) -> cml_sponge::CmlSpongeState {
+    let mut sponge = cml_sponge::cipher_init(cipher_key, nonce);
+    cml_sponge::absorb_aad(&mut sponge, header_bytes);
+    sponge
+}
+
+/// Process an in-memory buffer through the AEAD chunk operation in
+/// STREAM_CHUNK-sized slices, reporting progress along the way.
+///
+/// `chunk_op` is `cml_sponge::aead_encrypt_chunk` for the encrypt path or
+/// `cml_sponge::aead_decrypt_chunk` for the decrypt path.  Allocates and
+/// zeroizes the scratch buffer locally so callers don't repeat that ritual.
+fn aead_process_in_place(
+    sponge: &mut cml_sponge::CmlSpongeState,
+    data: &mut [u8],
+    chunk_op: fn(&mut cml_sponge::CmlSpongeState, &mut [u8], &mut Vec<u8>),
+    scratch_cap: usize,
+    progress: &Option<&ProgressFn>,
+    progress_start: f32,
+    progress_span: f32,
+) {
+    let mut scratch = Vec::with_capacity(scratch_cap);
+    let total_len = data.len();
+    if total_len > 0 {
+        let mut offset = 0;
+        while offset < total_len {
+            let end = (offset + STREAM_CHUNK).min(total_len);
+            chunk_op(sponge, &mut data[offset..end], &mut scratch);
+            offset = end;
+            if progress.is_some() {
+                let frac = offset as f32 / total_len as f32;
+                report(progress, progress_start + frac * progress_span);
+            }
+        }
+    }
+    scratch.zeroize();
+}
+
 // ── Encrypt (v9 — CML-Sponge AEAD) ──────────────────────────────────────────
 
 /// Encrypt `plaintext` and return the complete CATWALK v9 ciphertext bundle.
@@ -590,26 +639,19 @@ pub fn encrypt(
         &meta.extension,
     );
 
-    let mut sponge = cml_sponge::cipher_init(cipher_key.get(), &nonce);
-    cml_sponge::absorb_aad(&mut sponge, &header);
+    let mut sponge = init_aead_sponge(cipher_key.get(), &nonce, &header);
 
     // Phase 3: Stream encrypt + authenticate (0.35 → 0.85)
     let mut ciphertext = data;
-    let mut scratch = Vec::with_capacity(STREAM_CHUNK);
-    let total_len = ciphertext.len();
-    if total_len > 0 {
-        let mut offset = 0;
-        while offset < total_len {
-            let end = (offset + STREAM_CHUNK).min(total_len);
-            cml_sponge::aead_encrypt_chunk(&mut sponge, &mut ciphertext[offset..end], &mut scratch);
-            offset = end;
-            if progress.is_some() {
-                let frac = offset as f32 / total_len as f32;
-                report(progress, 0.35 + frac * 0.50);
-            }
-        }
-    }
-    scratch.zeroize();
+    aead_process_in_place(
+        &mut sponge,
+        &mut ciphertext,
+        cml_sponge::aead_encrypt_chunk,
+        STREAM_CHUNK,
+        progress,
+        0.35,
+        0.50,
+    );
     report(progress, 0.85);
 
     // Phase 4: Finalise tag + assemble output (0.85 → 0.90)
@@ -767,8 +809,7 @@ pub fn encrypt_stream<R: Read, W: Write>(
     );
     writer.write_all(&header)?;
 
-    let mut sponge = cml_sponge::cipher_init(cipher_key.get(), &nonce);
-    cml_sponge::absorb_aad(&mut sponge, &header);
+    let mut sponge = init_aead_sponge(cipher_key.get(), &nonce, &header);
 
     // Stream encrypt (0.35 → 0.85).
     let mut buf = vec![0u8; STREAM_CHUNK];
@@ -863,8 +904,11 @@ pub fn decrypt_stream<R: Read + Seek, W: Write>(
     )?;
     report(progress, 0.35);
 
-    let mut sponge = cml_sponge::cipher_init(cipher_key.get(), &stream_header.prefix.nonce);
-    cml_sponge::absorb_aad(&mut sponge, &stream_header.header_bytes);
+    let mut sponge = init_aead_sponge(
+        cipher_key.get(),
+        &stream_header.prefix.nonce,
+        &stream_header.header_bytes,
+    );
 
     // Stream decrypt (0.40 → 0.85).
     let no_compress = (stream_header.prefix.flags & FLAG_NO_COMPRESS) != 0;
@@ -929,27 +973,19 @@ fn decrypt_v9(
     progress: &Option<&ProgressFn>,
 ) -> Result<(Vec<u8>, String), CryptoError> {
     // Init sponge and absorb header as AAD — must match encryption exactly.
-    let mut sponge = cml_sponge::cipher_init(cipher_key.get(), nonce);
-    cml_sponge::absorb_aad(&mut sponge, header);
+    let mut sponge = init_aead_sponge(cipher_key.get(), nonce, header);
 
     // Phase 3: Stream decrypt (0.40 → 0.85)
     let mut decrypted = encrypted.to_vec();
-    let mut scratch = Vec::with_capacity(STREAM_CHUNK * 2);
-
-    let total_len = decrypted.len();
-    if total_len > 0 {
-        let mut offset = 0;
-        while offset < total_len {
-            let end = (offset + STREAM_CHUNK).min(total_len);
-            cml_sponge::aead_decrypt_chunk(&mut sponge, &mut decrypted[offset..end], &mut scratch);
-            offset = end;
-            if progress.is_some() {
-                let frac = offset as f32 / total_len as f32;
-                report(progress, 0.40 + frac * 0.45);
-            }
-        }
-    }
-    scratch.zeroize();
+    aead_process_in_place(
+        &mut sponge,
+        &mut decrypted,
+        cml_sponge::aead_decrypt_chunk,
+        STREAM_CHUNK * 2,
+        progress,
+        0.40,
+        0.45,
+    );
     report(progress, 0.85);
 
     // Verify authentication tag (constant-time).

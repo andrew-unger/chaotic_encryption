@@ -9,6 +9,12 @@ use crate::error::CryptoError;
 /// Archive extension used to identify encrypted archives on decryption.
 pub const ARCHIVE_EXTENSION: &str = "catwalkarchive";
 
+/// Extract the lossy filename component of `path` if any.  Drops directory
+/// components and returns `None` only when the path has no terminal name.
+fn lossy_file_name(path: &Path) -> Option<String> {
+    path.file_name().map(|n| n.to_string_lossy().into_owned())
+}
+
 /// Create an in-memory ZIP archive from the given files.
 ///
 /// Each file is stored with its filename only (no directory structure).
@@ -19,10 +25,7 @@ pub fn create_archive(files: &[PathBuf]) -> Result<Vec<u8>, CryptoError> {
         .compression_method(zip::CompressionMethod::Deflated);
 
     for path in files {
-        let name = path
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| "unknown".into());
+        let name = lossy_file_name(path).unwrap_or_else(|| "unknown".into());
         zip.start_file(&name, options)
             .map_err(|e| CryptoError::ArchiveError(format!("Failed to add {}: {}", name, e)))?;
         let data = fs::read(path)?;
@@ -57,10 +60,7 @@ pub fn extract_archive(data: &[u8], output_dir: &Path) -> Result<usize, CryptoEr
             .by_index(i)
             .map_err(|e| CryptoError::ArchiveError(format!("Archive error: {}", e)))?;
         let raw_name = file.name().to_string();
-        let safe_name = Path::new(&raw_name)
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_default();
+        let safe_name = lossy_file_name(Path::new(&raw_name)).unwrap_or_default();
         if safe_name.is_empty() || safe_name.contains("..") {
             continue;
         }
