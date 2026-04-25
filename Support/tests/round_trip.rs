@@ -252,6 +252,42 @@ fn weak_kdf_params_rejected() {
 }
 
 #[test]
+fn weak_kdf_t_cost_rejected() {
+    // m_log2 OK, but t_cost = 1 — below minimum of 2.
+    let mut data = vec![0u8; MIN_HEADER_LEN + 10];
+    data[0..4].copy_from_slice(b"CATW");
+    data[4] = 9;
+    data[5] = 0;
+    data[46] = 18; // m_log2 = 18 (default) — meets minimum
+    data[47] = 1; // t_cost = 1 — below minimum of 2
+    data[48] = 1;
+    let result = decrypt(&data, "password", None, None);
+    assert!(
+        matches!(result, Err(CryptoError::WeakKdfParameters)),
+        "expected WeakKdfParameters for t_cost = 1, got {:?}",
+        result.err()
+    );
+}
+
+#[test]
+fn weak_kdf_m_log2_15_rejected() {
+    // m_log2 = 15 (32 MB) — exactly one below the floor of 16.
+    let mut data = vec![0u8; MIN_HEADER_LEN + 10];
+    data[0..4].copy_from_slice(b"CATW");
+    data[4] = 9;
+    data[5] = 0;
+    data[46] = 15;
+    data[47] = 4;
+    data[48] = 1;
+    let result = decrypt(&data, "password", None, None);
+    assert!(
+        matches!(result, Err(CryptoError::WeakKdfParameters)),
+        "expected WeakKdfParameters for m_log2 = 15, got {:?}",
+        result.err()
+    );
+}
+
+#[test]
 fn tampered_tag_fails() {
     let plaintext = b"tag tamper test";
     let password = "tag_tamper_pass";
@@ -519,6 +555,100 @@ fn stream_tampered_tag_fails() {
         "expected IntegrityCheckFailed, got {:?}",
         result.err()
     );
+}
+
+// ── Chunk-boundary round-trip tests ───────────────────────────────────────────
+//
+// Streaming AEAD processes the payload in 64 KiB chunks (`STREAM_CHUNK_SIZE` in
+// crypto.rs).  Off-by-one bugs in chunk handling typically show up at sizes
+// equal to N × 65 536 ± 1.  These tests pin the cipher's behavior at those
+// exact boundaries for both the in-memory and streaming APIs.
+
+const CHUNK_BOUNDARY_SIZES: &[usize] = &[65_535, 65_536, 65_537, 131_071, 131_072, 131_073];
+
+fn pattern(len: usize) -> Vec<u8> {
+    (0..len)
+        .map(|i| (i as u8).wrapping_mul(31).wrapping_add(7))
+        .collect()
+}
+
+#[test]
+fn chunk_boundary_round_trip_in_memory() {
+    let password = "chunk-boundary-tests-pw!";
+    let opts = EncryptOptions {
+        strip_metadata: false,
+        skip_compression: true, // disable compression so payload size is preserved
+    };
+
+    for &size in CHUNK_BOUNDARY_SIZES {
+        let plaintext = pattern(size);
+        let encrypted = encrypt(&plaintext, password, "boundary.bin", &opts, None, None)
+            .unwrap_or_else(|e| panic!("encrypt({size}) failed: {e:?}"));
+        let (decrypted, ext) = decrypt(&encrypted, password, None, None)
+            .unwrap_or_else(|e| panic!("decrypt({size}) failed: {e:?}"));
+
+        assert_eq!(decrypted.len(), size, "size mismatch at boundary {size}");
+        assert_eq!(decrypted, plaintext, "payload mismatch at boundary {size}");
+        assert_eq!(ext, "bin");
+    }
+}
+
+#[test]
+fn chunk_boundary_round_trip_streaming() {
+    let password = "chunk-boundary-stream-pw!";
+    let opts = EncryptOptions {
+        strip_metadata: false,
+        skip_compression: true,
+    };
+
+    for &size in CHUNK_BOUNDARY_SIZES {
+        let plaintext = pattern(size);
+
+        let mut input = Cursor::new(plaintext.clone());
+        let mut encrypted = Cursor::new(Vec::new());
+        encrypt_stream(
+            &mut input,
+            &mut encrypted,
+            password,
+            "boundary.bin",
+            &opts,
+            None,
+            None,
+            Some(size as u64),
+        )
+        .unwrap_or_else(|e| panic!("encrypt_stream({size}) failed: {e:?}"));
+
+        encrypted.set_position(0);
+        let mut output = Vec::new();
+        let ext = decrypt_stream(&mut encrypted, &mut output, password, None, None)
+            .unwrap_or_else(|e| panic!("decrypt_stream({size}) failed: {e:?}"));
+
+        assert_eq!(
+            output.len(),
+            size,
+            "stream size mismatch at boundary {size}"
+        );
+        assert_eq!(
+            output, plaintext,
+            "stream payload mismatch at boundary {size}"
+        );
+        assert_eq!(ext, "bin");
+    }
+}
+
+#[test]
+fn one_byte_round_trip() {
+    // Smallest possible non-empty payload — confirms zero-vs-one branching.
+    let password = "one-byte-test-pw!!";
+    let opts = EncryptOptions {
+        strip_metadata: false,
+        skip_compression: true,
+    };
+    let encrypted =
+        encrypt(b"\xA5", password, "one.bin", &opts, None, None).expect("encrypt failed");
+    let (decrypted, ext) = decrypt(&encrypted, password, None, None).expect("decrypt failed");
+    assert_eq!(decrypted, b"\xA5");
+    assert_eq!(ext, "bin");
 }
 
 // ── Edge case tests ───────────────────────────────────────────────────────────

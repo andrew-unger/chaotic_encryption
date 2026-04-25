@@ -210,7 +210,86 @@ fn different_keyfiles_produce_different_ciphertext() {
     let _ = fs::remove_file(kf_b);
 }
 
-// ── Test 8 — EntropyPool derives deterministically from same inputs ───────────
+// ── Test 8 — keyfile size edge cases ──────────────────────────────────────────
+
+#[test]
+fn one_byte_keyfile_round_trip() {
+    // Smallest non-empty keyfile.  Confirms there's no off-by-one in the
+    // keyfile-mixing path that would reject single-byte inputs.
+    let plaintext = b"single-byte keyfile payload";
+    let password = "correcthorsebattery";
+    let keyfile = write_tmp("kf_one.key", b"\x42");
+
+    let encrypted = encrypt(plaintext, password, "x.bin", &OPTS, Some(&keyfile), None)
+        .expect("encryption with 1-byte keyfile must succeed");
+    let (decrypted, _) = decrypt(&encrypted, password, Some(&keyfile), None)
+        .expect("decryption with same 1-byte keyfile must succeed");
+
+    assert_eq!(decrypted, plaintext);
+
+    let _ = fs::remove_file(keyfile);
+}
+
+#[test]
+fn empty_keyfile_behavior() {
+    // Pin current behavior for an empty keyfile.  Whether encrypt accepts
+    // it or rejects it, the high-level API must not panic.  If it succeeds,
+    // round-trip with the same empty keyfile must work.
+    let plaintext = b"empty keyfile payload";
+    let password = "correcthorsebattery";
+    let keyfile = write_tmp("kf_empty.key", b"");
+
+    let result = encrypt(plaintext, password, "x.bin", &OPTS, Some(&keyfile), None);
+    if let Ok(encrypted) = result {
+        let (decrypted, _) = decrypt(&encrypted, password, Some(&keyfile), None)
+            .expect("decryption with empty keyfile must succeed when encryption did");
+        assert_eq!(decrypted, plaintext);
+    }
+    // The other branch — error — is also acceptable; we just require no panic.
+
+    let _ = fs::remove_file(keyfile);
+}
+
+#[test]
+fn random_keyfiles_pairwise_distinct_ciphertexts() {
+    // Encrypt the same plaintext + password under 4 distinct random keyfiles
+    // and assert all ciphertexts are pairwise distinct.  Random salt/nonce
+    // would already make them differ; this test is meaningful because it
+    // exercises 4 fresh KDF runs through the keyfile-mixing path.
+    use rand::RngCore;
+
+    let plaintext = b"pairwise-distinct keyfile property";
+    let password = "correcthorsebattery";
+
+    let mut rng = rand::thread_rng();
+    let mut keyfile_paths = Vec::new();
+    let mut ciphertexts = Vec::new();
+
+    for i in 0..4 {
+        let mut bytes = vec![0u8; 64];
+        rng.fill_bytes(&mut bytes);
+        let path = write_tmp(&format!("kf_rand{i}.key"), &bytes);
+        let ct = encrypt(plaintext, password, "x.bin", &OPTS, Some(&path), None)
+            .expect("encryption with random keyfile must succeed");
+        ciphertexts.push(ct);
+        keyfile_paths.push(path);
+    }
+
+    for i in 0..ciphertexts.len() {
+        for j in (i + 1)..ciphertexts.len() {
+            assert_ne!(
+                ciphertexts[i], ciphertexts[j],
+                "ciphertexts under random keyfiles {i} and {j} collided"
+            );
+        }
+    }
+
+    for path in keyfile_paths {
+        let _ = fs::remove_file(path);
+    }
+}
+
+// ── Test 9 — EntropyPool derives deterministically from same inputs ───────────
 // This lives here (not in gui.rs) because EntropyPool is a pure data structure
 // and its derive_keyfile() output must be deterministic for a fixed pool state.
 // We test it by directly exercising the BLAKE3 derivation logic.
