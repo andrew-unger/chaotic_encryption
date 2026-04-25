@@ -6,7 +6,7 @@ use eframe::egui;
 use catwalk::archive::ARCHIVE_EXTENSION;
 use catwalk::utils::format_byte_size;
 
-use super::state::{BatchFileEntry, CatwalkGui, Mode};
+use super::state::{fd, path_to_string, BatchFileEntry, CatwalkGui, Mode};
 use super::{
     action_button, chrome_panel_frame, file_row, mode_toggle, section_frame, ACCENT, ACCENT_DIM,
     ERROR, H_MARGIN, MUTED, SUCCESS, SURFACE,
@@ -335,11 +335,10 @@ impl CatwalkGui {
         section_frame(ui, "OUTPUT ARCHIVE", |ui| {
             let hint = format!("Output .{} file...", ARCHIVE_EXTENSION);
             if file_row(ui, &mut self.batch_output_path, &hint, "Browse") {
-                let dialog = rfd::FileDialog::new()
-                    .set_title("Save Encrypted Archive")
+                let dialog = fd("Save Encrypted Archive")
                     .add_filter("CATWALK Archive", &[ARCHIVE_EXTENSION]);
                 if let Some(path) = dialog.save_file() {
-                    self.batch_output_path = path.to_string_lossy().to_string();
+                    self.batch_output_path = path_to_string(&path);
                 }
             }
         });
@@ -384,14 +383,12 @@ impl CatwalkGui {
             match super::operations::show_file_info(&PathBuf::from(&self.input_path)) {
                 Ok(info) => {
                     self.file_info_text = info;
-                    self.status_message = "File info retrieved.".into();
-                    self.status_is_error = false;
+                    self.set_status("File info retrieved.", false);
                     self.progress = 1.0;
                 }
                 Err(e) => {
                     self.file_info_text.clear();
-                    self.status_message = format!("Error: {}", e);
-                    self.status_is_error = true;
+                    self.set_status(format!("Error: {}", e), true);
                     self.progress = 0.0;
                 }
             }
@@ -437,18 +434,16 @@ impl CatwalkGui {
                         } else {
                             path.parent().unwrap_or(path)
                         };
-                        self.batch_output_path = dir
-                            .join(format!("archive.{}", ARCHIVE_EXTENSION))
-                            .to_string_lossy()
-                            .to_string();
+                        self.batch_output_path =
+                            path_to_string(&dir.join(format!("archive.{}", ARCHIVE_EXTENSION)));
                     }
                 }
             }
         } else if let Some(first) = dropped.first() {
             if let Some(path) = &first.path {
                 self.auto_detect_mode(path);
-                self.input_path = path.to_string_lossy().to_string();
-                self.output_path = self.compute_output_path(path).to_string_lossy().to_string();
+                self.input_path = path_to_string(path);
+                self.output_path = path_to_string(&self.compute_output_path(path));
             }
         }
     }

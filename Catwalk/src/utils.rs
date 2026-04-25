@@ -7,17 +7,16 @@ use std::io::{Read, Write};
 use std::path::Path;
 
 const MAX_DECOMPRESSED_SIZE: u64 = 4 * 1024 * 1024 * 1024; // 4 GB
+const DECOMPRESS_BUF: usize = 64 * 1024;
 
 /// Compress data using zstd (level 1 — fast, good ratio).
 pub fn compress_data(data: &[u8]) -> Result<Vec<u8>, CryptoError> {
     zstd::encode_all(data, 1).map_err(CryptoError::IoError)
 }
 
-/// Decompress zstd-compressed data with a 4 GB size limit.
-pub fn decompress_data(data: &[u8]) -> Result<Vec<u8>, CryptoError> {
-    let mut decoder = zstd::Decoder::new(data).map_err(CryptoError::IoError)?;
+fn read_all_capped<R: Read>(mut decoder: R) -> Result<Vec<u8>, CryptoError> {
     let mut decompressed = Vec::new();
-    let mut buf = [0u8; 65536];
+    let mut buf = [0u8; DECOMPRESS_BUF];
     loop {
         let n = decoder.read(&mut buf)?;
         if n == 0 {
@@ -31,22 +30,15 @@ pub fn decompress_data(data: &[u8]) -> Result<Vec<u8>, CryptoError> {
     Ok(decompressed)
 }
 
+/// Decompress zstd-compressed data with a 4 GB size limit.
+pub fn decompress_data(data: &[u8]) -> Result<Vec<u8>, CryptoError> {
+    let decoder = zstd::Decoder::new(data).map_err(CryptoError::IoError)?;
+    read_all_capped(decoder)
+}
+
 /// Decompress zlib-compressed data (backward compat for pre-zstd files).
 pub fn decompress_data_zlib(data: &[u8]) -> Result<Vec<u8>, CryptoError> {
-    let mut decoder = ZlibDecoder::new(data);
-    let mut decompressed = Vec::new();
-    let mut buf = [0u8; 65536];
-    loop {
-        let n = decoder.read(&mut buf)?;
-        if n == 0 {
-            break;
-        }
-        if decompressed.len() as u64 + n as u64 > MAX_DECOMPRESSED_SIZE {
-            return Err(CryptoError::DecompressionTooLarge);
-        }
-        decompressed.extend_from_slice(&buf[..n]);
-    }
-    Ok(decompressed)
+    read_all_capped(ZlibDecoder::new(data))
 }
 
 // ── File Info ────────────────────────────────────────────────────────────────

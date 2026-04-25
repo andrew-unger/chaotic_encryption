@@ -1,9 +1,23 @@
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::time::Instant;
 
 use super::entropy::EntropyPool;
+
+// ── Small UI helpers shared across the gui module ────────────────────────────
+
+/// Lossy `Path` → owned `String`.  Centralizes the `to_string_lossy().to_string()`
+/// idiom that appears throughout the GUI for filling in path-text fields.
+pub(super) fn path_to_string(p: &Path) -> String {
+    p.to_string_lossy().into_owned()
+}
+
+/// Build a `rfd::FileDialog` pre-titled — a tiny convenience over the bare
+/// `rfd::FileDialog::new().set_title(...)` pair used by every dialog opener.
+pub(super) fn fd(title: &str) -> rfd::FileDialog {
+    rfd::FileDialog::new().set_title(title)
+}
 
 // ── Recent files config ──────────────────────────────────────────────────────
 
@@ -139,6 +153,15 @@ pub struct CatwalkGui {
     pub(super) entropy_pool: EntropyPool,
     /// Frame counter — increments every frame while the dialog is open.
     pub(super) entropy_counter: u64,
+}
+
+impl CatwalkGui {
+    /// Update the status line and the error flag together.  Replaces the
+    /// recurring `self.status_message = …; self.status_is_error = …;` pair.
+    pub(super) fn set_status(&mut self, msg: impl Into<String>, is_error: bool) {
+        self.status_message = msg.into();
+        self.status_is_error = is_error;
+    }
 }
 
 impl Default for CatwalkGui {

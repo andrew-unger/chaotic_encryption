@@ -14,7 +14,9 @@ use catwalk::crypto::{decrypt, encrypt, validate_password, EncryptOptions, Progr
 use catwalk::error::CryptoError;
 use catwalk::utils::parse_file_info;
 
-use super::state::{add_to_recent, BatchFileEntry, CatwalkGui, Mode, WorkerMessage};
+use super::state::{
+    add_to_recent, fd, path_to_string, BatchFileEntry, CatwalkGui, Mode, WorkerMessage,
+};
 
 impl CatwalkGui {
     // ── Keyfile helpers ──────────────────────────────────────────────────────
@@ -45,40 +47,31 @@ impl CatwalkGui {
     // ── File Browsing ───────────────────────────────────────────────────────────
 
     pub(super) fn browse_input(&mut self) {
-        let dialog = rfd::FileDialog::new()
-            .set_title("Select Input File")
+        let dialog = fd("Select Input File")
             .add_filter("All Files", &["*"])
             .add_filter("CATWALK Encrypted", &["catwalk"]);
         if let Some(path) = dialog.pick_file() {
             self.auto_detect_mode(&path);
-            self.input_path = path.to_string_lossy().to_string();
-            self.output_path = self
-                .compute_output_path(&path)
-                .to_string_lossy()
-                .to_string();
+            self.input_path = path_to_string(&path);
+            self.output_path = path_to_string(&self.compute_output_path(&path));
         }
     }
 
     pub(super) fn browse_output(&mut self) {
-        let dialog = rfd::FileDialog::new().set_title("Select Output File");
-        if let Some(path) = dialog.save_file() {
-            self.output_path = path.to_string_lossy().to_string();
+        if let Some(path) = fd("Select Output File").save_file() {
+            self.output_path = path_to_string(&path);
         }
     }
 
     pub(super) fn browse_batch_files(&mut self) {
-        let dialog = rfd::FileDialog::new()
-            .set_title("Select Files")
-            .add_filter("All Files", &["*"]);
+        let dialog = fd("Select Files").add_filter("All Files", &["*"]);
         if let Some(paths) = dialog.pick_files() {
             for path in paths {
                 let size = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
                 if self.batch_output_path.is_empty() {
                     if let Some(dir) = path.parent() {
-                        self.batch_output_path = dir
-                            .join(format!("archive.{}", ARCHIVE_EXTENSION))
-                            .to_string_lossy()
-                            .to_string();
+                        self.batch_output_path =
+                            path_to_string(&dir.join(format!("archive.{}", ARCHIVE_EXTENSION)));
                     }
                 }
                 self.batch_files.push(BatchFileEntry { path, size });
@@ -87,14 +80,11 @@ impl CatwalkGui {
     }
 
     pub(super) fn browse_batch_folder(&mut self) {
-        let dialog = rfd::FileDialog::new().set_title("Select Folder to Archive");
-        if let Some(dir) = dialog.pick_folder() {
+        if let Some(dir) = fd("Select Folder to Archive").pick_folder() {
             self.add_folder_contents(&dir);
             if self.batch_output_path.is_empty() {
-                self.batch_output_path = dir
-                    .join(format!("archive.{}", ARCHIVE_EXTENSION))
-                    .to_string_lossy()
-                    .to_string();
+                self.batch_output_path =
+                    path_to_string(&dir.join(format!("archive.{}", ARCHIVE_EXTENSION)));
             }
         }
     }
@@ -195,8 +185,7 @@ impl CatwalkGui {
         self.worker_rx = Some(rx);
         self.processing = true;
         self.progress = 0.0;
-        self.status_message = "Processing...".into();
-        self.status_is_error = false;
+        self.set_status("Processing...", false);
         self.file_info_text.clear();
         self.operation_start = Some(Instant::now());
 
@@ -272,8 +261,7 @@ impl CatwalkGui {
         self.worker_rx = Some(rx);
         self.processing = true;
         self.progress = 0.0;
-        self.status_message = "Creating archive...".into();
-        self.status_is_error = false;
+        self.set_status("Creating archive...", false);
         self.operation_start = Some(Instant::now());
 
         let files: Vec<PathBuf> = self.batch_files.iter().map(|e| e.path.clone()).collect();
@@ -319,6 +307,10 @@ impl CatwalkGui {
                     self.progress = v;
                 }
                 WorkerMessage::Complete(result) => match result {
+                    // Direct field assigns rather than self.set_status() —
+                    // the loop still holds an immutable borrow of
+                    // self.worker_rx via `rx`, so taking &mut self here
+                    // would conflict.
                     Ok(msg) => {
                         self.status_message = msg;
                         self.status_is_error = false;

@@ -9,6 +9,8 @@ use catwalk::error::CryptoError;
 use std::fs;
 use std::path::PathBuf;
 
+mod common;
+
 const OPTS: EncryptOptions = EncryptOptions {
     strip_metadata: false,
     skip_compression: true,
@@ -17,13 +19,11 @@ const OPTS: EncryptOptions = EncryptOptions {
 // ── helpers ──────────────────────────────────────────────────────────────────
 
 fn tmp_path(name: &str) -> PathBuf {
-    std::env::temp_dir().join(format!("catwalk_kftest_{}", name))
+    common::tmp_path("kftest", name)
 }
 
 fn write_tmp(name: &str, data: &[u8]) -> PathBuf {
-    let p = tmp_path(name);
-    fs::write(&p, data).expect("write tmp file");
-    p
+    common::write_tmp("kftest", name, data)
 }
 
 // ── Test 1 — keyfile round-trip ───────────────────────────────────────────────

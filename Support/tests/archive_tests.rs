@@ -12,22 +12,23 @@
 //   - Count returned by extract_archive equals number of files
 
 #[cfg(feature = "archive")]
+#[path = "common/mod.rs"]
+mod common;
+
+#[cfg(feature = "archive")]
 mod archive {
     use catwalk::archive::{create_archive, extract_archive};
     use std::fs;
     use std::path::{Path, PathBuf};
 
+    use super::common;
+
     fn tmp_dir(name: &str) -> PathBuf {
-        let p = std::env::temp_dir().join(format!("catwalk_archtest_{}", name));
-        let _ = fs::remove_dir_all(&p);
-        fs::create_dir_all(&p).expect("create tmp dir");
-        p
+        common::tmp_dir("archtest", name)
     }
 
     fn write_file(dir: &Path, name: &str, content: &[u8]) -> PathBuf {
-        let p = dir.join(name);
-        fs::write(&p, content).expect("write test file");
-        p
+        common::write_file(dir, name, content)
     }
 
     // ── Happy path: create then extract ───────────────────────────────────────
