@@ -1,0 +1,27 @@
+CATWALK — All Rights Reserved
+
+Copyright (c) 2026 Andrew Unger
+All rights reserved.
+
+This source code, the accompanying documentation, the research paper, and any
+binaries or test vectors derived from this repository (collectively, the
+"Software") are made available for personal study, academic review, and
+non-commercial cryptographic research only.
+
+No license, express or implied, is granted to copy, modify, merge, publish,
+distribute, sublicense, or sell the Software or any derivative work, in source
+or binary form, in whole or in part, except as expressly authorized in writing
+by the copyright holder.
+
+For licensing inquiries, contact: ungerandrew2@gmail.com
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE, AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+COPYRIGHT HOLDER BE LIABLE FOR ANY CLAIM, DAMAGES, OR OTHER LIABILITY ARISING
+FROM, OUT OF, OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
+IN THE SOFTWARE.
+
+CATWALK is research-grade cryptographic software. It has not undergone formal
+review and must not be used to protect production data or any information of
+real consequence.
