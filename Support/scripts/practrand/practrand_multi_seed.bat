@@ -7,16 +7,23 @@ REM   - cargo build --release (catwalk keystream_dump binary)
 REM   - PractRand RNG_test.exe compiled and on PATH or set PRACTRAND below
 REM
 REM Usage:
-REM   tools\practrand_multi_seed.bat
+REM   Support\scripts\practrand\practrand_multi_seed.bat
+REM (Run from the repo root.)
 
 setlocal enabledelayedexpansion
 
+REM ── Resolve repo root from this script's location ─────────────────────────
+REM   %~dp0 = ...\Support\scripts\practrand\
+REM   ..\..\..\ takes us up to the repo root.
+set "REPO_ROOT=%~dp0..\..\.."
+pushd "%REPO_ROOT%"
+
 REM ── Configuration ──────────────────────────────────────────────────────────
-set "KEYSTREAM_DUMP=target\release\cml_keystream_dump.exe"
+set "KEYSTREAM_DUMP=Catwalk\target\release\cml_keystream_dump.exe"
 set "PRACTRAND=C:\Users\Unger\Documents\Code\PractRand\build\RNG_test.exe"
 set "MAX_LENGTH=16GB"
 set "SEED_COUNT=10"
-set "LOG_DIR=tools\practrand_logs"
+set "LOG_DIR=Support\practrand_logs"
 
 REM ── Verify binaries exist ──────────────────────────────────────────────────
 if not exist "%KEYSTREAM_DUMP%" (
@@ -62,9 +69,11 @@ echo ============================================================
 
 if !FAIL! gtr 0 (
     echo OVERALL: FAIL
+    popd
     exit /b 1
 ) else (
     echo OVERALL: PASS
+    popd
     exit /b 0
 )
 

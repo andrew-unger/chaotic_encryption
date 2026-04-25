@@ -247,6 +247,258 @@ fn derive_cipher_key_v9(master_key: &[u8; 32]) -> [u8; 32] {
     blake3::derive_key("catwalk.v9.cipher", master_key)
 }
 
+/// Length in bytes of the fixed-size v9 header preamble (everything before
+/// the variable-length extension field): magic + version + flags + salt +
+/// timestamp + nonce + argon-params(3) + ext_len.
+const FIXED_HEADER_LEN: usize = 4 + 1 + 1 + SALT_LEN + TIMESTAMP_LEN + NONCE_LEN + 3 + 1;
+
+// ── Header & KDF Helpers ─────────────────────────────────────────────────────
+
+/// Encryption-time metadata derived from `EncryptOptions`: the serialized
+/// timestamp, the file extension bytes, and the assembled flags byte.
+struct EncryptMeta {
+    timestamp: [u8; TIMESTAMP_LEN],
+    extension: Vec<u8>,
+    flags: u8,
+}
+
+/// Compute timestamp/extension/flags for a new ciphertext given the options.
+fn compute_encrypt_meta(
+    options: &EncryptOptions,
+    input_filename: &str,
+    has_keyfile: bool,
+) -> Result<EncryptMeta, CryptoError> {
+    let timestamp = if options.strip_metadata {
+        [0u8; TIMESTAMP_LEN]
+    } else {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| CryptoError::SystemTimeError)?
+            .as_secs()
+            .to_le_bytes()
+    };
+
+    let extension = if options.strip_metadata {
+        Vec::new()
+    } else {
+        Path::new(input_filename)
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .unwrap_or("")
+            .as_bytes()
+            .to_vec()
+    };
+    if extension.len() > u8::MAX as usize {
+        return Err(CryptoError::ExtensionTooLong);
+    }
+
+    let mut flags: u8 = 0;
+    if options.strip_metadata {
+        flags |= FLAG_STRIP_METADATA;
+    }
+    if options.skip_compression {
+        flags |= FLAG_NO_COMPRESS;
+    }
+    if has_keyfile {
+        flags |= FLAG_KEYFILE;
+    }
+    if !options.skip_compression {
+        // New files always use zstd when compression is enabled.
+        flags |= FLAG_ZSTD;
+    }
+
+    Ok(EncryptMeta {
+        timestamp,
+        extension,
+        flags,
+    })
+}
+
+/// Serialize the v9 header bytes (which double as AEAD associated data).
+#[allow(clippy::too_many_arguments)]
+fn build_v9_header(
+    flags: u8,
+    salt: &[u8; SALT_LEN],
+    timestamp: &[u8; TIMESTAMP_LEN],
+    nonce: &[u8; NONCE_LEN],
+    m_log2: u8,
+    t_cost: u8,
+    p_cost: u8,
+    extension: &[u8],
+) -> Vec<u8> {
+    let mut header = Vec::with_capacity(FIXED_HEADER_LEN + extension.len());
+    header.extend_from_slice(MAGIC);
+    header.push(VERSION);
+    header.push(flags);
+    header.extend_from_slice(salt);
+    header.extend_from_slice(timestamp);
+    header.extend_from_slice(nonce);
+    header.push(m_log2);
+    header.push(t_cost);
+    header.push(p_cost);
+    header.push(extension.len() as u8);
+    header.extend_from_slice(extension);
+    header
+}
+
+/// Parsed fixed-size prefix of a v9 header.  Validates magic, version, and
+/// rejects below-floor Argon2id parameters.  Does not read the variable-length
+/// extension bytes — `ext_len` is returned so the caller can read them next.
+struct V9HeaderPrefix {
+    flags: u8,
+    salt: [u8; SALT_LEN],
+    timestamp: [u8; TIMESTAMP_LEN],
+    nonce: [u8; NONCE_LEN],
+    m_log2: u8,
+    t_cost: u8,
+    p_cost: u8,
+    ext_len: usize,
+}
+
+fn parse_v9_header_prefix(buf: &[u8]) -> Result<V9HeaderPrefix, CryptoError> {
+    if buf.len() < FIXED_HEADER_LEN {
+        return Err(CryptoError::InvalidCiphertextLength);
+    }
+    if &buf[..4] != MAGIC {
+        return Err(CryptoError::InvalidMagicBytes);
+    }
+    if buf[4] != VERSION {
+        return Err(CryptoError::InvalidVersion);
+    }
+
+    let flags = buf[FLAGS_OFFSET];
+    let salt_start = 6;
+    let ts_start = salt_start + SALT_LEN;
+    let nonce_start = ts_start + TIMESTAMP_LEN;
+    let argon_start = nonce_start + NONCE_LEN;
+    let ext_len_pos = argon_start + 3;
+
+    let mut salt = [0u8; SALT_LEN];
+    salt.copy_from_slice(&buf[salt_start..ts_start]);
+    let mut timestamp = [0u8; TIMESTAMP_LEN];
+    timestamp.copy_from_slice(&buf[ts_start..nonce_start]);
+    let mut nonce = [0u8; NONCE_LEN];
+    nonce.copy_from_slice(&buf[nonce_start..argon_start]);
+
+    let m_log2 = buf[argon_start];
+    let t_cost = buf[argon_start + 1];
+    let p_cost = buf[argon_start + 2];
+
+    // Reject downgraded Argon2 parameters before doing any expensive KDF
+    // work (timing-oracle defence).
+    if m_log2 < ARGON2_M_LOG2_MIN || t_cost < ARGON2_T_COST_MIN || p_cost < ARGON2_P_COST_MIN {
+        return Err(CryptoError::WeakKdfParameters);
+    }
+
+    let ext_len = buf[ext_len_pos] as usize;
+
+    Ok(V9HeaderPrefix {
+        flags,
+        salt,
+        timestamp,
+        nonce,
+        m_log2,
+        t_cost,
+        p_cost,
+        ext_len,
+    })
+}
+
+/// Validate keyfile usage against the header flag.  When `FLAG_KEYFILE` is
+/// set, a keyfile path is required; when unset, any supplied keyfile is
+/// silently ignored — the flag in the header is authoritative.
+fn resolve_keyfile(flags: u8, supplied: Option<&Path>) -> Result<Option<&Path>, CryptoError> {
+    if (flags & FLAG_KEYFILE) != 0 {
+        match supplied {
+            Some(p) => Ok(Some(p)),
+            None => Err(CryptoError::KeyfileRequired),
+        }
+    } else {
+        Ok(None)
+    }
+}
+
+/// Parsed v9 header from a seekable stream, with the stored tag already
+/// fetched.  After this returns the reader's position is at the start of
+/// the ciphertext body.
+struct V9StreamHeader {
+    prefix: V9HeaderPrefix,
+    /// Full header bytes (fixed prefix + extension) — used as AEAD AAD.
+    header_bytes: Vec<u8>,
+    stored_tag: [u8; HASH_LEN],
+    cipher_len: usize,
+    /// UTF-8 decoded extension string (or "???" on invalid bytes).
+    extension_str: String,
+}
+
+/// Read and validate the v9 header from a seekable reader, then read the
+/// 32-byte authentication tag from the end of the file.  Leaves the reader
+/// positioned at the start of the ciphertext body.
+fn read_v9_stream_header<R: Read + Seek>(reader: &mut R) -> Result<V9StreamHeader, CryptoError> {
+    let file_size = reader.seek(SeekFrom::End(0))? as usize;
+    reader.seek(SeekFrom::Start(0))?;
+    if file_size < MIN_HEADER_LEN {
+        return Err(CryptoError::InvalidCiphertextLength);
+    }
+
+    let mut fixed = vec![0u8; FIXED_HEADER_LEN];
+    reader.read_exact(&mut fixed)?;
+    let prefix = parse_v9_header_prefix(&fixed)?;
+
+    let mut ext_bytes = vec![0u8; prefix.ext_len];
+    if prefix.ext_len > 0 {
+        reader.read_exact(&mut ext_bytes)?;
+    }
+
+    let header_len = FIXED_HEADER_LEN + prefix.ext_len;
+    if header_len + HASH_LEN > file_size {
+        return Err(CryptoError::InvalidCiphertextLength);
+    }
+    let cipher_len = file_size - header_len - HASH_LEN;
+
+    // Read the stored tag from the end of the file, then seek back.
+    let cipher_pos = reader.stream_position()?;
+    reader.seek(SeekFrom::Start((file_size - HASH_LEN) as u64))?;
+    let mut stored_tag = [0u8; HASH_LEN];
+    reader.read_exact(&mut stored_tag)?;
+    reader.seek(SeekFrom::Start(cipher_pos))?;
+
+    let mut header_bytes = Vec::with_capacity(header_len);
+    header_bytes.extend_from_slice(&fixed);
+    header_bytes.extend_from_slice(&ext_bytes);
+    let extension_str = String::from_utf8(ext_bytes).unwrap_or_else(|_| "???".to_string());
+
+    Ok(V9StreamHeader {
+        prefix,
+        header_bytes,
+        stored_tag,
+        cipher_len,
+        extension_str,
+    })
+}
+
+/// Derive the per-session cipher key for one ciphertext: build the KDF input,
+/// run Argon2id to obtain the master key, then BLAKE3-domain-derive the
+/// v9 cipher key.  The intermediate master key lives only inside this
+/// function and is zeroized when its `LockedBuffer` drops.
+fn derive_session_cipher_key(
+    password: &str,
+    keyfile_path: Option<&Path>,
+    salt: &[u8],
+    timestamp: &[u8],
+    m_log2: u8,
+    t_cost: u8,
+    p_cost: u8,
+) -> Result<LockedBuffer, CryptoError> {
+    let mut kdf_input = build_kdf_input(password, keyfile_path)?;
+    let master_key = LockedBuffer::new(derive_key(
+        &kdf_input, salt, timestamp, m_log2, t_cost, p_cost,
+    )?);
+    kdf_input.zeroize();
+    let cipher_key = LockedBuffer::new(derive_cipher_key_v9(master_key.get()));
+    Ok(cipher_key)
+}
+
 // ── Password Validation ──────────────────────────────────────────────────────
 
 /// Validate that a password meets minimum complexity requirements.
@@ -307,88 +559,43 @@ pub fn encrypt(
     };
     report(progress, 0.05);
 
-    // Generate random salt and nonce.
     let mut salt = [0u8; SALT_LEN];
     rand::thread_rng().fill(&mut salt);
     let mut nonce = [0u8; NONCE_LEN];
     rand::thread_rng().fill(&mut nonce);
 
-    let timestamp = if options.strip_metadata {
-        [0u8; 8]
-    } else {
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_err(|_| CryptoError::SystemTimeError)?
-            .as_secs()
-            .to_le_bytes()
-    };
+    let meta = compute_encrypt_meta(options, input_filename, keyfile_path.is_some())?;
+    let (m_log2, t_cost, p_cost) = (ARGON2_M_LOG2, ARGON2_T_COST, ARGON2_P_COST);
 
-    let extension = if options.strip_metadata {
-        Vec::new()
-    } else {
-        Path::new(input_filename)
-            .extension()
-            .and_then(|ext| ext.to_str())
-            .unwrap_or("")
-            .as_bytes()
-            .to_vec()
-    };
-    if extension.len() > u8::MAX as usize {
-        return Err(CryptoError::ExtensionTooLong);
-    }
-    let ext_len = extension.len() as u8;
-
-    let mut flags: u8 = 0;
-    if options.strip_metadata {
-        flags |= FLAG_STRIP_METADATA;
-    }
-    if options.skip_compression {
-        flags |= FLAG_NO_COMPRESS;
-    }
-    if keyfile_path.is_some() {
-        flags |= FLAG_KEYFILE;
-    }
-    if !options.skip_compression {
-        flags |= FLAG_ZSTD;
-    } // new files use zstd
-
-    let m_log2 = ARGON2_M_LOG2;
-    let t_cost = ARGON2_T_COST;
-    let p_cost = ARGON2_P_COST;
-
-    // Phase 2: Build KDF input and run Argon2id (0.05 → 0.35)
-    let mut kdf_input = build_kdf_input(password, keyfile_path)?;
-    let master_key = LockedBuffer::new(derive_key(
-        &kdf_input, &salt, &timestamp, m_log2, t_cost, p_cost,
-    )?);
-    kdf_input.zeroize();
-    let cipher_key = LockedBuffer::new(derive_cipher_key_v9(master_key.get()));
+    // Phase 2: KDF (0.05 → 0.35)
+    let cipher_key = derive_session_cipher_key(
+        password,
+        keyfile_path,
+        &salt,
+        &meta.timestamp,
+        m_log2,
+        t_cost,
+        p_cost,
+    )?;
     report(progress, 0.35);
 
-    // Build header bytes — these become the AEAD associated data (authenticated
-    // but not encrypted).  Must be serialised before starting the sponge so
-    // we can absorb the exact bytes that will appear in the output.
-    let mut header = Vec::with_capacity(50 + extension.len());
-    header.extend_from_slice(MAGIC);
-    header.push(VERSION);
-    header.push(flags);
-    header.extend_from_slice(&salt);
-    header.extend_from_slice(&timestamp);
-    header.extend_from_slice(&nonce);
-    header.push(m_log2);
-    header.push(t_cost);
-    header.push(p_cost);
-    header.push(ext_len);
-    header.extend_from_slice(&extension);
+    let header = build_v9_header(
+        meta.flags,
+        &salt,
+        &meta.timestamp,
+        &nonce,
+        m_log2,
+        t_cost,
+        p_cost,
+        &meta.extension,
+    );
 
-    // Initialise CML-Sponge AEAD and absorb header as associated data.
     let mut sponge = cml_sponge::cipher_init(cipher_key.get(), &nonce);
     cml_sponge::absorb_aad(&mut sponge, &header);
 
     // Phase 3: Stream encrypt + authenticate (0.35 → 0.85)
     let mut ciphertext = data;
     let mut scratch = Vec::with_capacity(STREAM_CHUNK);
-
     let total_len = ciphertext.len();
     if total_len > 0 {
         let mut offset = 0;
@@ -407,12 +614,10 @@ pub fn encrypt(
 
     // Phase 4: Finalise tag + assemble output (0.85 → 0.90)
     let tag = cml_sponge::aead_finalize(&mut sponge);
-
     let mut result = Vec::with_capacity(header.len() + ciphertext.len() + HASH_LEN);
     result.extend_from_slice(&header);
     result.extend_from_slice(&ciphertext);
     result.extend_from_slice(&tag);
-
     report(progress, 0.90);
     Ok(result)
 }
@@ -448,63 +653,18 @@ pub fn decrypt(
     progress: Option<&ProgressFn>,
 ) -> Result<(Vec<u8>, String), CryptoError> {
     let progress = &progress;
-
     report(progress, 0.0);
 
     if ciphertext_bundle.len() < MIN_HEADER_LEN {
         return Err(CryptoError::InvalidCiphertextLength);
     }
 
-    // Parse header fields.
-    let magic = &ciphertext_bundle[..4];
-    if magic != MAGIC {
-        return Err(CryptoError::InvalidMagicBytes);
-    }
+    let prefix = parse_v9_header_prefix(ciphertext_bundle)?;
+    let effective_keyfile = resolve_keyfile(prefix.flags, keyfile_path)?;
 
-    let version = ciphertext_bundle[4];
-    if version != VERSION {
-        return Err(CryptoError::InvalidVersion);
-    }
-
-    let flags = ciphertext_bundle[FLAGS_OFFSET];
-
-    let salt_start = 6;
-    let ts_start = salt_start + SALT_LEN;
-    let nonce_start = ts_start + TIMESTAMP_LEN;
-    let argon_start = nonce_start + NONCE_LEN;
-    let ext_len_pos = argon_start + 3;
-
-    let salt = &ciphertext_bundle[salt_start..ts_start];
-    let timestamp = &ciphertext_bundle[ts_start..nonce_start];
-    let nonce_bytes = &ciphertext_bundle[nonce_start..argon_start];
-    let m_log2 = ciphertext_bundle[argon_start];
-    let t_cost = ciphertext_bundle[argon_start + 1];
-    let p_cost = ciphertext_bundle[argon_start + 2];
-
-    // Reject downgraded Argon2 parameters before running KDF (timing oracle defence).
-    if m_log2 < ARGON2_M_LOG2_MIN || t_cost < ARGON2_T_COST_MIN || p_cost < ARGON2_P_COST_MIN {
-        return Err(CryptoError::WeakKdfParameters);
-    }
-
-    // Enforce keyfile requirement before doing any expensive KDF work.
-    // If the flag is set but no keyfile was supplied, fail immediately.
-    // If no flag is set but a keyfile was supplied, silently ignore it —
-    // the flag in the header is authoritative.
-    let effective_keyfile = if (flags & FLAG_KEYFILE) != 0 {
-        match keyfile_path {
-            Some(p) => Some(p),
-            None => return Err(CryptoError::KeyfileRequired),
-        }
-    } else {
-        // File encrypted without a keyfile; ignore any keyfile supplied.
-        None
-    };
-
-    let ext_len = ciphertext_bundle[ext_len_pos] as usize;
-    let ext_start = ext_len_pos + 1;
-    let cipher_start = ext_start + ext_len;
+    let ext_start = FIXED_HEADER_LEN;
+    let cipher_start = ext_start + prefix.ext_len;
     let tag_start = ciphertext_bundle.len() - HASH_LEN;
-
     if cipher_start > tag_start {
         return Err(CryptoError::InvalidCiphertextLength);
     }
@@ -513,21 +673,25 @@ pub fn decrypt(
     let encrypted = &ciphertext_bundle[cipher_start..tag_start];
     let stored_tag = &ciphertext_bundle[tag_start..];
 
-    // Phase 2: Build KDF input and run Argon2id (0.05 → 0.35)
-    let mut kdf_input = build_kdf_input(password, effective_keyfile)?;
-    let master_key = LockedBuffer::new(derive_key(
-        &kdf_input, salt, timestamp, m_log2, t_cost, p_cost,
-    )?);
-    kdf_input.zeroize();
+    // Phase 2: KDF (0.05 → 0.35)
+    let cipher_key = derive_session_cipher_key(
+        password,
+        effective_keyfile,
+        &prefix.salt,
+        &prefix.timestamp,
+        prefix.m_log2,
+        prefix.t_cost,
+        prefix.p_cost,
+    )?;
     report(progress, 0.35);
 
     decrypt_v9(
-        master_key.get(),
-        nonce_bytes,
+        &cipher_key,
+        &prefix.nonce,
         &ciphertext_bundle[..cipher_start],
         encrypted,
         stored_tag,
-        flags,
+        prefix.flags,
         extension,
         progress,
     )
@@ -570,81 +734,39 @@ pub fn encrypt_stream<R: Read, W: Write>(
     let progress = &progress;
     report(progress, 0.0);
 
-    // Generate random salt and nonce.
     let mut salt = [0u8; SALT_LEN];
     rand::thread_rng().fill(&mut salt);
     let mut nonce = [0u8; NONCE_LEN];
     rand::thread_rng().fill(&mut nonce);
 
-    let timestamp = if options.strip_metadata {
-        [0u8; 8]
-    } else {
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_err(|_| CryptoError::SystemTimeError)?
-            .as_secs()
-            .to_le_bytes()
-    };
-
-    let extension = if options.strip_metadata {
-        Vec::new()
-    } else {
-        Path::new(input_filename)
-            .extension()
-            .and_then(|ext| ext.to_str())
-            .unwrap_or("")
-            .as_bytes()
-            .to_vec()
-    };
-    if extension.len() > u8::MAX as usize {
-        return Err(CryptoError::ExtensionTooLong);
-    }
-    let ext_len = extension.len() as u8;
-
-    let mut flags: u8 = 0;
-    if options.strip_metadata {
-        flags |= FLAG_STRIP_METADATA;
-    }
-    if options.skip_compression {
-        flags |= FLAG_NO_COMPRESS;
-    }
-    if keyfile_path.is_some() {
-        flags |= FLAG_KEYFILE;
-    }
-    if !options.skip_compression {
-        flags |= FLAG_ZSTD;
-    } // new files use zstd
-
-    let m_log2 = ARGON2_M_LOG2;
-    let t_cost = ARGON2_T_COST;
-    let p_cost = ARGON2_P_COST;
+    let meta = compute_encrypt_meta(options, input_filename, keyfile_path.is_some())?;
+    let (m_log2, t_cost, p_cost) = (ARGON2_M_LOG2, ARGON2_T_COST, ARGON2_P_COST);
 
     // KDF (0.05 → 0.35)
     report(progress, 0.05);
-    let mut kdf_input = build_kdf_input(password, keyfile_path)?;
-    let master_key = LockedBuffer::new(derive_key(
-        &kdf_input, &salt, &timestamp, m_log2, t_cost, p_cost,
-    )?);
-    kdf_input.zeroize();
-    let cipher_key = LockedBuffer::new(derive_cipher_key_v9(master_key.get()));
+    let cipher_key = derive_session_cipher_key(
+        password,
+        keyfile_path,
+        &salt,
+        &meta.timestamp,
+        m_log2,
+        t_cost,
+        p_cost,
+    )?;
     report(progress, 0.35);
 
-    // Build and write header.
-    let mut header = Vec::with_capacity(50 + extension.len());
-    header.extend_from_slice(MAGIC);
-    header.push(VERSION);
-    header.push(flags);
-    header.extend_from_slice(&salt);
-    header.extend_from_slice(&timestamp);
-    header.extend_from_slice(&nonce);
-    header.push(m_log2);
-    header.push(t_cost);
-    header.push(p_cost);
-    header.push(ext_len);
-    header.extend_from_slice(&extension);
+    let header = build_v9_header(
+        meta.flags,
+        &salt,
+        &meta.timestamp,
+        &nonce,
+        m_log2,
+        t_cost,
+        p_cost,
+        &meta.extension,
+    );
     writer.write_all(&header)?;
 
-    // Init sponge and absorb header as AAD.
     let mut sponge = cml_sponge::cipher_init(cipher_key.get(), &nonce);
     cml_sponge::absorb_aad(&mut sponge, &header);
 
@@ -653,7 +775,6 @@ pub fn encrypt_stream<R: Read, W: Write>(
     let mut scratch = Vec::with_capacity(STREAM_CHUNK);
     let mut bytes_out: u64 = 0;
 
-    // Inner loop: read from source, encrypt chunk, write to output.
     let mut encrypt_loop = |source: &mut dyn Read| -> Result<(), CryptoError> {
         loop {
             let n = read_full(source, &mut buf)?;
@@ -683,11 +804,9 @@ pub fn encrypt_stream<R: Read, W: Write>(
     scratch.zeroize();
     report(progress, 0.85);
 
-    // Finalize tag and write it.
     let tag = cml_sponge::aead_finalize(&mut sponge);
     writer.write_all(&tag)?;
     report(progress, 0.90);
-
     Ok(())
 }
 
@@ -728,102 +847,33 @@ pub fn decrypt_stream<R: Read + Seek, W: Write>(
     let progress = &progress;
     report(progress, 0.0);
 
-    // Determine file size via seek.
-    let file_size = reader.seek(SeekFrom::End(0))? as usize;
-    reader.seek(SeekFrom::Start(0))?;
-
-    if file_size < MIN_HEADER_LEN {
-        return Err(CryptoError::InvalidCiphertextLength);
-    }
-
-    // Read fixed-size header prefix:
-    //   magic(4) + ver(1) + flags(1) + salt(16) + ts(8) + nonce(16) + argon(3) + ext_len(1) = 50
-    let fixed_len = 4 + 1 + 1 + SALT_LEN + TIMESTAMP_LEN + NONCE_LEN + 3 + 1;
-    let mut fixed = vec![0u8; fixed_len];
-    reader.read_exact(&mut fixed)?;
-
-    if &fixed[..4] != MAGIC {
-        return Err(CryptoError::InvalidMagicBytes);
-    }
-    if fixed[4] != VERSION {
-        return Err(CryptoError::InvalidVersion);
-    }
-
-    let flags = fixed[FLAGS_OFFSET];
-
-    let salt_start = 6;
-    let ts_start = salt_start + SALT_LEN;
-    let nonce_start = ts_start + TIMESTAMP_LEN;
-    let argon_start = nonce_start + NONCE_LEN;
-    let ext_len_pos = argon_start + 3;
-
-    let mut salt = [0u8; SALT_LEN];
-    salt.copy_from_slice(&fixed[salt_start..ts_start]);
-    let mut ts = [0u8; TIMESTAMP_LEN];
-    ts.copy_from_slice(&fixed[ts_start..nonce_start]);
-    let mut nonce = [0u8; NONCE_LEN];
-    nonce.copy_from_slice(&fixed[nonce_start..argon_start]);
-
-    let m_log2 = fixed[argon_start];
-    let t_cost = fixed[argon_start + 1];
-    let p_cost = fixed[argon_start + 2];
-
-    if m_log2 < ARGON2_M_LOG2_MIN || t_cost < ARGON2_T_COST_MIN || p_cost < ARGON2_P_COST_MIN {
-        return Err(CryptoError::WeakKdfParameters);
-    }
-
-    let effective_keyfile = if (flags & FLAG_KEYFILE) != 0 {
-        match keyfile_path {
-            Some(p) => Some(p),
-            None => return Err(CryptoError::KeyfileRequired),
-        }
-    } else {
-        None
-    };
-
-    let ext_len = fixed[ext_len_pos] as usize;
-    let mut ext_bytes = vec![0u8; ext_len];
-    if ext_len > 0 {
-        reader.read_exact(&mut ext_bytes)?;
-    }
-
-    let header_len = fixed_len + ext_len;
-    if header_len + HASH_LEN > file_size {
-        return Err(CryptoError::InvalidCiphertextLength);
-    }
-    let cipher_len = file_size - header_len - HASH_LEN;
-
-    // Read the stored tag from the end of the file, then seek back.
-    let cipher_pos = reader.stream_position()?;
-    reader.seek(SeekFrom::Start((file_size - HASH_LEN) as u64))?;
-    let mut stored_tag = [0u8; HASH_LEN];
-    reader.read_exact(&mut stored_tag)?;
-    reader.seek(SeekFrom::Start(cipher_pos))?;
-
-    // Reconstruct the full header for AAD.
-    let mut header = Vec::with_capacity(header_len);
-    header.extend_from_slice(&fixed);
-    header.extend_from_slice(&ext_bytes);
+    let stream_header = read_v9_stream_header(reader)?;
+    let effective_keyfile = resolve_keyfile(stream_header.prefix.flags, keyfile_path)?;
 
     // KDF (0.05 → 0.35)
     report(progress, 0.05);
-    let mut kdf_input = build_kdf_input(password, effective_keyfile)?;
-    let master_key = LockedBuffer::new(derive_key(&kdf_input, &salt, &ts, m_log2, t_cost, p_cost)?);
-    kdf_input.zeroize();
-    let cipher_key = LockedBuffer::new(derive_cipher_key_v9(master_key.get()));
+    let cipher_key = derive_session_cipher_key(
+        password,
+        effective_keyfile,
+        &stream_header.prefix.salt,
+        &stream_header.prefix.timestamp,
+        stream_header.prefix.m_log2,
+        stream_header.prefix.t_cost,
+        stream_header.prefix.p_cost,
+    )?;
     report(progress, 0.35);
 
-    // Init sponge and absorb header as AAD.
-    let mut sponge = cml_sponge::cipher_init(cipher_key.get(), &nonce);
-    cml_sponge::absorb_aad(&mut sponge, &header);
+    let mut sponge = cml_sponge::cipher_init(cipher_key.get(), &stream_header.prefix.nonce);
+    cml_sponge::absorb_aad(&mut sponge, &stream_header.header_bytes);
 
     // Stream decrypt (0.40 → 0.85).
-    let no_compress = (flags & FLAG_NO_COMPRESS) != 0;
+    let no_compress = (stream_header.prefix.flags & FLAG_NO_COMPRESS) != 0;
+    let use_zstd = (stream_header.prefix.flags & FLAG_ZSTD) != 0;
+    let cipher_len = stream_header.cipher_len;
     let mut buf = vec![0u8; STREAM_CHUNK];
     let mut scratch = Vec::with_capacity(STREAM_CHUNK * 2);
     let mut remaining = cipher_len;
 
-    // Inner loop: read ciphertext chunk, decrypt, write to sink.
     let mut decrypt_loop = |sink: &mut dyn Write| -> Result<(), CryptoError> {
         while remaining > 0 {
             let to_read = remaining.min(STREAM_CHUNK);
@@ -832,16 +882,14 @@ pub fn decrypt_stream<R: Read + Seek, W: Write>(
             sink.write_all(&buf[..to_read])?;
             remaining -= to_read;
             // cipher_len.max(1) avoids division by zero when cipher_len == 0
-            // (empty ciphertext body); in that case remaining == 0 and the loop
-            // never executes, so this line is unreachable, but the guard is kept
-            // for clarity.
+            // (the loop body never runs in that case, but the guard is kept
+            // for clarity).
             let frac = (cipher_len - remaining) as f32 / cipher_len.max(1) as f32;
             report(progress, 0.40 + frac * 0.45);
         }
         Ok(())
     };
 
-    let use_zstd = (flags & FLAG_ZSTD) != 0;
     if no_compress {
         decrypt_loop(writer)?;
     } else if use_zstd {
@@ -859,20 +907,20 @@ pub fn decrypt_stream<R: Read + Seek, W: Write>(
 
     // Verify authentication tag (constant-time).
     let computed_tag = cml_sponge::aead_finalize(&mut sponge);
-    if computed_tag.ct_eq(&stored_tag).unwrap_u8() != 1 {
+    if computed_tag.ct_eq(&stream_header.stored_tag).unwrap_u8() != 1 {
         return Err(CryptoError::IntegrityCheckFailed);
     }
     report(progress, 0.90);
 
-    Ok(String::from_utf8(ext_bytes).unwrap_or_else(|_| "???".to_string()))
+    Ok(stream_header.extension_str)
 }
 
 // ── v9 decryption (CML-Sponge AEAD) ─────────────────────────────────────────
 
 #[allow(clippy::too_many_arguments)]
 fn decrypt_v9(
-    master_key: &[u8; 32],
-    nonce_bytes: &[u8],
+    cipher_key: &LockedBuffer,
+    nonce: &[u8; NONCE_LEN],
     header: &[u8],
     encrypted: &[u8],
     stored_tag: &[u8],
@@ -880,14 +928,8 @@ fn decrypt_v9(
     extension: &[u8],
     progress: &Option<&ProgressFn>,
 ) -> Result<(Vec<u8>, String), CryptoError> {
-    let cipher_key = LockedBuffer::new(derive_cipher_key_v9(master_key));
-
-    let nonce: [u8; NONCE_LEN] = nonce_bytes
-        .try_into()
-        .map_err(|_| CryptoError::InvalidCiphertextLength)?;
-
     // Init sponge and absorb header as AAD — must match encryption exactly.
-    let mut sponge = cml_sponge::cipher_init(cipher_key.get(), &nonce);
+    let mut sponge = cml_sponge::cipher_init(cipher_key.get(), nonce);
     cml_sponge::absorb_aad(&mut sponge, header);
 
     // Phase 3: Stream decrypt (0.40 → 0.85)

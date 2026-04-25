@@ -241,17 +241,17 @@ iv  = BLAKE3::derive_key("catwalk.v10.practrand.iv",  seed_material)[0..16]
 
 ## Interpretation
 
-*(Partial results: Seeds 0 and 1 have completed 1 TB validation with zero anomalies. Seeds 2, 3, 64, 128, 254, and 255 are in progress. This section will be completed when all runs finish. Interim finding: both completed seeds pass 397 tests at 1 TB with zero final-checkpoint anomalies, consistent with the full 256 GB validation results in docs/practrand_results.md.)*
+*(Partial results: Seeds 0 and 1 have completed 1 TB validation with zero anomalies. Seeds 2, 3, 64, 128, 254, and 255 are in progress. This section will be completed when all runs finish. Interim finding: both completed seeds pass 397 tests at 1 TB with zero final-checkpoint anomalies, consistent with the full 256 GB validation results in docs/archive/practrand_results_v9_1_7_8.md.)*
 
 ---
 
 ## Comparison to Previous Results
 
-The prior `docs/practrand_results.md` documents 256 GB validation against the
+The prior `docs/archive/practrand_results_v9_1_7_8.md` documents 256 GB validation against the
 **original {1, 7, 8} construction** (commit `c2a8507`). Those results do not apply
 to v10. This document is the definitive statistical validation of CATWALK v10.
 
-| | Previous (practrand_results.md) | This document |
+| | Previous (archive/practrand_results_v9_1_7_8.md) | This document |
 |--|--|--|
 | Construction | {1, 7, 8} coupling | **{1, 3, 7, 11} coupling (v10)** |
 | Commit | c2a8507 | **c002dfb** |

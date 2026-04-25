@@ -212,7 +212,7 @@ Justification:
 - Comparison: Keccak-f[1600] uses 24 rounds; SHA-3's security margin is also 2×
   over the theoretical minimum for diffusion. CATWALK follows the same principle.
 - PractRand validation at 256 GB with multiple seeds provides empirical support that
-  8 rounds is sufficient for statistical indistinguishability (see `docs/practrand_results.md`).
+  8 rounds is sufficient for statistical indistinguishability (see `docs/archive/practrand_results_v9_1_7_8.md`).
 
 Reduced-round PractRand testing (docs/reduced_round_analysis.md) confirms that the raw permutation achieves full statistical indistinguishability at 2 rounds without Mix13, giving the 8-round design a 4× conservative empirical security margin.
 
@@ -471,7 +471,7 @@ For the cipher to be broken, an adversary would need to either:
 | Output before tag verification | Blocked in `decrypt()`: plaintext is only returned after `ct_eq` passes |
 | Differential cryptanalysis | Unconsidered; no differential analysis of the CML round has been performed |
 | Algebraic attacks | Unconsidered; the quadratic nonlinearity of the maps complicates algebraic structure, but no formal analysis exists |
-| Statistical distinguisher | Countered empirically by PractRand at 256 GB (see `docs/practrand_results.md`) |
+| Statistical distinguisher | Countered empirically by PractRand at 256 GB (see `docs/archive/practrand_results_v9_1_7_8.md`) |
 
 ### 4.8 Attacks NOT Ruled Out
 

@@ -499,16 +499,16 @@ The following attacks were considered or attempted against the CML-Sponge constr
 
 | Seed | Key type | Length | Tests | Anomalies | Source |
 |------|----------|--------|-------|-----------|--------|
-| 0 | BLAKE3-derived | 256 GB | 369 | **0** | `docs/practrand_results.md` |
-| 1 | BLAKE3-derived | 256 GB | 369 | **0** (2 transient) | `docs/practrand_results.md` |
-| 2 | BLAKE3-derived | 256 GB | 369 | **0** | `docs/practrand_results.md` |
-| 254 | 0x00 × 32 | 256 GB | 369 | **0** | `docs/practrand_results.md` |
-| 255 | 0xFF × 32 | 256 GB | 369 | **0** (1 transient) | `docs/practrand_results.md` |
+| 0 | BLAKE3-derived | 256 GB | 369 | **0** | `docs/archive/practrand_results_v9_1_7_8.md` |
+| 1 | BLAKE3-derived | 256 GB | 369 | **0** (2 transient) | `docs/archive/practrand_results_v9_1_7_8.md` |
+| 2 | BLAKE3-derived | 256 GB | 369 | **0** | `docs/archive/practrand_results_v9_1_7_8.md` |
+| 254 | 0x00 × 32 | 256 GB | 369 | **0** | `docs/archive/practrand_results_v9_1_7_8.md` |
+| 255 | 0xFF × 32 | 256 GB | 369 | **0** (1 transient) | `docs/archive/practrand_results_v9_1_7_8.md` |
 
 **[EMPIRICAL]** No persistent statistical anomaly was found.  Results span two validation campaigns:
 
 - **v10 1 TB validation** (`docs/practrand_1tb_v10.md`): Seeds 0 and 1 each pass 397 tests at 1 TB with zero persistent anomalies (seed 0: 1 transient "unusual" at 1 TB, seed 1: 1 transient "unusual" at 256 MB — both resolved at next doubling).  Seeds 2, 3, 64, 128, 254, 255 are in progress.
-- **Original {1,7,8} coupling at 256 GB** (`docs/practrand_results.md`): Seeds 0, 1, 2, 254, 255 each pass 369 tests with zero persistent anomalies.  These results predate the v10 coupling change and serve as baseline validation of the sponge framework.
+- **Original {1,7,8} coupling at 256 GB** (`docs/archive/practrand_results_v9_1_7_8.md`): Seeds 0, 1, 2, 254, 255 each pass 369 tests with zero persistent anomalies.  These results predate the v10 coupling change and serve as baseline validation of the sponge framework.
 - **v10 raw permutation at 32 GB** (`docs/practrand_raw_permutation.md`): Seeds 0, 254, 255 pass 325 tests each without Mix13, confirming the permutation produces statistically strong output at the raw lattice level.
 
 At 397 concurrent tests (1 TB checkpoint), approximately 0.4 "unusual" events are expected by chance per checkpoint (Poisson, λ = 0.4).  A real weakness would appear at earlier checkpoints and intensify; all observed anomalies are single-checkpoint appearances consistent with statistical fluctuation.

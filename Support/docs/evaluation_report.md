@@ -283,7 +283,7 @@ The test suite is comprehensive:
 - `design.md` — complete construction specification (reimplementable from scratch)
 - `security_argument_final.md` — formal security argument with proof/conjecture/empirical taxonomy
 - `coupling_5term_evaluation.md` — exhaustive search over coupling candidates
-- `practrand_results.md` — complete statistical validation results
+- `archive/practrand_results_v9_1_7_8.md` — historical statistical validation (pre-v10 {1,7,8} coupling); see `practrand_1tb_v10.md` for current results
 - Inline doc comments on all public functions and critical internal functions
 
 The honest delineation between PROOF, CONJECTURE, and EMPIRICAL claims in the security argument is commendable and unusual for a personal project.

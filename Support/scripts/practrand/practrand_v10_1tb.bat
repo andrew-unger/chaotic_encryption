@@ -5,10 +5,20 @@ REM Binary: cml_keystream_dump (built from that commit)
 REM
 REM Tier 1: seeds 0, 1, 2, 254, 255
 REM Tier 2: seeds 3, 128, 64
+REM
+REM Usage:
+REM   Support\scripts\practrand\practrand_v10_1tb.bat
+REM (Run from the repo root.)
+
+REM ── Resolve repo root from this script's location ─────────────────────────
+REM   %~dp0 = ...\Support\scripts\practrand\
+REM   ..\..\..\ takes us up to the repo root.
+set "REPO_ROOT=%~dp0..\..\.."
+pushd "%REPO_ROOT%"
 
 set PRACTRAND="C:\Users\Unger\Documents\Code\PractRand\build\RNG_test.exe"
-set DUMP=.\target\release\cml_keystream_dump.exe
-set LOGDIR=.\tools\practrand_logs_v10
+set DUMP=.\Catwalk\target\release\cml_keystream_dump.exe
+set LOGDIR=.\Support\practrand_logs_v10
 
 mkdir %LOGDIR% 2>nul
 
@@ -58,3 +68,5 @@ echo [%date% %time%] Seed 64 complete >> %LOGDIR%\run.log
 
 echo [%date% %time%] ALL SEEDS COMPLETE >> %LOGDIR%\run.log
 echo [%date% %time%] All seeds complete.
+
+popd
