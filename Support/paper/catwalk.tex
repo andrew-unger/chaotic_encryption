@@ -9,6 +9,7 @@
 \usepackage[utf8]{inputenc}
 \usepackage[T1]{fontenc}
 \usepackage{amsmath,amssymb,amsfonts}
+\usepackage{mathtools}  % psmallmatrix environment
 \usepackage{algorithm}
 \usepackage{algpseudocode}
 \usepackage{tikz}
@@ -62,7 +63,9 @@ PractRand validation to 1~TB per seed (397 tests per seed at the 1~TB checkpoint
 full multi-seed validation in progress), raw
 permutation validation at~32~GB without the output finalizer, and
 reduced-round analysis establishing a $4\times$ security margin all support
-the empirical quality of the construction.  CATWALK is a research cipher: it
+the empirical quality of the construction.  Authenticated encryption uses a
+SpongeWrap-style duplex costing one permutation per 64-byte block
+($\approx$0.5~GB/s on commodity x86-64).  CATWALK is a research cipher: it
 has not received independent cryptanalysis, and the core security conjecture---that the CML-Sponge permutation is indistinguishable from a random
 permutation---remains unproven.  We present the design, analysis, and open
 problems to invite community scrutiny.
@@ -1398,8 +1401,9 @@ represent concrete opportunities for analysis.  A successful attack would be
 as valuable as a successful defense: it would clarify the boundary between
 chaos-theoretic intuition and cryptographic reality.
 
-The complete reference implementation (Rust, $\sim$580 lines for the core
-primitive) and all documentation are publicly available.
+The complete reference implementation (Rust, $\sim$400 lines of code for the
+core primitive and duplex AEAD, extensively documented) and all analysis
+artifacts are publicly available.
 
 \bibliographystyle{splncs04}
 \bibliography{refs}
