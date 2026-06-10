@@ -3,7 +3,7 @@
 #![cfg_attr(all(windows, feature = "gui"), windows_subsystem = "windows")]
 
 use std::fs;
-use std::io::{self, Cursor, Read, Write};
+use std::io::{self, Cursor, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand};
@@ -37,6 +37,85 @@ impl Drop for PasswordGuard {
 /// Constant-time byte comparison for user-supplied confirmations.
 fn ct_str_eq(a: &str, b: &str) -> bool {
     a.as_bytes().ct_eq(b.as_bytes()).into()
+}
+
+/// Read one line from piped stdin, stripping the trailing newline (and CR).
+fn read_password_line_from_stdin() -> io::Result<String> {
+    let mut line = String::new();
+    io::stdin().read_line(&mut line)?;
+    while line.ends_with('\n') || line.ends_with('\r') {
+        line.pop();
+    }
+    Ok(line)
+}
+
+/// Acquire the operation password.
+///
+/// Precedence:
+/// 1. `--password-file` — the first line of the file (trailing CR/LF
+///    stripped).  The rest of the file is ignored.  Preferred for scripting;
+///    never pass passwords on the command line (visible in process listings).
+/// 2. Piped stdin (batch mode, stdin is not a terminal) — one line is read.
+///    No confirmation prompt is issued in batch mode (it exists to catch
+///    interactive typos).  Unavailable when stdin carries the data stream
+///    (`input == "-"`); use `--password-file` there.
+/// 3. Interactive console prompt (rpassword), with a confirmation prompt
+///    when `confirm` is true.
+///
+/// Exits the process with a message on unrecoverable input errors, matching
+/// the CLI's existing error style.
+fn obtain_password(
+    password_file: Option<&Path>,
+    confirm: bool,
+    stdin_is_data: bool,
+) -> PasswordGuard {
+    if let Some(path) = password_file {
+        let mut contents = match fs::read_to_string(path) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!(
+                    "Error: cannot read password file '{}': {}",
+                    path.display(),
+                    e
+                );
+                std::process::exit(1);
+            }
+        };
+        let line_end = contents.find(['\r', '\n']).unwrap_or(contents.len());
+        let pw = contents[..line_end].to_string();
+        contents.zeroize();
+        return PasswordGuard::new(pw);
+    }
+
+    if !io::stdin().is_terminal() {
+        if stdin_is_data {
+            eprintln!(
+                "Error: stdin carries the data stream; supply the password with --password-file."
+            );
+            std::process::exit(1);
+        }
+        let pw = match read_password_line_from_stdin() {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("Error: failed to read password from stdin: {}", e);
+                std::process::exit(1);
+            }
+        };
+        return PasswordGuard::new(pw);
+    }
+
+    let password =
+        PasswordGuard::new(prompt_password("Enter password: ").expect("Failed to read password"));
+    if confirm {
+        let confirmation = PasswordGuard::new(
+            prompt_password("Confirm password: ").expect("Failed to read password"),
+        );
+        if !ct_str_eq(password.as_str(), confirmation.as_str()) {
+            eprintln!("Error: Passwords do not match.");
+            std::process::exit(1);
+        }
+    }
+    password
 }
 
 // The in-memory API is used by the archive subcommand (feature-gated).
@@ -82,6 +161,10 @@ enum Command {
         /// Optional keyfile for two-factor encryption
         #[arg(long, value_name = "PATH")]
         keyfile: Option<PathBuf>,
+        /// Read the password from the first line of PATH instead of
+        /// prompting (for scripting; the file should be access-protected)
+        #[arg(long, value_name = "PATH")]
+        password_file: Option<PathBuf>,
         /// Best-effort overwrite + delete the input file after successful
         /// encryption. Unreliable on SSDs, CoW filesystems (BTRFS/ZFS/APFS),
         /// and journaled filesystems; use full-disk encryption for real erasure.
@@ -101,6 +184,10 @@ enum Command {
         /// Optional keyfile for two-factor decryption
         #[arg(long, value_name = "PATH")]
         keyfile: Option<PathBuf>,
+        /// Read the password from the first line of PATH instead of
+        /// prompting (for scripting; the file should be access-protected)
+        #[arg(long, value_name = "PATH")]
+        password_file: Option<PathBuf>,
     },
 
     /// Display header info for an encrypted file
@@ -135,6 +222,10 @@ enum Command {
         /// Optional keyfile for two-factor encryption
         #[arg(long, value_name = "PATH")]
         keyfile: Option<PathBuf>,
+        /// Read the password from the first line of PATH instead of
+        /// prompting (for scripting; the file should be access-protected)
+        #[arg(long, value_name = "PATH")]
+        password_file: Option<PathBuf>,
         /// Best-effort overwrite + delete the input files after successful
         /// encryption. Unreliable on SSDs, CoW filesystems (BTRFS/ZFS/APFS),
         /// and journaled filesystems; use full-disk encryption for real erasure.
@@ -156,6 +247,10 @@ enum Command {
         /// Optional keyfile for two-factor decryption
         #[arg(long, value_name = "PATH")]
         keyfile: Option<PathBuf>,
+        /// Read the password from the first line of PATH instead of
+        /// prompting (for scripting; the file should be access-protected)
+        #[arg(long, value_name = "PATH")]
+        password_file: Option<PathBuf>,
     },
 }
 
@@ -233,7 +328,19 @@ fn make_progress_cb() -> ProgressFn {
 
 // ── Main ─────────────────────────────────────────────────────────────────────
 
-fn main() -> Result<(), CryptoError> {
+fn main() -> std::process::ExitCode {
+    match run() {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(e) => {
+            // Print the human-readable Display message (thiserror), not the
+            // Debug variant name that `fn main() -> Result<_, E>` would emit.
+            eprintln!("Error: {}", e);
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+fn run() -> Result<(), CryptoError> {
     let cli = Cli::parse();
 
     // Launch GUI when no subcommand is given (or --gui)
@@ -263,6 +370,7 @@ fn main() -> Result<(), CryptoError> {
             no_metadata,
             no_compress,
             keyfile,
+            password_file,
             secure_delete,
         } => {
             let from_stdin = input == "-";
@@ -273,23 +381,12 @@ fn main() -> Result<(), CryptoError> {
                 std::process::exit(1);
             }
 
-            let password = PasswordGuard::new(
-                prompt_password("Enter password: ").expect("Failed to read password"),
-            );
+            let password = obtain_password(password_file.as_deref(), true, from_stdin);
 
             if let Err(reason) = validate_password(password.as_str()) {
                 eprintln!("Password rejected: {}", reason);
                 std::process::exit(1);
             }
-
-            let confirm = PasswordGuard::new(
-                prompt_password("Confirm password: ").expect("Failed to read password"),
-            );
-            if !ct_str_eq(password.as_str(), confirm.as_str()) {
-                eprintln!("Error: Passwords do not match.");
-                std::process::exit(1);
-            }
-            drop(confirm); // no longer needed; Drop zeroes it
 
             let options = EncryptOptions {
                 strip_metadata: no_metadata,
@@ -352,13 +449,12 @@ fn main() -> Result<(), CryptoError> {
             output,
             force,
             keyfile,
+            password_file,
         } => {
             let from_stdin = input == "-";
             let to_stdout = output == "-";
 
-            let password = PasswordGuard::new(
-                prompt_password("Enter password: ").expect("Failed to read password"),
-            );
+            let password = obtain_password(password_file.as_deref(), false, from_stdin);
 
             if !to_stdout && Path::new(&output).exists() && !force {
                 eprintln!(
@@ -485,6 +581,7 @@ fn main() -> Result<(), CryptoError> {
             no_metadata,
             no_compress,
             keyfile,
+            password_file,
             secure_delete,
         } => {
             use catwalk::archive::{create_archive, ARCHIVE_EXTENSION};
@@ -497,23 +594,12 @@ fn main() -> Result<(), CryptoError> {
                 }
             }
 
-            let password = PasswordGuard::new(
-                prompt_password("Enter password: ").expect("Failed to read password"),
-            );
+            let password = obtain_password(password_file.as_deref(), true, false);
 
             if let Err(reason) = validate_password(password.as_str()) {
                 eprintln!("Password rejected: {}", reason);
                 std::process::exit(1);
             }
-
-            let confirm = PasswordGuard::new(
-                prompt_password("Confirm password: ").expect("Failed to read password"),
-            );
-            if !ct_str_eq(password.as_str(), confirm.as_str()) {
-                eprintln!("Error: Passwords do not match.");
-                std::process::exit(1);
-            }
-            drop(confirm); // no longer needed; Drop zeroes it
 
             eprintln!("Creating archive from {} file(s)...", files.len());
             let archive_data = create_archive(&files)?;
@@ -558,12 +644,11 @@ fn main() -> Result<(), CryptoError> {
             output_dir,
             force,
             keyfile,
+            password_file,
         } => {
             use catwalk::archive::{extract_archive, ARCHIVE_EXTENSION};
 
-            let password = PasswordGuard::new(
-                prompt_password("Enter password: ").expect("Failed to read password"),
-            );
+            let password = obtain_password(password_file.as_deref(), false, false);
 
             let data = fs::read(&input)?;
             let progress_cb = make_progress_cb();
