@@ -10,14 +10,16 @@
 //!   3. Tag tamper — flipping any byte in the 32-byte authentication tag
 //!      causes decryption to fail.
 //!   4. Wrong password — decrypting with a different password always fails.
-//!   5. Keystream uniqueness — distinct IVs produce distinct keystreams.
+//!   5. Chunking invariance — duplex AEAD output is independent of how the
+//!      caller splits the data into chunks.
+//!   6. Keystream uniqueness — distinct IVs produce distinct keystreams.
 //!
 //! Note on case counts: properties 1–4 invoke the full Argon2id KDF (~1.5 s
 //! per case at production parameters).  Case counts are intentionally small
 //! (20 cases each) so the suite completes in ~2 minutes.  Property 5 uses
 //! only the fast sponge primitive and runs 256 cases.
 
-use catwalk::cml_sponge::{cipher_init, keystream};
+use catwalk::cml_sponge::{cipher_init, keystream, AeadSession};
 use catwalk::crypto::{decrypt, encrypt, EncryptOptions};
 use catwalk::error::CryptoError;
 use proptest::prelude::*;
@@ -128,7 +130,73 @@ proptest! {
     }
 }
 
-// ── Property 5: Keystream uniqueness ─────────────────────────────────────────
+// ── Property 5: Duplex chunking invariance ───────────────────────────────────
+
+proptest! {
+    // Uses only the fast sponge primitive (no KDF) — default case count is fine.
+
+    /// Encrypting the same plaintext as one chunk and as arbitrarily-split
+    /// chunks must yield identical ciphertext and tag: the duplex session
+    /// buffers partial blocks, so caller chunking is never observable.
+    #[test]
+    fn prop_chunking_never_affects_ciphertext_or_tag(
+        plaintext in proptest::collection::vec(any::<u8>(), 0..=1024),
+        splits in proptest::collection::vec(any::<usize>(), 0..=8),
+    ) {
+        let key = [0xC4u8; 32];
+        let iv = [0x7Eu8; 16];
+        let aad = b"chunking-invariance-property";
+
+        // Reference: single-chunk encryption.
+        let (ct_ref, tag_ref) = {
+            let mut s = AeadSession::new(&key, &iv);
+            s.absorb_aad(aad);
+            let mut ct = plaintext.clone();
+            s.encrypt_chunk(&mut ct);
+            (ct, s.finalize())
+        };
+
+        // Split points derived from the fuzzer-chosen values, sorted and
+        // clamped into range.
+        let mut points: Vec<usize> = splits
+            .iter()
+            .map(|&x| if plaintext.is_empty() { 0 } else { x % (plaintext.len() + 1) })
+            .collect();
+        points.sort_unstable();
+
+        let (ct_split, tag_split) = {
+            let mut s = AeadSession::new(&key, &iv);
+            s.absorb_aad(aad);
+            let mut ct = plaintext.clone();
+            let mut start = 0;
+            for &p in &points {
+                s.encrypt_chunk(&mut ct[start..p.max(start)]);
+                start = p.max(start);
+            }
+            s.encrypt_chunk(&mut ct[start..]);
+            (ct, s.finalize())
+        };
+
+        prop_assert_eq!(&ct_ref, &ct_split, "ciphertext depends on chunking");
+        prop_assert_eq!(tag_ref, tag_split, "tag depends on chunking");
+
+        // Decryption with yet another chunking recovers the plaintext and tag.
+        let (pt_rec, tag_dec) = {
+            let mut s = AeadSession::new(&key, &iv);
+            s.absorb_aad(aad);
+            let mut pt = ct_ref.clone();
+            let mid = pt.len() / 3;
+            let (a, b) = pt.split_at_mut(mid);
+            s.decrypt_chunk(a);
+            s.decrypt_chunk(b);
+            (pt, s.finalize())
+        };
+        prop_assert_eq!(pt_rec, plaintext, "decrypt failed to recover plaintext");
+        prop_assert_eq!(tag_dec, tag_ref, "decrypt tag mismatch");
+    }
+}
+
+// ── Property 6: Keystream uniqueness ─────────────────────────────────────────
 
 proptest! {
     // 256 cases — cipher_init is fast (no KDF), so default case count is fine.

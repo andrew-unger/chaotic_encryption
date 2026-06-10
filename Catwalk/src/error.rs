@@ -10,7 +10,7 @@ pub enum CryptoError {
     InvalidCiphertextLength,
     #[error("Invalid magic bytes. Not a CATWALK file.")]
     InvalidMagicBytes,
-    #[error("Unsupported file version.")]
+    #[error("Unsupported file version (this build reads CATWALK format v10 only).")]
     InvalidVersion,
     #[error("System time error.")]
     SystemTimeError,
