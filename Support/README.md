@@ -140,17 +140,17 @@ password + random salt + timestamp
         v
     master_key (32 bytes)
         |
-        v (BLAKE3 derive_key "catwalk.v9.cipher")
+        v (BLAKE3 derive_key "catwalk.v10.cipher")
     cipher_key (32 bytes)
         |
         v
-    CML-Sponge AEAD init (cipher_key + nonce)
+    duplex AEAD session init (cipher_key + nonce)
         |
         |--- absorb header (AAD) --------+
         |                                |
         v                                |
-    stream encrypt plaintext             | authenticated
-    (64 KB chunks, XOR + absorb CT)      | but not encrypted
+    duplex encrypt plaintext             | authenticated
+    (1 permutation per 64-byte block)    | but not encrypted
         |                                |
         v                                |
     finalize → 32-byte AEAD tag ---------+
@@ -159,15 +159,17 @@ password + random salt + timestamp
     header ‖ ciphertext ‖ tag
 ```
 
-1. **Compress** plaintext with zlib (unless `--no-compress`)
+1. **Compress** plaintext with zstd (unless `--no-compress`)
 2. **Derive** master key from password via Argon2id (parameters stored in header)
 3. **Derive** single cipher key via BLAKE3 `derive_key` with version-locked context string
 4. **Lock** key material in heap-allocated buffer via VirtualLock (prevents paging to disk)
 5. **Build** header bytes (magic, version, flags, salt, timestamp, nonce, Argon2 params, extension)
-6. **Init** CML-Sponge state from cipher key and nonce
+6. **Init** duplex AEAD session from cipher key and nonce
 7. **Absorb** header as authenticated associated data (DOMAIN_AAD)
-8. **Encrypt** data in 64 KB streaming chunks: XOR keystream, then absorb ciphertext (DOMAIN_CT)
-9. **Finalize** tag: absorb domain separator (DOMAIN_TAG), squeeze 32 bytes from capacity
+8. **Encrypt** via the duplex: per 64-byte block, read keystream from the rate (Mix13),
+   XOR plaintext → ciphertext, inject ciphertext into the rate, permute once
+9. **Finalize** tag: inject the DOMAIN_CT-padded terminal block, absorb domain
+   separator (DOMAIN_TAG), squeeze 32 bytes
 10. **Zeroize** and unlock all key material on drop
 
 ### CML-Sponge Cipher
@@ -189,20 +191,20 @@ The `CmlSpongeState` is a 16-site Coupled Map Lattice (CML) operating as a crypt
 
 **Output finalizer:** Each squeezed word passes through Stafford Mix13 (the bijective finalizer used by SplitMix64 / PCG) for additional output whitening. Stafford Mix13 is fully invertible — no entropy is lost.
 
-**Sponge construction (SpongeWrap AEAD):**
+**Sponge construction (SpongeWrap duplex AEAD, format v10):**
 - Multi-rate padding with domain constants (KEY=0x01, IV=0x02, AAD=0x03, CT=0x04, TAG=0x05)
-- State evolution is identical for encryption and decryption (both absorb ciphertext bytes), enabling tag verification from the sponge capacity without a separate MAC
-- Encryption: `squeeze keystream → XOR plaintext → ciphertext; absorb(ciphertext)`
-- Decryption: `squeeze keystream → save ciphertext; XOR ciphertext → plaintext; absorb(saved ciphertext)`
+- One permutation per 64-byte block: `keystream = Mix13(rate); ciphertext = plaintext ⊕ keystream; rate ⊕= ciphertext; permute`
+- State evolution is identical for encryption and decryption (both inject the ciphertext bytes), enabling tag verification from the sponge capacity without a separate MAC
+- The session buffers partial blocks internally, so chunk boundaries never affect the ciphertext or tag; finalisation injects exactly one DOMAIN_CT-padded terminal block, making message boundaries unambiguous
 
 All arithmetic uses `u64`/`u128` wrapping operations, guaranteeing identical results on every platform.
 
-### File Format (v9)
+### File Format (v10)
 
 | Field | Size | Description |
 |-------|------|-------------|
 | Magic | 4 bytes | `CATW` |
-| Version | 1 byte | `9` |
+| Version | 1 byte | `10` |
 | Flags | 1 byte | Bit 0: STRIP_METADATA, Bit 1: NO_COMPRESS |
 | Salt | 16 bytes | Random, used as Argon2id salt prefix |
 | Timestamp | 8 bytes | Unix epoch seconds (LE), or zero if metadata stripped |
@@ -219,7 +221,11 @@ All fields from Magic through Extension are authenticated as associated data (ab
 
 ### Version Note
 
-v9 and v10 share the same file format (version byte = 9); v10 refers to the cipher internals (5-term coupling), not the file format version.
+The construction version and file format version are now unified at v10: the
+version byte is 10, the BLAKE3 cipher-key context is `catwalk.v10.cipher`, and
+the AEAD is the one-permutation-per-block duplex.  Files written by the
+retired v9 format (version byte 9, two-permutation AEAD) are not readable —
+the format predates any stable release.
 
 ## Dependencies
 

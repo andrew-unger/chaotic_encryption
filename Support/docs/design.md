@@ -1,6 +1,6 @@
 # CATWALK: Design and Specification
 
-**Version:** v10 (CML-Sponge AEAD — 5-term coupling)
+**Version:** v10 — 5-term coupling permutation; duplex AEAD; file format version byte 10
 **Status:** Research implementation — self-reviewed, awaiting independent cryptanalysis
 **Implementation:** `src/cml_sponge.rs` (Rust)
 
@@ -303,7 +303,7 @@ master_key = Argon2id(
     output_len = 32 bytes
 )
 
-cipher_key = BLAKE3_derive_key("catwalk.v9.cipher", master_key)
+cipher_key = BLAKE3_derive_key("catwalk.v10.cipher", master_key)
 ```
 
 Argon2id at 256 MB / 4 iterations costs ~1–4 seconds on typical hardware, making
@@ -326,44 +326,57 @@ resource-exhaustion attacks.  The encrypt path only ever emits the defaults
 (m_log2 = 18, t_cost = 4, p_cost = 1), so any header outside this range is
 malformed or hostile.
 
-### 2.10 AEAD Construction
+### 2.10 AEAD Construction (duplex, file format v10)
 
-CATWALK's AEAD follows SpongeWrap (Bertoni et al.):
+CATWALK's AEAD is a SpongeWrap-style duplex (Bertoni et al.): keystream
+extraction and ciphertext authentication share a single permutation call per
+64-byte block.  (The retired v9 file format used a two-permutation mode —
+a squeeze permutation for keystream plus a separate padded absorb of every
+ciphertext chunk — costing 2 permutations per 64 bytes and making the tag
+depend on the caller's chunk boundaries.  v10 fixes both.)
 
 **Encryption:**
 ```
-1. cipher_init(cipher_key, nonce)       // key + IV absorbed
-2. absorb_aad(header_bytes)             // domain 0x03
-3. for each chunk of plaintext:
-       keystream_bytes = squeeze(chunk_len)
-       ciphertext = plaintext XOR keystream_bytes
-       absorb(ciphertext, DOMAIN_CT)    // domain 0x04
-4. tag = finalize()                     // absorb([], DOMAIN_TAG) then squeeze 32 bytes
+1. cipher_init(cipher_key, nonce)       // key (0x01) + nonce (0x02) absorbed
+2. absorb_aad(header_bytes)             // domain 0x03, padded absorb
+3. for each 64-byte block of plaintext (partial blocks buffered across chunks):
+       keystream = Mix13(rate)          // read, no permute
+       ciphertext = plaintext XOR keystream
+       rate ^= ciphertext               // duplex injection
+       permute()                        // ONE permutation per block
+4. finalize:
+       absorb(pending_partial_ciphertext, DOMAIN_CT)  // always exactly one
+                                        // padded terminal block (pure padding
+                                        // when the length is a block multiple)
+       absorb([], DOMAIN_TAG)           // domain 0x05
+       tag = Mix13(rate words 0–3)      // 32 bytes
 5. output: header || ciphertext || tag
 ```
 
-**Decryption:**
-```
-1. cipher_init(cipher_key, nonce)
-2. absorb_aad(header_bytes)
-3. for each chunk of ciphertext:
-       save original_ciphertext = ciphertext
-       keystream_bytes = squeeze(chunk_len)
-       plaintext = ciphertext XOR keystream_bytes
-       absorb(original_ciphertext, DOMAIN_CT)  // absorb the same bytes as encryption
-4. computed_tag = finalize()
-5. if NOT constant_time_eq(computed_tag, stored_tag): ABORT, discard plaintext
-6. otherwise: return plaintext
-```
+**Decryption:** identical, except step 3 computes
+`plaintext = ciphertext XOR keystream` and injects the **received ciphertext**
+into the rate — the same bytes encryption injected.
 
-The critical invariant: in both encrypt and decrypt paths, the sponge absorbs
-**the ciphertext** with DOMAIN_CT. This means the sponge state after processing
-all chunks is identical if and only if the same ciphertext was processed. The
-final tag is therefore bound to: cipher_key, nonce, all header bytes (AAD), and
-all ciphertext bytes — providing Encrypt-then-MAC semantics natively.
+The critical invariant: both paths inject **the ciphertext** into the duplex.
+The sponge state after processing is identical if and only if the same
+ciphertext was processed, so the final tag is bound to: cipher_key, nonce, all
+header bytes (AAD), and all ciphertext bytes — Encrypt-then-MAC semantics
+natively.  Because the session buffers partial blocks internally, the
+ciphertext and tag are independent of how the caller chunks the data; the
+terminal DOMAIN_CT-padded block makes message boundaries unambiguous.
 
-**Tag output is 32 bytes** extracted from the first 4 rate words (sites 0–3) after
-the finalization permutation, each processed through Stafford Mix13.
+**Keystream exposure is equivalent to the v9 mode:** an adversary with known
+plaintext learns `Mix13(rate)` — the same information the v9 squeeze output
+revealed.  Mix13 is a public bijection, so in both modes the adversary's view
+is the full 512-bit rate and never the 512-bit capacity, preserving the
+standard duplex security argument.
+
+**Tag output is 32 bytes** extracted from the first 4 rate words (sites 0–3)
+after the finalization permutation, each processed through Stafford Mix13.
+
+**Performance:** ~1 permutation per 64 bytes plus a fixed ~5 permutations of
+overhead per message (key, nonce, AAD, terminal CT, tag) — twice the
+throughput of the v9 mode.
 
 ---
 
@@ -570,7 +583,7 @@ below were generated with the v10 construction: Arnold's Cat Map local map +
 | KDF memory | 256 MB (2^18 KiB) | ~1–4 second cost; configurable within floor |
 | KDF iterations | 4 | Multiplies time cost beyond memory |
 | Nonce size | 16 bytes | 128-bit nonce space; collision at ~2^64 encryptions |
-| BLAKE3 derive | "catwalk.v9.cipher" | Domain separation between KDF output and cipher key (retained from v9 for file format compatibility; not updated to v10 to preserve decryption of existing files) |
+| BLAKE3 derive | "catwalk.v10.cipher" | Domain separation between KDF output and cipher key; versioned so v9 and v10 ciphertexts never share a cipher key even under identical password/salt/timestamp |
 
 ## 8. Keyfile Support
 

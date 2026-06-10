@@ -1,22 +1,23 @@
 # CATWALK (CML-Sponge AEAD) — Performance Benchmarks
 
 **Date:** 2026-06-09
-**Crate version:** 0.1.0
+**Crate version:** 0.1.0 (file format v10 — duplex AEAD)
 **Rust toolchain:** stable (1.96)
 **Profile:** release (opt-level=3, LTO=fat, codegen-units=1)
 **Platform:** Windows 11 Pro (x86-64)
 **Benchmark harness:** criterion 0.5.1 (100 samples, default warmup/measurement time)
 
-All AEAD timings include `cipher_init` + `absorb_aad` + encrypt/decrypt chunk + `aead_finalize`.
-They do **not** include the Argon2id KDF; see the `kdf_only` entry for that cost.
+All AEAD timings include session init (`AeadSession::new`) + `absorb_aad` +
+encrypt/decrypt + `finalize`.  They do **not** include the Argon2id KDF; see
+the `kdf_only` entry for that cost.
 
-> **Changelog vs. the 2026-03-18 baseline:** the AEAD data path was made
-> allocation-free — `absorb` no longer copies its input into a padded heap
-> buffer (full blocks are absorbed directly from the caller's slice), the
-> keystream is XOR-ed into the data in place instead of being materialised in
-> a scratch buffer, and `aead_decrypt_chunk`'s scratch shrank from 2× to 1×
-> the chunk length.  Measured same-machine A/B (criterion `--baseline`):
-> **encrypt 1 MB +51% throughput, decrypt 1 MB +57% throughput.**
+> **Changelog vs. the v11 (2026-06-09, pre-duplex) baseline:** the AEAD was
+> rebuilt as a SpongeWrap duplex — one permutation per 64-byte block instead
+> of two (squeeze + absorb), with a word-wise fast path for block-aligned
+> data.  Measured same-machine A/B (criterion `--baseline v11`):
+> **encrypt 64 KB +86%, decrypt 1 MB +119% throughput.**  Combined with the
+> earlier allocation-elimination wave, total speedup since the 2026-03
+> implementation is ≈ 2.8× (encrypt) to 3.4× (decrypt).
 
 ---
 
@@ -26,35 +27,30 @@ They do **not** include the Argon2id KDF; see the `kdf_only` entry for that cost
 
 | Benchmark | Mean time | Notes |
 |-----------|-----------|-------|
-| `permutation_only` | 107.4 ns | 8 × CML rounds; 1024-bit state |
-| `keystream_64b` | 113.4 ns | 538 MiB/s; cipher_init state reused across iterations |
+| `permutation_only` | 98.0 ns | 8 × CML rounds; 1024-bit state |
+| `keystream_64b` | 105.4 ns | 579 MiB/s; cipher_init state reused across iterations |
 
-### AEAD encrypt throughput
-
-| Payload | Mean time | Throughput |
-|---------|-----------|------------|
-| 1 KB | 4.26 µs | 229 MiB/s |
-| 64 KB | 220.0 µs | 284 MiB/s |
-| 1 MB | 3.87 ms | 259 MiB/s |
-
-### AEAD decrypt throughput
+### AEAD encrypt throughput (duplex)
 
 | Payload | Mean time | Throughput |
 |---------|-----------|------------|
-| 1 KB | 4.23 µs | 231 MiB/s |
-| 64 KB | 223.7 µs | 279 MiB/s |
-| 1 MB | 4.22 ms | 237 MiB/s |
+| 1 KB | 2.80 µs | 349 MiB/s |
+| 64 KB | 128.3 µs | 487 MiB/s |
+| 1 MB | 2.38 ms | 419 MiB/s |
 
-Encrypt and decrypt are now nearly symmetric: the former decrypt penalty came
-from a keystream buffer plus a `2 × len` scratch resize per chunk, both of
-which are gone.  The remaining ~8% gap at 1 MB is the unavoidable ciphertext
-copy decrypt must keep so the pre-XOR bytes can be absorbed for authentication.
+### AEAD decrypt throughput (duplex)
+
+| Payload | Mean time | Throughput |
+|---------|-----------|------------|
+| 1 KB | 2.50 µs | 391 MiB/s |
+| 64 KB | 118.6 µs | 527 MiB/s |
+| 1 MB | 1.89 ms | 529 MiB/s |
 
 ### Key derivation
 
 | Benchmark | Mean time | Parameters |
 |-----------|-----------|------------|
-| `kdf_only` | 78.4 ms | Argon2id m=2^16 (64 MB), t=2, p=1 — minimum accepted by decrypt() |
+| `kdf_only` | 73.6 ms | Argon2id m=2^16 (64 MB), t=2, p=1 — minimum accepted by decrypt() |
 | `kdf_only` (production) | ~1 s (estimated) | Argon2id m=2^18 (256 MB), t=4, p=1 — default encryption parameters |
 
 > The production KDF estimate is extrapolated from the minimum-parameter
@@ -66,25 +62,27 @@ copy decrypt must keep so the pre-XOR bytes can be absorbed for authentication.
 
 ## Interpretation
 
-**Permutation cost (107 ns per call):**
-Each permutation applies 8 CML rounds over a 16×u64 (1024-bit) state.  At 107 ns
-per call and 64 bytes of output per squeeze, the raw permutation throughput
-ceiling is `64 / 107ns ≈ 570 MiB/s`.  The measured keystream rate of 538 MiB/s
-is within 6% of that ceiling — the buffered-squeeze path adds almost no overhead.
+**Permutation cost (98 ns per call):**
+Each permutation applies 8 CML rounds over a 16×u64 (1024-bit) state.  The
+duplex AEAD performs exactly one permutation per 64-byte block, so the raw
+ceiling is `64 / 98ns ≈ 622 MiB/s`.  The measured streaming plateau of
+~490–530 MiB/s sits at 80–85% of that ceiling; the gap is the per-block
+Mix13 keystream read, the XOR/injection word loop, and session bookkeeping.
 
-**Streaming throughput plateau (~280 MiB/s):**
-Throughput rises from ~230 MiB/s at 1 KB to a plateau of ~280 MiB/s at 64 KB
-as the fixed `cipher_init` cost amortises away.  The plateau is dominated by
-the absorb step in `aead_encrypt_chunk`/`aead_decrypt_chunk`: each 64-byte
-ciphertext block costs one absorb permutation in addition to the squeeze
-permutation for keystream, i.e. 2 permutations per 64 bytes
-(`64 / (2 × 107ns) ≈ 285 MiB/s` theoretical ceiling — the measured plateau
-sits essentially on it).  Any further large gain would require a duplex-style
-mode that combines squeeze and absorb in a single permutation pass, which is
-a file-format-breaking design change.
+**Duplex vs. the retired two-permutation mode:**
+The v9-format AEAD cost 2 permutations per 64 bytes (squeeze for keystream,
+padded absorb for authentication), capping it at ~285 MiB/s.  The duplex
+halves the permutation count, and the block-aligned fast path processes data
+word-wise directly between the caller's buffer and the rate with no staging
+buffers.  Encrypt and decrypt are now within noise of each other.
+
+**Chunking independence:**
+Unlike the retired mode, the duplex session buffers partial blocks, so
+ciphertext and tag are invariant under the caller's chunking; the streaming
+and in-memory paths produce identical bytes by construction.
 
 **KDF dominates at interactive scale:**
-At ~78 ms for the minimum-parameter KDF (and ~1 s for production parameters),
+At ~74 ms for the minimum-parameter KDF (and ~1 s for production parameters),
 the KDF completely dominates encryption time for any file smaller than a few
 hundred megabytes.  This is intentional — the KDF cost is what makes offline
 password-guessing attacks expensive.
@@ -93,16 +91,16 @@ password-guessing attacks expensive.
 
 ## Baseline and regression tracking
 
-These numbers serve as the v11 baseline.  To save them for future comparison:
+These numbers serve as the v10-duplex baseline.  To save them for future comparison:
 
 ```sh
-cargo bench --bench catwalk_bench -- --save-baseline v11
+cargo bench --bench catwalk_bench -- --save-baseline v10-duplex
 ```
 
 To compare a future change against this baseline:
 
 ```sh
-cargo bench --bench catwalk_bench -- --baseline v11
+cargo bench --bench catwalk_bench -- --baseline v10-duplex
 ```
 
 HTML reports are written to `target/criterion/` when `html_reports` feature is enabled.

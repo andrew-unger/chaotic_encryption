@@ -110,9 +110,11 @@ impl Drop for LockedBuffer {
 // ── Constants ────────────────────────────────────────────────────────────────
 
 pub mod constants {
-    /// File format version.  v9 uses CML-Sponge AEAD natively
-    /// (single primitive for cipher + auth via sponge capacity).
-    pub const VERSION: u8 = 9;
+    /// File format version.  v10 uses the duplex CML-Sponge AEAD: one
+    /// permutation per 64-byte block (keystream read + ciphertext injection
+    /// combined), replacing v9's two-permutation squeeze-then-absorb mode.
+    /// v9 files are not readable; the format predates any stable release.
+    pub const VERSION: u8 = 10;
     pub const MAGIC: &[u8; 4] = b"CATW";
     pub const SALT_LEN: usize = 16;
     pub const HASH_LEN: usize = 32;
@@ -251,12 +253,14 @@ fn derive_key(
     }
 }
 
-/// Derive the v9 cipher key from the master key via BLAKE3 domain derivation.
-fn derive_cipher_key_v9(master_key: &[u8; 32]) -> [u8; 32] {
-    blake3::derive_key("catwalk.v9.cipher", master_key)
+/// Derive the v10 cipher key from the master key via BLAKE3 domain derivation.
+/// The context string is versioned so keys for different format versions are
+/// domain-separated even under identical password/salt/timestamp inputs.
+fn derive_cipher_key_v10(master_key: &[u8; 32]) -> [u8; 32] {
+    blake3::derive_key("catwalk.v10.cipher", master_key)
 }
 
-/// Length in bytes of the fixed-size v9 header preamble (everything before
+/// Length in bytes of the fixed-size v10 header preamble (everything before
 /// the variable-length extension field): magic + version + flags + salt +
 /// timestamp + nonce + argon-params(3) + ext_len.
 const FIXED_HEADER_LEN: usize = 4 + 1 + 1 + SALT_LEN + TIMESTAMP_LEN + NONCE_LEN + 3 + 1;
@@ -323,9 +327,9 @@ fn compute_encrypt_meta(
     })
 }
 
-/// Serialize the v9 header bytes (which double as AEAD associated data).
+/// Serialize the v10 header bytes (which double as AEAD associated data).
 #[allow(clippy::too_many_arguments)]
-fn build_v9_header(
+fn build_v10_header(
     flags: u8,
     salt: &[u8; SALT_LEN],
     timestamp: &[u8; TIMESTAMP_LEN],
@@ -350,10 +354,10 @@ fn build_v9_header(
     header
 }
 
-/// Parsed fixed-size prefix of a v9 header.  Validates magic, version, and
+/// Parsed fixed-size prefix of a v10 header.  Validates magic, version, and
 /// rejects below-floor Argon2id parameters.  Does not read the variable-length
 /// extension bytes — `ext_len` is returned so the caller can read them next.
-struct V9HeaderPrefix {
+struct V10HeaderPrefix {
     flags: u8,
     salt: [u8; SALT_LEN],
     timestamp: [u8; TIMESTAMP_LEN],
@@ -364,7 +368,7 @@ struct V9HeaderPrefix {
     ext_len: usize,
 }
 
-fn parse_v9_header_prefix(buf: &[u8]) -> Result<V9HeaderPrefix, CryptoError> {
+fn parse_v10_header_prefix(buf: &[u8]) -> Result<V10HeaderPrefix, CryptoError> {
     if buf.len() < FIXED_HEADER_LEN {
         return Err(CryptoError::InvalidCiphertextLength);
     }
@@ -408,7 +412,7 @@ fn parse_v9_header_prefix(buf: &[u8]) -> Result<V9HeaderPrefix, CryptoError> {
 
     let ext_len = buf[ext_len_pos] as usize;
 
-    Ok(V9HeaderPrefix {
+    Ok(V10HeaderPrefix {
         flags,
         salt,
         timestamp,
@@ -434,11 +438,11 @@ fn resolve_keyfile(flags: u8, supplied: Option<&Path>) -> Result<Option<&Path>, 
     }
 }
 
-/// Parsed v9 header from a seekable stream, with the stored tag already
+/// Parsed v10 header from a seekable stream, with the stored tag already
 /// fetched.  After this returns the reader's position is at the start of
 /// the ciphertext body.
-struct V9StreamHeader {
-    prefix: V9HeaderPrefix,
+struct V10StreamHeader {
+    prefix: V10HeaderPrefix,
     /// Full header bytes (fixed prefix + extension) — used as AEAD AAD.
     header_bytes: Vec<u8>,
     stored_tag: [u8; HASH_LEN],
@@ -447,10 +451,10 @@ struct V9StreamHeader {
     extension_str: String,
 }
 
-/// Read and validate the v9 header from a seekable reader, then read the
+/// Read and validate the v10 header from a seekable reader, then read the
 /// 32-byte authentication tag from the end of the file.  Leaves the reader
 /// positioned at the start of the ciphertext body.
-fn read_v9_stream_header<R: Read + Seek>(reader: &mut R) -> Result<V9StreamHeader, CryptoError> {
+fn read_v10_stream_header<R: Read + Seek>(reader: &mut R) -> Result<V10StreamHeader, CryptoError> {
     let file_size = reader.seek(SeekFrom::End(0))? as usize;
     reader.seek(SeekFrom::Start(0))?;
     if file_size < MIN_HEADER_LEN {
@@ -459,7 +463,7 @@ fn read_v9_stream_header<R: Read + Seek>(reader: &mut R) -> Result<V9StreamHeade
 
     let mut fixed = vec![0u8; FIXED_HEADER_LEN];
     reader.read_exact(&mut fixed)?;
-    let prefix = parse_v9_header_prefix(&fixed)?;
+    let prefix = parse_v10_header_prefix(&fixed)?;
 
     let mut ext_bytes = vec![0u8; prefix.ext_len];
     if prefix.ext_len > 0 {
@@ -484,7 +488,7 @@ fn read_v9_stream_header<R: Read + Seek>(reader: &mut R) -> Result<V9StreamHeade
     header_bytes.extend_from_slice(&ext_bytes);
     let extension_str = String::from_utf8(ext_bytes).unwrap_or_else(|_| "???".to_string());
 
-    Ok(V9StreamHeader {
+    Ok(V10StreamHeader {
         prefix,
         header_bytes,
         stored_tag,
@@ -495,7 +499,7 @@ fn read_v9_stream_header<R: Read + Seek>(reader: &mut R) -> Result<V9StreamHeade
 
 /// Derive the per-session cipher key for one ciphertext: build the KDF input,
 /// run Argon2id to obtain the master key, then BLAKE3-domain-derive the
-/// v9 cipher key.  The intermediate master key lives only inside this
+/// v10 cipher key.  The intermediate master key lives only inside this
 /// function and is zeroized when its `LockedBuffer` drops.
 fn derive_session_cipher_key(
     password: &str,
@@ -511,7 +515,7 @@ fn derive_session_cipher_key(
         &kdf_input, salt, timestamp, m_log2, t_cost, p_cost,
     )?);
     kdf_input.zeroize();
-    let cipher_key = LockedBuffer::new(derive_cipher_key_v9(master_key.get()));
+    let cipher_key = LockedBuffer::new(derive_cipher_key_v10(master_key.get()));
     Ok(cipher_key)
 }
 
@@ -540,31 +544,30 @@ pub fn validate_password(password: &str) -> Result<(), &'static str> {
 
 // ── AEAD session helpers (shared by encrypt/decrypt, in-memory and streaming) ─
 
-/// Initialise the CML-sponge with the cipher key + nonce and absorb the
-/// header bytes as Associated Data.  Replaces the `cipher_init` + `absorb_aad`
-/// pair that appears in `encrypt`, `encrypt_stream`, `decrypt_v9`, and
-/// `decrypt_stream`.
+/// Initialise a duplex AEAD session with the cipher key + nonce and absorb
+/// the header bytes as Associated Data.  Shared by `encrypt`,
+/// `encrypt_stream`, `decrypt_v10`, and `decrypt_stream`.
 #[inline]
-fn init_aead_sponge(
+fn init_aead_session(
     cipher_key: &[u8; 32],
     nonce: &[u8; NONCE_LEN],
     header_bytes: &[u8],
-) -> cml_sponge::CmlSpongeState {
-    let mut sponge = cml_sponge::cipher_init(cipher_key, nonce);
-    cml_sponge::absorb_aad(&mut sponge, header_bytes);
-    sponge
+) -> cml_sponge::AeadSession {
+    let mut session = cml_sponge::AeadSession::new(cipher_key, nonce);
+    session.absorb_aad(header_bytes);
+    session
 }
 
-/// Process an in-memory buffer through the AEAD chunk operation in
-/// STREAM_CHUNK-sized slices, reporting progress along the way.
+/// Process an in-memory buffer through the AEAD session in STREAM_CHUNK-sized
+/// slices, reporting progress along the way.
 ///
-/// `chunk_op` is `cml_sponge::aead_encrypt_chunk` for the encrypt path or a
-/// closure wrapping `cml_sponge::aead_decrypt_chunk` (which owns the reusable
-/// ciphertext scratch buffer) for the decrypt path.
+/// `chunk_op` is `AeadSession::encrypt_chunk` or `AeadSession::decrypt_chunk`.
+/// Chunking exists purely for progress reporting — the duplex session
+/// produces identical output for any chunking.
 fn aead_process_in_place(
-    sponge: &mut cml_sponge::CmlSpongeState,
+    session: &mut cml_sponge::AeadSession,
     data: &mut [u8],
-    mut chunk_op: impl FnMut(&mut cml_sponge::CmlSpongeState, &mut [u8]),
+    chunk_op: fn(&mut cml_sponge::AeadSession, &mut [u8]),
     progress: &Option<&ProgressFn>,
     progress_start: f32,
     progress_span: f32,
@@ -573,7 +576,7 @@ fn aead_process_in_place(
     let mut offset = 0;
     while offset < total_len {
         let end = (offset + STREAM_CHUNK).min(total_len);
-        chunk_op(sponge, &mut data[offset..end]);
+        chunk_op(session, &mut data[offset..end]);
         offset = end;
         if progress.is_some() {
             let frac = offset as f32 / total_len as f32;
@@ -582,9 +585,9 @@ fn aead_process_in_place(
     }
 }
 
-// ── Encrypt (v9 — CML-Sponge AEAD) ──────────────────────────────────────────
+// ── Encrypt (v10 — duplex CML-Sponge AEAD) ──────────────────────────────────
 
-/// Encrypt `plaintext` and return the complete CATWALK v9 ciphertext bundle.
+/// Encrypt `plaintext` and return the complete CATWALK v10 ciphertext bundle.
 ///
 /// The returned bytes contain the header, ciphertext, and 32-byte AEAD tag —
 /// all in one contiguous buffer ready to write to disk.
@@ -642,7 +645,7 @@ pub fn encrypt(
     )?;
     report(progress, 0.35);
 
-    let header = build_v9_header(
+    let header = build_v10_header(
         meta.flags,
         &salt,
         &meta.timestamp,
@@ -653,7 +656,7 @@ pub fn encrypt(
         &meta.extension,
     );
 
-    let mut sponge = init_aead_sponge(cipher_key.get(), &nonce, &header);
+    let mut session = init_aead_session(cipher_key.get(), &nonce, &header);
 
     // Phase 3: Stream encrypt + authenticate (0.35 → 0.85).
     // The output bundle is assembled first and encrypted in place, so the
@@ -668,9 +671,9 @@ pub fn encrypt(
         c.zeroize();
     }
     aead_process_in_place(
-        &mut sponge,
+        &mut session,
         &mut result[body_start..],
-        cml_sponge::aead_encrypt_chunk,
+        cml_sponge::AeadSession::encrypt_chunk,
         progress,
         0.35,
         0.50,
@@ -678,15 +681,15 @@ pub fn encrypt(
     report(progress, 0.85);
 
     // Phase 4: Finalise tag + append (0.85 → 0.90)
-    let tag = cml_sponge::aead_finalize(&mut sponge);
+    let tag = session.finalize();
     result.extend_from_slice(&tag);
     report(progress, 0.90);
     Ok(result)
 }
 
-// ── Decrypt (v9 — CML-Sponge AEAD) ──────────────────────────────────────────
+// ── Decrypt (v10 — duplex CML-Sponge AEAD) ──────────────────────────────────────────
 
-/// Decrypt a complete CATWALK v9 ciphertext bundle and return `(plaintext, extension)`.
+/// Decrypt a complete CATWALK v10 ciphertext bundle and return `(plaintext, extension)`.
 ///
 /// `extension` is the original file extension stored in the header (empty string if
 /// `strip_metadata` was set during encryption or no extension was present).
@@ -721,7 +724,7 @@ pub fn decrypt(
         return Err(CryptoError::InvalidCiphertextLength);
     }
 
-    let prefix = parse_v9_header_prefix(ciphertext_bundle)?;
+    let prefix = parse_v10_header_prefix(ciphertext_bundle)?;
     let effective_keyfile = resolve_keyfile(prefix.flags, keyfile_path)?;
 
     let ext_start = FIXED_HEADER_LEN;
@@ -747,7 +750,7 @@ pub fn decrypt(
     )?;
     report(progress, 0.35);
 
-    decrypt_v9(
+    decrypt_v10(
         &cipher_key,
         &prefix.nonce,
         &ciphertext_bundle[..cipher_start],
@@ -817,7 +820,7 @@ pub fn encrypt_stream<R: Read, W: Write>(
     )?;
     report(progress, 0.35);
 
-    let header = build_v9_header(
+    let header = build_v10_header(
         meta.flags,
         &salt,
         &meta.timestamp,
@@ -829,7 +832,7 @@ pub fn encrypt_stream<R: Read, W: Write>(
     );
     writer.write_all(&header)?;
 
-    let mut sponge = init_aead_sponge(cipher_key.get(), &nonce, &header);
+    let mut session = init_aead_session(cipher_key.get(), &nonce, &header);
 
     // Stream encrypt (0.35 → 0.85).
     let mut buf = vec![0u8; STREAM_CHUNK];
@@ -841,7 +844,7 @@ pub fn encrypt_stream<R: Read, W: Write>(
             if n == 0 {
                 break;
             }
-            cml_sponge::aead_encrypt_chunk(&mut sponge, &mut buf[..n]);
+            session.encrypt_chunk(&mut buf[..n]);
             writer.write_all(&buf[..n])?;
             bytes_out += n as u64;
             if let Some(total) = input_len {
@@ -866,7 +869,7 @@ pub fn encrypt_stream<R: Read, W: Write>(
     buf.zeroize();
     report(progress, 0.85);
 
-    let tag = cml_sponge::aead_finalize(&mut sponge);
+    let tag = session.finalize();
     writer.write_all(&tag)?;
     report(progress, 0.90);
     Ok(())
@@ -909,7 +912,7 @@ pub fn decrypt_stream<R: Read + Seek, W: Write>(
     let progress = &progress;
     report(progress, 0.0);
 
-    let stream_header = read_v9_stream_header(reader)?;
+    let stream_header = read_v10_stream_header(reader)?;
     let effective_keyfile = resolve_keyfile(stream_header.prefix.flags, keyfile_path)?;
 
     // KDF (0.05 → 0.35)
@@ -925,7 +928,7 @@ pub fn decrypt_stream<R: Read + Seek, W: Write>(
     )?;
     report(progress, 0.35);
 
-    let mut sponge = init_aead_sponge(
+    let mut session = init_aead_session(
         cipher_key.get(),
         &stream_header.prefix.nonce,
         &stream_header.header_bytes,
@@ -936,14 +939,13 @@ pub fn decrypt_stream<R: Read + Seek, W: Write>(
     let use_zstd = (stream_header.prefix.flags & FLAG_ZSTD) != 0;
     let cipher_len = stream_header.cipher_len;
     let mut buf = vec![0u8; STREAM_CHUNK];
-    let mut scratch = Vec::with_capacity(STREAM_CHUNK);
     let mut remaining = cipher_len;
 
     let mut decrypt_loop = |sink: &mut dyn Write| -> Result<(), CryptoError> {
         while remaining > 0 {
             let to_read = remaining.min(STREAM_CHUNK);
             reader.read_exact(&mut buf[..to_read])?;
-            cml_sponge::aead_decrypt_chunk(&mut sponge, &mut buf[..to_read], &mut scratch);
+            session.decrypt_chunk(&mut buf[..to_read]);
             sink.write_all(&buf[..to_read])?;
             remaining -= to_read;
             // cipher_len.max(1) avoids division by zero when cipher_len == 0
@@ -984,7 +986,7 @@ pub fn decrypt_stream<R: Read + Seek, W: Write>(
     report(progress, 0.85);
 
     // Verify authentication tag (constant-time).
-    let computed_tag = cml_sponge::aead_finalize(&mut sponge);
+    let computed_tag = session.finalize();
     if computed_tag.ct_eq(&stream_header.stored_tag).unwrap_u8() != 1 {
         return Err(CryptoError::IntegrityCheckFailed);
     }
@@ -993,10 +995,10 @@ pub fn decrypt_stream<R: Read + Seek, W: Write>(
     Ok(stream_header.extension_str)
 }
 
-// ── v9 decryption (CML-Sponge AEAD) ─────────────────────────────────────────
+// ── v10 decryption (duplex CML-Sponge AEAD) ─────────────────────────────────
 
 #[allow(clippy::too_many_arguments)]
-fn decrypt_v9(
+fn decrypt_v10(
     cipher_key: &LockedBuffer,
     nonce: &[u8; NONCE_LEN],
     header: &[u8],
@@ -1006,16 +1008,15 @@ fn decrypt_v9(
     extension: &[u8],
     progress: &Option<&ProgressFn>,
 ) -> Result<(Vec<u8>, String), CryptoError> {
-    // Init sponge and absorb header as AAD — must match encryption exactly.
-    let mut sponge = init_aead_sponge(cipher_key.get(), nonce, header);
+    // Init session and absorb header as AAD — must match encryption exactly.
+    let mut session = init_aead_session(cipher_key.get(), nonce, header);
 
     // Phase 3: Stream decrypt (0.40 → 0.85)
     let mut decrypted = encrypted.to_vec();
-    let mut scratch = Vec::with_capacity(STREAM_CHUNK);
     aead_process_in_place(
-        &mut sponge,
+        &mut session,
         &mut decrypted,
-        |sponge, chunk| cml_sponge::aead_decrypt_chunk(sponge, chunk, &mut scratch),
+        cml_sponge::AeadSession::decrypt_chunk,
         progress,
         0.40,
         0.45,
@@ -1023,7 +1024,7 @@ fn decrypt_v9(
     report(progress, 0.85);
 
     // Verify authentication tag (constant-time).
-    let computed_tag = cml_sponge::aead_finalize(&mut sponge);
+    let computed_tag = session.finalize();
     if computed_tag.ct_eq(stored_tag).unwrap_u8() != 1 {
         return Err(CryptoError::IntegrityCheckFailed);
     }
@@ -1108,7 +1109,7 @@ mod tests {
         let salt = [0u8; constants::SALT_LEN];
         let ts = [0u8; constants::TIMESTAMP_LEN];
         let nonce = [0u8; constants::NONCE_LEN];
-        let header = build_v9_header(
+        let header = build_v10_header(
             0,
             &salt,
             &ts,
@@ -1119,7 +1120,7 @@ mod tests {
             &[],
         );
         assert!(matches!(
-            parse_v9_header_prefix(&header),
+            parse_v10_header_prefix(&header),
             Err(CryptoError::KdfParametersOutOfRange)
         ));
     }
@@ -1129,7 +1130,7 @@ mod tests {
         let salt = [0u8; constants::SALT_LEN];
         let ts = [0u8; constants::TIMESTAMP_LEN];
         let nonce = [0u8; constants::NONCE_LEN];
-        let header = build_v9_header(
+        let header = build_v10_header(
             0,
             &salt,
             &ts,
@@ -1140,7 +1141,7 @@ mod tests {
             &[],
         );
         assert!(matches!(
-            parse_v9_header_prefix(&header),
+            parse_v10_header_prefix(&header),
             Err(CryptoError::KdfParametersOutOfRange)
         ));
     }
@@ -1150,7 +1151,7 @@ mod tests {
         let salt = [0u8; constants::SALT_LEN];
         let ts = [0u8; constants::TIMESTAMP_LEN];
         let nonce = [0u8; constants::NONCE_LEN];
-        let header = build_v9_header(
+        let header = build_v10_header(
             0,
             &salt,
             &ts,
@@ -1160,6 +1161,6 @@ mod tests {
             constants::ARGON2_P_COST,
             &[],
         );
-        assert!(parse_v9_header_prefix(&header).is_ok());
+        assert!(parse_v10_header_prefix(&header).is_ok());
     }
 }

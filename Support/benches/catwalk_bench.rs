@@ -13,10 +13,7 @@
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 
 use argon2::{Algorithm, Argon2, Params, Version};
-use catwalk::cml_sponge::{
-    absorb_aad, aead_decrypt_chunk, aead_encrypt_chunk, aead_finalize, cipher_init, cml_permute_r,
-    keystream,
-};
+use catwalk::cml_sponge::{cipher_init, cml_permute_r, keystream, AeadSession};
 
 // ── Fixed test vectors ──────────────────────────────────────────────────────
 
@@ -34,11 +31,11 @@ const AAD: &[u8] = b"CATWALK benchmark AAD";
 // ── Helper: encrypt a buffer and return (ciphertext, tag) ──────────────────
 
 fn aead_encrypt(plaintext: &[u8]) -> (Vec<u8>, [u8; 32]) {
-    let mut state = cipher_init(&KEY, &IV);
-    absorb_aad(&mut state, AAD);
+    let mut session = AeadSession::new(&KEY, &IV);
+    session.absorb_aad(AAD);
     let mut ct = plaintext.to_vec();
-    aead_encrypt_chunk(&mut state, &mut ct);
-    let tag = aead_finalize(&mut state);
+    session.encrypt_chunk(&mut ct);
+    let tag = session.finalize();
     (ct, tag)
 }
 
@@ -75,11 +72,11 @@ fn bench_encrypt(c: &mut Criterion) {
         group.throughput(Throughput::Bytes(*size as u64));
         group.bench_with_input(BenchmarkId::from_parameter(label), size, |b, _| {
             b.iter(|| {
-                let mut state = cipher_init(&KEY, &IV);
-                absorb_aad(&mut state, AAD);
+                let mut session = AeadSession::new(&KEY, &IV);
+                session.absorb_aad(AAD);
                 let mut ct = plaintext.clone();
-                aead_encrypt_chunk(&mut state, &mut ct);
-                aead_finalize(&mut state)
+                session.encrypt_chunk(&mut ct);
+                session.finalize()
             });
         });
     }
@@ -99,12 +96,11 @@ fn bench_decrypt(c: &mut Criterion) {
         group.throughput(Throughput::Bytes(*size as u64));
         group.bench_with_input(BenchmarkId::from_parameter(label), &ciphertext, |b, ct| {
             b.iter(|| {
-                let mut state = cipher_init(&KEY, &IV);
-                absorb_aad(&mut state, AAD);
+                let mut session = AeadSession::new(&KEY, &IV);
+                session.absorb_aad(AAD);
                 let mut buf = ct.clone();
-                let mut scratch = vec![];
-                aead_decrypt_chunk(&mut state, &mut buf, &mut scratch);
-                aead_finalize(&mut state)
+                session.decrypt_chunk(&mut buf);
+                session.finalize()
             });
         });
     }

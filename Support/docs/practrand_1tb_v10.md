@@ -1,5 +1,11 @@
 # CATWALK v10 — PractRand 1 TB Validation
 
+> **Status (2026-06-09): partial.** Seeds 0 and 1 are complete at 1 TB; the
+> remaining planned seeds (2, 3, 64, 128, 254, 255) are pending and marked as
+> such below.  Note: this validation tests the **keystream/permutation** path
+> (`cml_keystream_dump`), which is unchanged by the v10 file-format duplex
+> AEAD switch — these results remain valid for the current code.
+
 **Date:** 2026-03-19
 **Construction:** CATWALK v10
 **Coupling distances:** {1, 3, 7, 11}

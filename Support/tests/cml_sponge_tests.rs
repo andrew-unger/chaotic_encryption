@@ -19,8 +19,8 @@
 //!   - AEAD: tag changes with AAD/ciphertext, round-trip, empty message, domain separation
 
 use catwalk::cml_sponge::{
-    absorb_aad, aead_decrypt_chunk, aead_encrypt_chunk, aead_finalize, cipher_init, cipher_init_r,
-    decrypt_in_place, encrypt_in_place, keystream, keystream_r,
+    cipher_init, cipher_init_r, decrypt_in_place, encrypt_in_place, keystream, keystream_r,
+    AeadSession,
 };
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -335,19 +335,19 @@ fn aead_tag_changes_with_aad() {
     let plaintext = b"some secret data";
 
     let tag_with_aad_a = {
-        let mut s = cipher_init(&key, &iv);
-        absorb_aad(&mut s, b"header_a");
+        let mut s = AeadSession::new(&key, &iv);
+        s.absorb_aad(b"header_a");
         let mut ct = plaintext.to_vec();
-        aead_encrypt_chunk(&mut s, &mut ct);
-        aead_finalize(&mut s)
+        s.encrypt_chunk(&mut ct);
+        s.finalize()
     };
 
     let tag_with_aad_b = {
-        let mut s = cipher_init(&key, &iv);
-        absorb_aad(&mut s, b"header_b"); // different AAD
+        let mut s = AeadSession::new(&key, &iv);
+        s.absorb_aad(b"header_b"); // different AAD
         let mut ct = plaintext.to_vec();
-        aead_encrypt_chunk(&mut s, &mut ct);
-        aead_finalize(&mut s)
+        s.encrypt_chunk(&mut ct);
+        s.finalize()
     };
 
     assert_ne!(
@@ -366,11 +366,11 @@ fn aead_tag_changes_with_ciphertext_tamper() {
 
     // Encrypt and get tag
     let (ciphertext, original_tag) = {
-        let mut s = cipher_init(&key, &iv);
-        absorb_aad(&mut s, aad);
+        let mut s = AeadSession::new(&key, &iv);
+        s.absorb_aad(aad);
         let mut ct = plaintext.to_vec();
-        aead_encrypt_chunk(&mut s, &mut ct);
-        let tag = aead_finalize(&mut s);
+        s.encrypt_chunk(&mut ct);
+        let tag = s.finalize();
         (ct, tag)
     };
 
@@ -379,11 +379,11 @@ fn aead_tag_changes_with_ciphertext_tamper() {
     tampered[0] ^= 0xFF;
 
     let tampered_tag = {
-        let mut s = cipher_init(&key, &iv);
-        absorb_aad(&mut s, aad);
+        let mut s = AeadSession::new(&key, &iv);
+        s.absorb_aad(aad);
         let mut buf = tampered.clone();
-        aead_decrypt_chunk(&mut s, &mut buf, &mut vec![]);
-        aead_finalize(&mut s)
+        s.decrypt_chunk(&mut buf);
+        s.finalize()
     };
 
     assert_ne!(
@@ -402,11 +402,11 @@ fn aead_encrypt_decrypt_roundtrip_direct() {
 
     // Encrypt
     let (ciphertext, enc_tag) = {
-        let mut s = cipher_init(&key, &iv);
-        absorb_aad(&mut s, aad);
+        let mut s = AeadSession::new(&key, &iv);
+        s.absorb_aad(aad);
         let mut ct = plaintext.to_vec();
-        aead_encrypt_chunk(&mut s, &mut ct);
-        let tag = aead_finalize(&mut s);
+        s.encrypt_chunk(&mut ct);
+        let tag = s.finalize();
         (ct, tag)
     };
 
@@ -417,11 +417,11 @@ fn aead_encrypt_decrypt_roundtrip_direct() {
 
     // Decrypt
     let (recovered, dec_tag) = {
-        let mut s = cipher_init(&key, &iv);
-        absorb_aad(&mut s, aad);
+        let mut s = AeadSession::new(&key, &iv);
+        s.absorb_aad(aad);
         let mut pt = ciphertext.clone();
-        aead_decrypt_chunk(&mut s, &mut pt, &mut vec![]);
-        let tag = aead_finalize(&mut s);
+        s.decrypt_chunk(&mut pt);
+        let tag = s.finalize();
         (pt, tag)
     };
 
@@ -440,10 +440,10 @@ fn aead_empty_message() {
     let aad = b"non-empty associated data";
 
     let tag = {
-        let mut s = cipher_init(&key, &iv);
-        absorb_aad(&mut s, aad);
+        let mut s = AeadSession::new(&key, &iv);
+        s.absorb_aad(aad);
         // No aead_encrypt_chunk calls — zero-length message
-        aead_finalize(&mut s)
+        s.finalize()
     };
 
     // Tag must be non-zero and exactly 32 bytes
@@ -461,17 +461,17 @@ fn aead_absorb_aad_domain_separation() {
 
     // Absorb as AAD only (no ciphertext)
     let tag_aad_only = {
-        let mut s = cipher_init(&key, &iv);
-        absorb_aad(&mut s, data);
-        aead_finalize(&mut s)
+        let mut s = AeadSession::new(&key, &iv);
+        s.absorb_aad(data);
+        s.finalize()
     };
 
     // Absorb as ciphertext only (no AAD)
     let tag_ct_only = {
-        let mut s = cipher_init(&key, &iv);
+        let mut s = AeadSession::new(&key, &iv);
         let mut buf = data.to_vec();
-        aead_encrypt_chunk(&mut s, &mut buf);
-        aead_finalize(&mut s)
+        s.encrypt_chunk(&mut buf);
+        s.finalize()
     };
 
     assert_ne!(
@@ -485,8 +485,8 @@ fn aead_absorb_aad_domain_separation() {
 /// Encrypting 192 bytes in three 64-byte chunks and decrypting in the same
 /// three chunks must recover the original plaintext with matching tags.
 /// This confirms that chunk boundaries are handled consistently across the
-/// encrypt/decrypt pair — the SpongeWrap absorb-after-XOR protocol produces
-/// identical state evolution regardless of which side performs it.
+/// encrypt/decrypt pair — both sides inject the same ciphertext into the
+/// duplex, so their state evolution is identical.
 #[test]
 fn aead_multi_chunk_encrypt_decrypt_roundtrip() {
     let key: [u8; 32] = core::array::from_fn(|i| (i * 5 + 0x10) as u8);
@@ -496,15 +496,15 @@ fn aead_multi_chunk_encrypt_decrypt_roundtrip() {
 
     // Encrypt in three 64-byte chunks
     let (ct0, ct1, ct2, enc_tag) = {
-        let mut s = cipher_init(&key, &iv);
-        absorb_aad(&mut s, aad);
+        let mut s = AeadSession::new(&key, &iv);
+        s.absorb_aad(aad);
         let mut c0 = plaintext[0..64].to_vec();
         let mut c1 = plaintext[64..128].to_vec();
         let mut c2 = plaintext[128..192].to_vec();
-        aead_encrypt_chunk(&mut s, &mut c0);
-        aead_encrypt_chunk(&mut s, &mut c1);
-        aead_encrypt_chunk(&mut s, &mut c2);
-        let tag = aead_finalize(&mut s);
+        s.encrypt_chunk(&mut c0);
+        s.encrypt_chunk(&mut c1);
+        s.encrypt_chunk(&mut c2);
+        let tag = s.finalize();
         (c0, c1, c2, tag)
     };
 
@@ -517,15 +517,15 @@ fn aead_multi_chunk_encrypt_decrypt_roundtrip() {
 
     // Decrypt in three 64-byte chunks
     let (pt0, pt1, pt2, dec_tag) = {
-        let mut s = cipher_init(&key, &iv);
-        absorb_aad(&mut s, aad);
+        let mut s = AeadSession::new(&key, &iv);
+        s.absorb_aad(aad);
         let mut d0 = ct0.clone();
         let mut d1 = ct1.clone();
         let mut d2 = ct2.clone();
-        aead_decrypt_chunk(&mut s, &mut d0, &mut vec![]);
-        aead_decrypt_chunk(&mut s, &mut d1, &mut vec![]);
-        aead_decrypt_chunk(&mut s, &mut d2, &mut vec![]);
-        let tag = aead_finalize(&mut s);
+        s.decrypt_chunk(&mut d0);
+        s.decrypt_chunk(&mut d1);
+        s.decrypt_chunk(&mut d2);
+        let tag = s.finalize();
         (d0, d1, d2, tag)
     };
 
@@ -619,19 +619,18 @@ fn aead_roundtrip_63_bytes() {
     let iv = [0x22u8; 16];
     let aad = b"aad-63";
     let mut pt = vec![0xAAu8; 63];
-    let mut buf = Vec::new();
 
-    let mut enc = cipher_init(&key, &iv);
-    absorb_aad(&mut enc, aad);
-    aead_encrypt_chunk(&mut enc, &mut pt);
-    let enc_tag = aead_finalize(&mut enc);
+    let mut enc = AeadSession::new(&key, &iv);
+    enc.absorb_aad(aad);
+    enc.encrypt_chunk(&mut pt);
+    let enc_tag = enc.finalize();
 
     let ct = pt.clone();
     let mut dec_ct = ct.clone();
-    let mut dec = cipher_init(&key, &iv);
-    absorb_aad(&mut dec, aad);
-    aead_decrypt_chunk(&mut dec, &mut dec_ct, &mut buf);
-    let dec_tag = aead_finalize(&mut dec);
+    let mut dec = AeadSession::new(&key, &iv);
+    dec.absorb_aad(aad);
+    dec.decrypt_chunk(&mut dec_ct);
+    let dec_tag = dec.finalize();
 
     assert_eq!(enc_tag, dec_tag, "tags must match for 63-byte plaintext");
     assert_eq!(
@@ -648,18 +647,17 @@ fn aead_roundtrip_64_bytes() {
     let iv = [0x44u8; 16];
     let aad = b"aad-64";
     let mut pt = vec![0xBBu8; 64];
-    let mut buf = Vec::new();
 
-    let mut enc = cipher_init(&key, &iv);
-    absorb_aad(&mut enc, aad);
-    aead_encrypt_chunk(&mut enc, &mut pt);
-    let enc_tag = aead_finalize(&mut enc);
+    let mut enc = AeadSession::new(&key, &iv);
+    enc.absorb_aad(aad);
+    enc.encrypt_chunk(&mut pt);
+    let enc_tag = enc.finalize();
 
     let mut dec_ct = pt.clone();
-    let mut dec = cipher_init(&key, &iv);
-    absorb_aad(&mut dec, aad);
-    aead_decrypt_chunk(&mut dec, &mut dec_ct, &mut buf);
-    let dec_tag = aead_finalize(&mut dec);
+    let mut dec = AeadSession::new(&key, &iv);
+    dec.absorb_aad(aad);
+    dec.decrypt_chunk(&mut dec_ct);
+    let dec_tag = dec.finalize();
 
     assert_eq!(enc_tag, dec_tag, "tags must match for 64-byte plaintext");
     assert_eq!(
@@ -676,18 +674,17 @@ fn aead_roundtrip_65_bytes() {
     let iv = [0x66u8; 16];
     let aad = b"aad-65";
     let mut pt = vec![0xCCu8; 65];
-    let mut buf = Vec::new();
 
-    let mut enc = cipher_init(&key, &iv);
-    absorb_aad(&mut enc, aad);
-    aead_encrypt_chunk(&mut enc, &mut pt);
-    let enc_tag = aead_finalize(&mut enc);
+    let mut enc = AeadSession::new(&key, &iv);
+    enc.absorb_aad(aad);
+    enc.encrypt_chunk(&mut pt);
+    let enc_tag = enc.finalize();
 
     let mut dec_ct = pt.clone();
-    let mut dec = cipher_init(&key, &iv);
-    absorb_aad(&mut dec, aad);
-    aead_decrypt_chunk(&mut dec, &mut dec_ct, &mut buf);
-    let dec_tag = aead_finalize(&mut dec);
+    let mut dec = AeadSession::new(&key, &iv);
+    dec.absorb_aad(aad);
+    dec.decrypt_chunk(&mut dec_ct);
+    let dec_tag = dec.finalize();
 
     assert_eq!(enc_tag, dec_tag, "tags must match for 65-byte plaintext");
     assert_eq!(
@@ -704,18 +701,17 @@ fn aead_roundtrip_128_bytes() {
     let iv = [0x88u8; 16];
     let aad = b"aad-128";
     let mut pt = vec![0xDDu8; 128];
-    let mut buf = Vec::new();
 
-    let mut enc = cipher_init(&key, &iv);
-    absorb_aad(&mut enc, aad);
-    aead_encrypt_chunk(&mut enc, &mut pt);
-    let enc_tag = aead_finalize(&mut enc);
+    let mut enc = AeadSession::new(&key, &iv);
+    enc.absorb_aad(aad);
+    enc.encrypt_chunk(&mut pt);
+    let enc_tag = enc.finalize();
 
     let mut dec_ct = pt.clone();
-    let mut dec = cipher_init(&key, &iv);
-    absorb_aad(&mut dec, aad);
-    aead_decrypt_chunk(&mut dec, &mut dec_ct, &mut buf);
-    let dec_tag = aead_finalize(&mut dec);
+    let mut dec = AeadSession::new(&key, &iv);
+    dec.absorb_aad(aad);
+    dec.decrypt_chunk(&mut dec_ct);
+    let dec_tag = dec.finalize();
 
     assert_eq!(enc_tag, dec_tag, "tags must match for 128-byte plaintext");
     assert_eq!(
@@ -726,10 +722,9 @@ fn aead_roundtrip_128_bytes() {
 }
 
 /// AEAD round-trip across multiple chunks whose lengths are NOT multiples of
-/// the 64-byte rate.  This exercises the keystream-buffer invalidation that must
-/// happen after each `absorb`: a partial-block chunk leaves keystream bytes
-/// buffered, and the following chunk must squeeze fresh state rather than reuse
-/// pre-absorb keystream.  Encrypt and decrypt must agree and recover the input.
+/// the 64-byte rate.  This exercises the session's partial-block buffering:
+/// a chunk may end mid-block and the next chunk must continue the same block's
+/// keystream seamlessly.  Encrypt and decrypt must agree and recover the input.
 #[test]
 fn aead_roundtrip_unaligned_multi_chunk() {
     let key = [0x9Cu8; 32];
@@ -740,15 +735,15 @@ fn aead_roundtrip_unaligned_multi_chunk() {
 
     // Encrypt chunk-by-chunk.
     let (ciphertext, enc_tag) = {
-        let mut s = cipher_init(&key, &iv);
-        absorb_aad(&mut s, aad);
+        let mut s = AeadSession::new(&key, &iv);
+        s.absorb_aad(aad);
         let mut ct = plaintext.clone();
         let mut off = 0;
         for &n in &sizes {
-            aead_encrypt_chunk(&mut s, &mut ct[off..off + n]);
+            s.encrypt_chunk(&mut ct[off..off + n]);
             off += n;
         }
-        let tag = aead_finalize(&mut s);
+        let tag = s.finalize();
         (ct, tag)
     };
     assert_ne!(
@@ -758,16 +753,15 @@ fn aead_roundtrip_unaligned_multi_chunk() {
 
     // Decrypt with the same chunk boundaries.
     let (recovered, dec_tag) = {
-        let mut s = cipher_init(&key, &iv);
-        absorb_aad(&mut s, aad);
+        let mut s = AeadSession::new(&key, &iv);
+        s.absorb_aad(aad);
         let mut pt = ciphertext.clone();
-        let mut buf = Vec::new();
         let mut off = 0;
         for &n in &sizes {
-            aead_decrypt_chunk(&mut s, &mut pt[off..off + n], &mut buf);
+            s.decrypt_chunk(&mut pt[off..off + n]);
             off += n;
         }
-        let tag = aead_finalize(&mut s);
+        let tag = s.finalize();
         (pt, tag)
     };
 
@@ -776,6 +770,85 @@ fn aead_roundtrip_unaligned_multi_chunk() {
         recovered, plaintext,
         "unaligned multi-chunk must round-trip"
     );
+}
+
+/// Chunk boundaries must NOT influence the ciphertext or tag: the duplex
+/// session buffers partial blocks internally, so any chunking of the same
+/// plaintext produces identical output.  (Under the retired v9 mode, each
+/// chunk was padded and absorbed separately, so chunking changed the tag.)
+#[test]
+fn aead_chunking_independence() {
+    let key = [0x3Du8; 32];
+    let iv = [0x71u8; 16];
+    let aad = b"chunking-independence";
+    let plaintext: Vec<u8> = (0..200u32)
+        .map(|i| (i.wrapping_mul(13) % 251) as u8)
+        .collect();
+
+    // One single chunk.
+    let (ct_single, tag_single) = {
+        let mut s = AeadSession::new(&key, &iv);
+        s.absorb_aad(aad);
+        let mut ct = plaintext.clone();
+        s.encrypt_chunk(&mut ct);
+        (ct, s.finalize())
+    };
+
+    // Three unaligned chunks (33 + 100 + 67 = 200).
+    let (ct_multi, tag_multi) = {
+        let mut s = AeadSession::new(&key, &iv);
+        s.absorb_aad(aad);
+        let mut ct = plaintext.clone();
+        let mut off = 0;
+        for &n in &[33usize, 100, 67] {
+            s.encrypt_chunk(&mut ct[off..off + n]);
+            off += n;
+        }
+        (ct, s.finalize())
+    };
+
+    // Byte-by-byte chunks.
+    let (ct_bytes, tag_bytes) = {
+        let mut s = AeadSession::new(&key, &iv);
+        s.absorb_aad(aad);
+        let mut ct = plaintext.clone();
+        for i in 0..ct.len() {
+            s.encrypt_chunk(&mut ct[i..i + 1]);
+        }
+        (ct, s.finalize())
+    };
+
+    assert_eq!(
+        ct_single, ct_multi,
+        "ciphertext must be chunking-independent"
+    );
+    assert_eq!(tag_single, tag_multi, "tag must be chunking-independent");
+    assert_eq!(ct_single, ct_bytes, "byte-wise ciphertext must match");
+    assert_eq!(tag_single, tag_bytes, "byte-wise tag must match");
+}
+
+/// Pinned v10 duplex AEAD test vector — detects any unintended change to the
+/// duplex construction (keystream schedule, ciphertext injection, terminal
+/// padding, or tag derivation).  Regenerate ONLY on a deliberate format bump.
+#[test]
+fn tv5_aead_duplex_v10() {
+    let key: [u8; 32] = core::array::from_fn(|i| i as u8);
+    let iv: [u8; 16] = core::array::from_fn(|i| (0xF0 + i) as u8);
+    let aad = b"catwalk v10 aead test vector";
+    let mut data: Vec<u8> = (0..100u32).map(|i| i as u8).collect();
+
+    let mut s = AeadSession::new(&key, &iv);
+    s.absorb_aad(aad);
+    s.encrypt_chunk(&mut data);
+    let tag = s.finalize();
+
+    let expected_ct = "ac23ccd5e10c23362befdb19670a66a9d81c2c6c332bce1a5c4ea666fbeb820a\
+                       565b4d759dbeb06e210e4de7baf8a105a378d635c9870623d4ac17e79235c2fe\
+                       d38a6ee2256dfbee0b022d78a30ea222e8da992e43c1ac2425a79201f9ac1493\
+                       5a2171a6";
+    let expected_tag = "1c7f118a4076dd6fdddc7d05553cd4cf989f0c91a6c299ef2f0f0b57bd8ee7d8";
+    assert_eq!(hex(&data), expected_ct, "TV5 ciphertext mismatch");
+    assert_eq!(hex(&tag), expected_tag, "TV5 tag mismatch");
 }
 
 #[test]

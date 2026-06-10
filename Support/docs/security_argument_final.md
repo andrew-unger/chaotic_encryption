@@ -121,23 +121,41 @@ The key schedule proceeds as follows:
 1. **Argon2id KDF:** password + (salt ‖ timestamp) → 32-byte master key.
    - Default parameters: m = 2^18 KiB = 256 MB, t = 4 iterations, p = 1 lane.
    - Minimum accepted on decryption: m ≥ 2^16 KiB = 64 MB, t ≥ 2.
-2. **BLAKE3 domain derivation:** `cipher_key = BLAKE3::derive_key("catwalk.v9.cipher", master_key)` → 32 bytes.
+2. **BLAKE3 domain derivation:** `cipher_key = BLAKE3::derive_key("catwalk.v10.cipher", master_key)` → 32 bytes.
 3. **Sponge initialization:** `absorb(cipher_key, DOMAIN_KEY=0x01)` then `absorb(nonce, DOMAIN_IV=0x02)`.
 
-### 1.6 AEAD Construction
+### 1.6 AEAD Construction (duplex, format v10)
 
-SpongeWrap-style authenticated encryption:
+SpongeWrap-style duplex authenticated encryption — one permutation per
+64-byte block:
 
-1. `cipher_init(cipher_key, nonce)` — all-zero state; absorb key then IV.
+1. `AeadSession::new(cipher_key, nonce)` — all-zero state; absorb key then IV.
 2. `absorb_aad(header)` with domain byte 0x03 — header authenticated, not encrypted.
-3. For each plaintext chunk P:
-   - Generate keystream K from current rate (with Mix13 output finalizer).
+3. For each 64-byte plaintext block P (partial blocks buffered across chunk
+   boundaries):
+   - Keystream K ← Mix13(rate) — read, no permute.
    - C ← P ⊕ K (ciphertext).
-   - `absorb(C, domain=0x04)` — absorb ciphertext for authentication.
-4. `absorb([], domain=0x05)` — domain-separated finalisation.
+   - rate ← rate ⊕ C — duplex injection of the ciphertext.
+   - Apply the permutation (the block's single permutation call).
+4. Finalisation:
+   - `absorb(pending_partial_ciphertext, domain=0x04)` — exactly one padded
+     terminal CT block per message (pure padding when the message length is a
+     block multiple), making message boundaries unambiguous.
+   - `absorb([], domain=0x05)` — domain-separated tag finalisation.
 5. Tag = first 32 bytes of rate (with Mix13), without advancing the sponge.
 
-Decryption runs the identical sponge state evolution (absorbing ciphertext, not plaintext), so the final tag matches iff the same ciphertext was processed.
+Decryption runs the identical sponge state evolution (injecting the received
+ciphertext, not the plaintext), so the final tag matches iff the same
+ciphertext was processed.
+
+**Adversarial view is unchanged from the retired v9 mode.**  With known
+plaintext the adversary learns K = Mix13(rate); Mix13 is a public bijection,
+so this reveals exactly the 512-bit rate — the same view the v9 squeeze
+output gave.  The 512-bit capacity is never output in either mode, so the
+standard duplex/sponge security argument (capacity-bounded distinguishing
+advantage) carries over.  The v9→v10 change halves the permutation count per
+block; the security margin per permutation call is unchanged at 8 rounds = 4×
+the empirical 2-round diffusion/distinguisher minimum.
 
 ### 1.7 Domain Separation
 
@@ -242,7 +260,7 @@ Argon2id (Algorithm::Argon2id, Version::V0x13) with default parameters m = 256 M
 
 **[CONJECTURE]** At the default parameters, offline dictionary attacks on the password require ≥ 256 MB of memory and ≥ 4 sequential passes per guess. On commodity hardware this corresponds to a rate of roughly 1–10 guesses/second per GPU, making brute-force impractical for passwords with ≥ 80 bits of entropy (approximately 18 random alphanumeric characters).  The password policy (minimum 18 characters, maximum 3 consecutive identical characters) is intended to enforce a minimum entropy floor, but does not formally bound entropy — it depends on the password distribution.
 
-**BLAKE3 domain derivation.** `cipher_key = BLAKE3::derive_key("catwalk.v9.cipher", master_key)` provides domain-separated subkey derivation.  **[CONJECTURE]** BLAKE3's security rests on the security of its underlying BLAKE2-based compression function, which is believed to behave as a random oracle. The context string "catwalk.v9.cipher" ensures cipher keys are independent of any future subkeys derived from the same master key.
+**BLAKE3 domain derivation.** `cipher_key = BLAKE3::derive_key("catwalk.v10.cipher", master_key)` provides domain-separated subkey derivation.  **[CONJECTURE]** BLAKE3's security rests on the security of its underlying BLAKE2-based compression function, which is believed to behave as a random oracle. The versioned context string "catwalk.v10.cipher" ensures cipher keys are independent of any subkeys derived from the same master key for other contexts or format versions.
 
 ---
 
@@ -400,35 +418,30 @@ CATWALK generates nonces as 128-bit random values.  The probability of a collisi
 
 ### 5.1 Encrypt-then-MAC Semantics
 
-The AEAD construction absorbs ciphertext (not plaintext) for authentication.  During encryption:
+The duplex AEAD injects ciphertext (not plaintext) into the sponge for
+authentication.  Per 64-byte block, in the actual implementation
+(`AeadSession` in `cml_sponge.rs`):
 
 ```
-C ← P ⊕ keystream(state)
-absorb(C, domain=0x04)
-```
-
-During decryption:
-
-```
-absorb(C, domain=0x04)           [absorb ciphertext before decrypting]
-P ← C ⊕ keystream(state_before_absorb)
-```
-
-Wait — the actual implementation generates keystream **before** absorbing ciphertext:
-
-```
-// aead_encrypt_chunk:
-ks ← keystream(state)
+// encrypt_chunk (per block):
+ks ← Mix13(rate)                 [read, no permute]
 C ← P ⊕ ks
-absorb(C, domain=0x04)
+rate ← rate ⊕ C                  [duplex injection]
+permute()
 
-// aead_decrypt_chunk:
-ks ← keystream(state)
+// decrypt_chunk (per block):
+ks ← Mix13(rate)
 P ← C ⊕ ks
-absorb(C, domain=0x04)           [C is saved before XOR]
+rate ← rate ⊕ C                  [same injection — C is the received bytes]
+permute()
 ```
 
-In both cases, the **ciphertext** is absorbed.  The sponge state evolves identically in encryption and decryption, so the final authentication tag matches iff the ciphertexts are identical.
+At finalisation, any pending partial-block ciphertext is absorbed as one
+DOMAIN_CT (0x04) padded terminal block — present for every message, so a
+message ending exactly on a block boundary is distinguishable from one that
+does not.
+
+In both directions, the **ciphertext** is injected.  The sponge state evolves identically in encryption and decryption, so the final authentication tag matches iff the ciphertexts are identical.
 
 **[PROOF]** The tag is fully determined by the cipher_key, nonce, AAD, and the sequence of ciphertext bytes absorbed.  Any modification to any byte of the ciphertext or header (AAD) will change the sponge state at finalization and thus the tag, with probability of undetected modification bounded by 1/2^{256} per forgery attempt (the tag is 32 bytes = 256 bits; assuming the permutation is ideal, a forged tag guess succeeds with probability 2^{-256}).
 

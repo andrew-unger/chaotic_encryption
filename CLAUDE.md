@@ -14,28 +14,32 @@ chaotic_encryption/
 ├── Catwalk/          # Rust crate (library + CLI binary)
 │   ├── src/
 │   │   ├── lib.rs          — public API surface
-│   │   ├── cml_sponge.rs   — core permutation primitive (CML lattice)
-│   │   ├── crypto.rs       — AEAD layer (encrypt/decrypt, key schedule)
-│   │   ├── utils.rs        — helpers (keyfile, zeroize wrappers, etc.)
+│   │   ├── cml_sponge.rs   — core permutation primitive + duplex AeadSession
+│   │   ├── crypto.rs       — file-format layer (encrypt/decrypt, key schedule)
+│   │   ├── utils.rs        — helpers (compression, file info, CappedWriter)
 │   │   ├── archive.rs      — optional zip archive support (feature = "archive")
-│   │   ├── gui.rs          — optional egui GUI (feature = "gui")
+│   │   ├── gui.rs + gui/   — optional egui GUI (feature = "gui")
 │   │   ├── error.rs        — typed error enum
-│   │   └── main.rs         — CLI entry point (clap)
+│   │   ├── main.rs         — CLI entry point (clap)
+│   │   └── bin/            — research tools (PractRand dumps, reduced-round,
+│   │                         algebraic degree analysis)
+│   ├── fuzz/               — cargo-fuzz targets (decrypt, parse, extract)
 │   └── Cargo.toml
 └── Support/
     ├── README.md
-    ├── tests/              — integration tests (cml_sponge_tests, round_trip, keyfile_tests)
+    ├── tests/              — integration tests (cml_sponge_tests, round_trip, keyfile_tests, …)
     ├── benches/            — Criterion benchmarks
-    ├── docs/
-    └── paper/
+    ├── docs/               — design spec, security argument, empirical analyses
+    ├── scripts/            — PractRand batch runners
+    └── paper/              — LaTeX paper (catwalk.tex)
 ```
 
 ## Cryptographic Design (summary)
 
 - **Primitive:** 16×u64 (1024-bit) CML lattice — 512-bit rate / 512-bit capacity
 - **Permutation:** Arnold's Cat Map + CML coupling (5-term polynomial) + Weyl counter injection, 8 rounds
-- **Key schedule:** Argon2id (256 MB / 4 iters) → BLAKE3 domain derivation → 32-byte cipher key
-- **AEAD mode:** SpongeWrap-style — absorb AAD (0x03), encrypt+absorb ciphertext (0x04), tag (0x05)
+- **Key schedule:** Argon2id (256 MB / 4 iters) → BLAKE3 domain derivation ("catwalk.v10.cipher") → 32-byte cipher key
+- **AEAD mode (format v10):** SpongeWrap duplex — absorb AAD (0x03); then one permutation per 64-byte block (keystream = Mix13(rate); inject ciphertext into rate; permute); finalize with a padded terminal CT block (0x04) + tag domain (0x05) → 32-byte tag
 - **Security target:** 128-bit confidentiality/integrity; 256-bit pre-image on permutation state
 
 ## Build & Test

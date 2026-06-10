@@ -37,8 +37,8 @@ chaotic_encryption/
   policy, dependency table, statistical validation summary.
 - [Support/paper/catwalk.tex](Support/paper/catwalk.tex) — design specification,
   coupling-matrix analysis, security argument.
-- [Support/docs/](Support/docs/) — design notes, audit reports, PractRand
-  validation logs.
+- [Support/docs/](Support/docs/) — design spec, security argument, and
+  empirical analysis (PractRand validation, reduced-round, algebraic degree).
 - [CLAUDE.md](CLAUDE.md) — coding conventions and build commands.
 
 ## License

@@ -4,7 +4,7 @@
 // the CLI and GUI).  These tests exercise the cipher and AEAD round-trip, not the
 // password policy.
 
-use catwalk::crypto::constants::MIN_HEADER_LEN;
+use catwalk::crypto::constants::{MIN_HEADER_LEN, VERSION};
 use catwalk::crypto::{
     decrypt, decrypt_stream, encrypt, encrypt_stream, EncryptOptions, ProgressFn,
 };
@@ -30,7 +30,7 @@ fn round_trip_basic() {
 
     // Verify magic bytes and version
     assert_eq!(&encrypted[..4], b"CATW");
-    assert_eq!(encrypted[4], 9); // version 9
+    assert_eq!(encrypted[4], VERSION);
 
     let (decrypted, ext) = decrypt(&encrypted, password, None, None).expect("decryption failed");
 
@@ -192,7 +192,7 @@ fn round_trip_both_flags() {
 fn invalid_magic_bytes_rejected() {
     let mut data = vec![0u8; MIN_HEADER_LEN + 10];
     data[0..4].copy_from_slice(b"FAKE");
-    data[4] = 9; // correct version
+    data[4] = VERSION; // correct version
     let result = decrypt(&data, "password", None, None);
     assert!(
         matches!(result, Err(CryptoError::InvalidMagicBytes)),
@@ -233,7 +233,7 @@ fn weak_kdf_params_rejected() {
     // Build a header with correct magic/version but m_log2 below minimum (16)
     let mut data = vec![0u8; MIN_HEADER_LEN + 10];
     data[0..4].copy_from_slice(b"CATW");
-    data[4] = 9; // correct version
+    data[4] = VERSION; // correct version
     data[5] = 0; // flags
                  // salt: bytes 6..22 (16 bytes) — leave as zero
                  // timestamp: bytes 22..30 (8 bytes) — leave as zero
@@ -256,7 +256,7 @@ fn weak_kdf_t_cost_rejected() {
     // m_log2 OK, but t_cost = 1 — below minimum of 2.
     let mut data = vec![0u8; MIN_HEADER_LEN + 10];
     data[0..4].copy_from_slice(b"CATW");
-    data[4] = 9;
+    data[4] = VERSION;
     data[5] = 0;
     data[46] = 18; // m_log2 = 18 (default) — meets minimum
     data[47] = 1; // t_cost = 1 — below minimum of 2
@@ -274,7 +274,7 @@ fn weak_kdf_m_log2_15_rejected() {
     // m_log2 = 15 (32 MB) — exactly one below the floor of 16.
     let mut data = vec![0u8; MIN_HEADER_LEN + 10];
     data[0..4].copy_from_slice(b"CATW");
-    data[4] = 9;
+    data[4] = VERSION;
     data[5] = 0;
     data[46] = 15;
     data[47] = 4;

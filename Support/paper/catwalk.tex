@@ -423,15 +423,16 @@ Domain & Value & Usage \\
 
 \subsection{AEAD Construction}
 
-The AEAD construction follows SpongeWrap semantics.
+The AEAD construction is a SpongeWrap-style duplex: keystream extraction and
+ciphertext authentication share a single permutation call per 64-byte block.
 Algorithm~\ref{alg:aead-enc} specifies encryption.
-Decryption is identical except: keystream is generated
-first, then ciphertext is absorbed (not plaintext),
-then XOR'd to recover plaintext.  The tag is verified
-before any plaintext is returned.
+Decryption is identical except the keystream is XOR'd with the received
+ciphertext to recover plaintext, and the \emph{received} ciphertext is
+injected into the rate---the same bytes encryption injects.  The tag is
+verified before any plaintext is returned.
 
 \begin{algorithm}[t]
-\caption{CATWALK AEAD encryption.}
+\caption{CATWALK duplex AEAD encryption (file format v10).}
 \label{alg:aead-enc}
 \begin{algorithmic}[1]
 \Require Key $K$ (32 bytes), nonce $N$ (16 bytes),
@@ -441,16 +442,21 @@ before any plaintext is returned.
   \Comment{Absorb $K$ with domain 0x01, $N$ with domain 0x02}
 \State $\mathsf{Absorb}(\sigma, H, \texttt{0x03})$
   \Comment{Header authenticated, not encrypted}
-\ForAll{64-byte blocks $P_i$ of $P$}
-  \State $K_i \gets \mathsf{Squeeze}(\sigma, 64)$
-    \Comment{Squeeze keystream (with Mix13)}
+\ForAll{full 64-byte blocks $P_i$ of $P$, then the final partial block $P_\ast$ (possibly empty)}
+  \State $K_i \gets \mathsf{Mix13}(\sigma.\mathrm{rate})$
+    \Comment{Read keystream; no permutation}
   \State $C_i \gets P_i \oplus K_i$
-  \State $\mathsf{Absorb}(\sigma, C_i, \texttt{0x04})$
-    \Comment{Absorb ciphertext, not plaintext}
+  \If{$P_i$ is a full block}
+    \State $\sigma.\mathrm{rate} \gets \sigma.\mathrm{rate} \oplus C_i$;\;
+           $\mathsf{Permute}(\sigma)$
+      \Comment{Duplex injection: one permutation per block}
+  \EndIf
 \EndFor
+\State $\mathsf{Absorb}(\sigma, C_\ast, \texttt{0x04})$
+  \Comment{Terminal padded CT block ($C_\ast$ may be empty); always present}
 \State $\mathsf{Absorb}(\sigma, \varepsilon, \texttt{0x05})$
   \Comment{Domain-separated finalisation}
-\State $T \gets \mathsf{Squeeze}(\sigma, 32)$
+\State $T \gets \mathsf{Mix13}(\sigma.\mathrm{rate}[0..4])$
   \Comment{32-byte tag}
 \State \Return $(C, T)$
 \end{algorithmic}
@@ -458,10 +464,16 @@ before any plaintext is returned.
 
 Domain bytes are defined in Table~\ref{tab:domains}.
 
-\proof{Both encrypt and decrypt absorb the \emph{ciphertext} with
-domain~\texttt{0x04}, so sponge state evolution is identical.
+\proof{Both encrypt and decrypt inject the \emph{ciphertext} into the duplex,
+so sponge state evolution is identical.
 The tag is bound to: key, nonce, all AAD, and all ciphertext---providing
-native Encrypt-then-MAC semantics.}
+native Encrypt-then-MAC semantics.  The unconditional terminal
+\texttt{0x04}-padded block makes message boundaries unambiguous and renders
+the ciphertext and tag independent of the caller's chunking.  An adversary
+with known plaintext learns $\mathsf{Mix13}(\mathrm{rate})$; since Mix13 is a
+public bijection this is exactly the rate---the same view a squeeze-based
+mode exposes---so the standard capacity-bounded duplex security argument
+applies unchanged.}
 
 \subsection{Key Derivation}
 
@@ -469,12 +481,10 @@ native Encrypt-then-MAC semantics.}
 \item Argon2id~\cite{rfc9106}: password $+$ (16-byte random salt $\|$ 8-byte timestamp)
   $\to$ 32-byte master key.  Default: $m = 256$~MB, $t = 4$ iterations, $p = 1$ lane.
 \item BLAKE3~\cite{blake3} domain derivation:
-  $\mathrm{cipher\_key} = \mathrm{BLAKE3\_derive\_key}(\text{``catwalk.v9.cipher''},\, \mathrm{master\_key})$.%
-  \footnote{The context string \texttt{catwalk.v9.cipher}
-  is retained from the v9 file format for backward
-  compatibility with files encrypted by prior versions.
-  It does not imply the v9 construction; all other
-  parameters reflect the v10 design.}
+  $\mathrm{cipher\_key} = \mathrm{BLAKE3\_derive\_key}(\text{``catwalk.v10.cipher''},\, \mathrm{master\_key})$.%
+  \footnote{The context string is versioned with the file format, so
+  ciphertexts of different format versions never share a cipher key even
+  under identical password, salt, and timestamp inputs.}
 \item Sponge init: absorb cipher\_key, then absorb nonce.
 \end{enumerate}
 
@@ -1138,50 +1148,53 @@ true security margin, not a definitive characterization.}
 \section{Performance}
 \label{sec:performance}
 
-All benchmarks were measured with Criterion~0.5 on Windows~10 IoT Enterprise
-(x86-64, AMD Ryzen 9 3900X),%
-\space Rust stable with release profile (LTO, single codegen unit, strip).
+All benchmarks were measured with Criterion~0.5 on Windows~11 Pro (x86-64),
+Rust stable with release profile (LTO, single codegen unit, strip).
 
 \begin{table}[h]
 \centering
-\caption{CATWALK performance benchmarks.}
+\caption{CATWALK performance benchmarks (duplex AEAD, format v10).}
 \label{tab:performance}
 \begin{tabular}{@{}lrr@{}}
 \toprule
 Operation & Time & Throughput \\
 \midrule
-Permutation (8 rounds) & 137.6~ns & --- \\
-Keystream (64 bytes) & 169.8~ns & 360~MiB/s \\
-AEAD encrypt (1~KB) & 7.21~$\mu$s & 135~MiB/s \\
-AEAD encrypt (64~KB) & 311.0~$\mu$s & 201~MiB/s \\
-AEAD encrypt (1~MB) & 6.05~ms & 165~MiB/s \\
-AEAD decrypt (1~KB) & 8.71~$\mu$s & 112~MiB/s \\
-AEAD decrypt (64~KB) & 317.3~$\mu$s & 197~MiB/s \\
-KDF (min params: 64~MB, $t\!=\!2$) & 93.4~ms & --- \\
-KDF (production: 256~MB, $t\!=\!4$) & $\sim$1.5~s & --- \\
+Permutation (8 rounds) & 98.0~ns & --- \\
+Keystream (64 bytes) & 105.4~ns & 579~MiB/s \\
+AEAD encrypt (1~KB) & 2.80~$\mu$s & 349~MiB/s \\
+AEAD encrypt (64~KB) & 128.3~$\mu$s & 487~MiB/s \\
+AEAD encrypt (1~MB) & 2.38~ms & 419~MiB/s \\
+AEAD decrypt (1~KB) & 2.50~$\mu$s & 391~MiB/s \\
+AEAD decrypt (64~KB) & 118.6~$\mu$s & 527~MiB/s \\
+AEAD decrypt (1~MB) & 1.89~ms & 529~MiB/s \\
+KDF (min params: 64~MB, $t\!=\!2$) & 73.6~ms & --- \\
+KDF (production: 256~MB, $t\!=\!4$) & $\sim$1~s & --- \\
 \bottomrule
 \end{tabular}
 \end{table}
 
 \paragraph{Permutation cost.}
-Each permutation applies 8~CML rounds over the 1024-bit state in 137.6~ns,
-yielding a raw permutation ceiling of $64\text{ bytes} / 137.6\text{ ns} \approx 445$~MiB/s.
+Each permutation applies 8~CML rounds over the 1024-bit state in 98~ns.
+The duplex AEAD performs exactly one permutation per 64-byte block, yielding
+a raw ceiling of $64\text{ bytes} / 98\text{ ns} \approx 622$~MiB/s.
 
 \paragraph{Streaming throughput.}
-The AEAD plateau is $\sim$200~MiB/s at 64~KB payloads.  Each 64-byte ciphertext
-block requires two permutations (one for squeeze, one for absorb), giving a
-theoretical ceiling of $64 / (2 \times 137.6) \approx 222$~MiB/s, consistent
-with the measured 200~MiB/s.
+The AEAD plateau is $\sim$490--530~MiB/s at 64~KB--1~MB payloads --- 80--85\%
+of the single-permutation ceiling.  The residual gap is the per-block Mix13
+keystream read, the XOR/injection word loop, and session bookkeeping.
+(An earlier two-permutation mode --- separate squeeze and padded absorb per
+block --- plateaued at $\sim$200~MiB/s; the duplex halves the permutation
+count per block.)
 
 \paragraph{Comparison.}
-ChaCha20-Poly1305 achieves 1--3~GiB/s on the same class of hardware (5--15$\times$
-faster), leveraging SIMD-friendly quarter-round operations.  CATWALK's higher
-per-byte cost is inherent to the CML architecture: the 16-site coupling step
-involves 80~wrapping additions per round (5~per site $\times$ 16~sites), and the
-AEAD absorb step doubles the permutation count per output block.
+ChaCha20-Poly1305 achieves 1--3~GiB/s on the same class of hardware
+(2--6$\times$ faster), leveraging SIMD-friendly quarter-round operations.
+CATWALK's higher per-byte cost is inherent to the CML architecture: the
+16-site coupling step involves 80~wrapping additions per round (5~per site
+$\times$ 16~sites).
 
 \paragraph{KDF dominance.}
-For files smaller than a few hundred megabytes, the Argon2id KDF ($\sim$1.5~s
+For files smaller than a few hundred megabytes, the Argon2id KDF ($\sim$1~s
 at production parameters) completely dominates the encryption time.  This is
 intentional: the KDF cost makes offline password-guessing attacks expensive.
 

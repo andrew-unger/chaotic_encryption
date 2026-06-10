@@ -438,106 +438,240 @@ pub fn decrypt_in_place(state: &mut CmlSpongeState, data: &mut [u8]) {
     encrypt_in_place(state, data);
 }
 
-// ── AEAD construction ─────────────────────────────────────────────────────────
+// ── AEAD construction (duplex, format v10) ───────────────────────────────────
 //
-// SpongeWrap-style authenticated encryption.  After `cipher_init`, the caller:
-//   1. Calls `absorb_aad` with associated data (authenticated, not encrypted).
-//   2. Calls `aead_encrypt_chunk` / `aead_decrypt_chunk` for each data chunk.
-//   3. Calls `aead_finalize` to produce / verify a 32-byte authentication tag.
+// SpongeWrap-style duplex authenticated encryption: ONE permutation per
+// 64-byte block (the retired v9 mode used two — a squeeze permutation for
+// keystream plus an absorb permutation for authentication).
 //
-// State evolution is identical in both encrypt and decrypt (both absorb the
-// ciphertext with DOMAIN_CT), so the final tags match iff the same ciphertext
-// was processed, providing Encrypt-then-MAC semantics natively.
+// Per 64-byte block:
+//   1. keystream = Mix13(rate)        — read, no permute
+//   2. ciphertext = plaintext ⊕ keystream
+//   3. rate ⊕= ciphertext             — duplex injection
+//   4. permute
+//
+// Step 3 makes the next block's keystream — and ultimately the tag — depend
+// on the entire transcript so far: key, IV, AAD, and all prior ciphertext.
+// Encrypt and decrypt inject the same ciphertext bytes, so both sides evolve
+// identically and the final tags match iff the ciphertext was untampered.
+//
+// Finalisation always injects exactly one DOMAIN_CT-padded terminal block
+// (carrying any pending partial-block ciphertext, or pure padding when the
+// message length is a block multiple), then a DOMAIN_TAG block — so message
+// boundaries are unambiguous and chunking cannot influence the tag.
 
-/// Absorb associated data into the sponge (authenticated, not encrypted).
+/// Duplex AEAD session.
 ///
-/// Call once after `cipher_init`, before any `aead_encrypt_chunk` calls.
-/// The caller typically passes the serialised file header here so it is
-/// bound into the authentication tag without being encrypted.
-pub fn absorb_aad(state: &mut CmlSpongeState, data: &[u8]) {
-    absorb(state, data, DOMAIN_AAD);
-}
-
-/// Encrypt `data` in place as one AEAD chunk, absorbing the resulting
-/// ciphertext for authentication.
-///
-/// Call in order for consecutive plaintext chunks, then call `aead_finalize`.
-/// Chunk sizes need not be multiples of 64; any size is accepted.
-/// Allocation-free: keystream is XOR-ed directly into `data` and the
-/// resulting ciphertext is absorbed straight from `data`.
-pub fn aead_encrypt_chunk(state: &mut CmlSpongeState, data: &mut [u8]) {
-    if data.is_empty() {
-        return;
-    }
-    // XOR plaintext → ciphertext in place, then absorb the ciphertext
-    // for authentication.
-    xor_keystream(state, data);
-    absorb(state, data, DOMAIN_CT);
-}
-
-/// Decrypt `data` in place as one AEAD chunk, absorbing the ciphertext
-/// (the pre-XOR bytes) for authentication — matching `aead_encrypt_chunk`'s
-/// state evolution exactly.
-///
-/// `buf` is a caller-owned scratch buffer reused across calls to avoid
-/// per-chunk heap allocation.  It holds a copy of the chunk's ciphertext
-/// (the function resizes it to `data.len()` if needed).
-///
-/// Call in order for consecutive ciphertext chunks, then call `aead_finalize`
-/// and compare the returned tag against the stored tag in constant time.
+/// Usage:
+/// 1. [`AeadSession::new`] with key and a **fresh, never-reused** nonce.
+/// 2. [`AeadSession::absorb_aad`] with associated data (optional, once,
+///    before any data).
+/// 3. [`AeadSession::encrypt_chunk`] / [`AeadSession::decrypt_chunk`] for
+///    consecutive data chunks — any sizes; chunk boundaries do not affect
+///    the ciphertext or tag.
+/// 4. [`AeadSession::finalize`] (consumes the session) for the 32-byte tag.
 ///
 /// # Do not use plaintext before verifying
 ///
-/// `data` is overwritten with decrypted plaintext **before** authentication is
-/// checked.  The caller must **not** act on or forward the contents of `data`
-/// until `aead_finalize` has been called and the returned tag compared against
-/// the stored tag using constant-time equality (e.g. `subtle::ConstantTimeEq`).
-/// Using unauthenticated plaintext enables decryption-oracle and padding-oracle
-/// attacks.  The high-level `decrypt` function in [`crate::crypto`] enforces
-/// this contract structurally — callers of this low-level API must enforce it
-/// themselves.
-pub fn aead_decrypt_chunk(state: &mut CmlSpongeState, data: &mut [u8], buf: &mut Vec<u8>) {
-    if data.is_empty() {
-        return;
-    }
-    let len = data.len();
-    // Save the ciphertext before XOR-ing — it must be absorbed for
-    // authentication after the keystream is consumed, matching encryption's
-    // squeeze-then-absorb state evolution.
-    buf.resize(len, 0);
-    let ct = &mut buf[..len];
-    ct.copy_from_slice(data);
-    // XOR to recover plaintext in place (same state evolution as encryption).
-    xor_keystream(state, data);
-    // Absorb the ciphertext (not the plaintext) — must match encryption order.
-    absorb(state, ct, DOMAIN_CT);
+/// On decryption, data is revealed **before** authentication is checked.
+/// Do not act on or forward decrypted bytes until `finalize`'s tag has been
+/// compared against the stored tag with constant-time equality
+/// (e.g. `subtle::ConstantTimeEq`).  The high-level `decrypt` in
+/// [`crate::crypto`] enforces this contract structurally.
+pub struct AeadSession {
+    state: CmlSpongeState,
+    /// Keystream for the current in-progress block — Mix13 of the rate,
+    /// computed lazily when the block's first byte is processed.
+    ks_block: [u8; BLOCK_BYTES],
+    /// Ciphertext bytes of the current in-progress block, pending injection.
+    ct_block: [u8; BLOCK_BYTES],
+    /// Bytes of the current block processed so far (0..BLOCK_BYTES).
+    fill: usize,
+    /// Debug guard: AAD must be absorbed before any data is processed.
+    #[cfg(debug_assertions)]
+    data_started: bool,
 }
 
-/// Finalise the AEAD session and return a 32-byte authentication tag.
-///
-/// After encryption: append this tag to the ciphertext.
-/// After decryption: compare this tag against the stored tag using a
-///   constant-time comparison (e.g. `subtle::ConstantTimeEq`) before
-///   trusting the decrypted plaintext.
-///
-/// The tag is derived from the sponge rate after a domain-separated
-/// empty absorption (DOMAIN_TAG = 0x05), ensuring it is bound to
-/// everything previously absorbed: key, IV, AAD, and all ciphertext blocks.
-pub fn aead_finalize(state: &mut CmlSpongeState) -> [u8; 32] {
-    // Empty absorption with TAG domain — domain-separated finalisation
-    // that commences a permute, mixing in all prior state.
-    absorb(state, &[], DOMAIN_TAG);
-    // Squeeze 32 bytes (4 rate words) with Mix13 output finaliser.
-    let mut tag = [0u8; 32];
-    for i in 0..4 {
-        let w = stafford_mix13(state.lattice[i]);
-        tag[i * 8..(i + 1) * 8].copy_from_slice(&w.to_le_bytes());
+impl AeadSession {
+    /// Initialise a session from a 32-byte key and 16-byte nonce.
+    ///
+    /// See [`cipher_init`] for the absorption sequence and the nonce-reuse
+    /// warning — reusing a `(key, nonce)` pair forfeits confidentiality
+    /// and integrity.
+    pub fn new(key: &[u8; 32], iv: &[u8; 16]) -> Self {
+        Self {
+            state: cipher_init(key, iv),
+            ks_block: [0u8; BLOCK_BYTES],
+            ct_block: [0u8; BLOCK_BYTES],
+            fill: 0,
+            #[cfg(debug_assertions)]
+            data_started: false,
+        }
     }
-    // Invalidate the internal keystream buffer.  The absorb call above permuted
-    // the state; any bytes still cached in `buf` are pre-finalization keystream
-    // and must not be returned by a subsequent `keystream` call.
-    state.buf_pos = BLOCK_BYTES;
-    tag
+
+    /// Absorb associated data (authenticated, not encrypted).
+    ///
+    /// Call at most once, after `new` and before any data chunks.  The
+    /// caller typically passes the serialised file header so it is bound
+    /// into the authentication tag without being encrypted.
+    pub fn absorb_aad(&mut self, aad: &[u8]) {
+        #[cfg(debug_assertions)]
+        debug_assert!(
+            !self.data_started,
+            "absorb_aad must be called before encrypt_chunk/decrypt_chunk"
+        );
+        absorb(&mut self.state, aad, DOMAIN_AAD);
+    }
+
+    /// Compute the current block's keystream: Mix13 applied to the rate.
+    fn refresh_keystream(&mut self) {
+        for i in 0..N_RATE {
+            let w = stafford_mix13(self.state.lattice[i]);
+            self.ks_block[i * 8..(i + 1) * 8].copy_from_slice(&w.to_le_bytes());
+        }
+    }
+
+    /// Duplex injection: XOR the completed ciphertext block into the rate,
+    /// then permute.  This is the single permutation per 64-byte block.
+    fn inject_block(&mut self) {
+        for i in 0..N_RATE {
+            // ct_block is [u8; BLOCK_BYTES]; each 8-byte slice is infallible.
+            let word = u64::from_le_bytes(
+                self.ct_block[i * 8..(i + 1) * 8]
+                    .try_into()
+                    .unwrap_or_else(|_| unreachable!()),
+            );
+            self.state.lattice[i] ^= word;
+        }
+        cml_permute(&mut self.state);
+        self.fill = 0;
+    }
+
+    /// Encrypt `data` in place.  Callable repeatedly; chunk sizes are
+    /// arbitrary and do not influence the ciphertext or tag.
+    pub fn encrypt_chunk(&mut self, data: &mut [u8]) {
+        #[cfg(debug_assertions)]
+        if !data.is_empty() {
+            self.data_started = true;
+        }
+        let mut pos = 0;
+        while pos < data.len() {
+            // Fast path: block-aligned with a full block available — process
+            // word-wise straight between `data` and the rate, with no staging
+            // through ks_block/ct_block.  Byte-identical to the general path.
+            if self.fill == 0 && data.len() - pos >= BLOCK_BYTES {
+                for i in 0..N_RATE {
+                    let ks = stafford_mix13(self.state.lattice[i]);
+                    let span = &mut data[pos + i * 8..pos + (i + 1) * 8];
+                    // span is exactly 8 bytes — try_into is infallible.
+                    let p =
+                        u64::from_le_bytes((&*span).try_into().unwrap_or_else(|_| unreachable!()));
+                    let c = p ^ ks;
+                    span.copy_from_slice(&c.to_le_bytes());
+                    self.state.lattice[i] ^= c; // duplex injection
+                }
+                cml_permute(&mut self.state);
+                pos += BLOCK_BYTES;
+                continue;
+            }
+
+            if self.fill == 0 {
+                self.refresh_keystream();
+            }
+            let take = (BLOCK_BYTES - self.fill).min(data.len() - pos);
+            for i in 0..take {
+                let c = data[pos + i] ^ self.ks_block[self.fill + i];
+                data[pos + i] = c;
+                self.ct_block[self.fill + i] = c;
+            }
+            self.fill += take;
+            pos += take;
+            if self.fill == BLOCK_BYTES {
+                self.inject_block();
+            }
+        }
+    }
+
+    /// Decrypt `data` in place.  Identical state evolution to
+    /// [`AeadSession::encrypt_chunk`] — both inject the ciphertext bytes.
+    ///
+    /// See the type-level warning: do not use the plaintext before the
+    /// finalize tag has been verified.
+    pub fn decrypt_chunk(&mut self, data: &mut [u8]) {
+        #[cfg(debug_assertions)]
+        if !data.is_empty() {
+            self.data_started = true;
+        }
+        let mut pos = 0;
+        while pos < data.len() {
+            // Fast path: see encrypt_chunk — word-wise, no staging buffers.
+            if self.fill == 0 && data.len() - pos >= BLOCK_BYTES {
+                for i in 0..N_RATE {
+                    let ks = stafford_mix13(self.state.lattice[i]);
+                    let span = &mut data[pos + i * 8..pos + (i + 1) * 8];
+                    // span is exactly 8 bytes — try_into is infallible.
+                    let c =
+                        u64::from_le_bytes((&*span).try_into().unwrap_or_else(|_| unreachable!()));
+                    span.copy_from_slice(&(c ^ ks).to_le_bytes());
+                    self.state.lattice[i] ^= c; // inject the received ciphertext
+                }
+                cml_permute(&mut self.state);
+                pos += BLOCK_BYTES;
+                continue;
+            }
+
+            if self.fill == 0 {
+                self.refresh_keystream();
+            }
+            let take = (BLOCK_BYTES - self.fill).min(data.len() - pos);
+            for i in 0..take {
+                let c = data[pos + i];
+                self.ct_block[self.fill + i] = c;
+                data[pos + i] = c ^ self.ks_block[self.fill + i];
+            }
+            self.fill += take;
+            pos += take;
+            if self.fill == BLOCK_BYTES {
+                self.inject_block();
+            }
+        }
+    }
+
+    /// Finalise the session and return the 32-byte authentication tag.
+    /// Consumes the session — no further data can be processed.
+    ///
+    /// After encryption: append the tag to the ciphertext.
+    /// After decryption: compare against the stored tag in constant time
+    /// (e.g. `subtle::ConstantTimeEq`) before trusting the plaintext.
+    pub fn finalize(mut self) -> [u8; 32] {
+        // Terminal ciphertext block: inject any pending partial-block
+        // ciphertext with DOMAIN_CT padding.  Performed unconditionally
+        // (pure padding when fill == 0) so every message ends with exactly
+        // one padded CT block — block-aligned and empty messages are
+        // unambiguous.
+        let fill = self.fill;
+        absorb(&mut self.state, &self.ct_block[..fill], DOMAIN_CT);
+        // Tag-domain separation, then squeeze 32 bytes (4 rate words)
+        // through the Mix13 output finaliser.
+        absorb(&mut self.state, &[], DOMAIN_TAG);
+        let mut tag = [0u8; 32];
+        for i in 0..4 {
+            let w = stafford_mix13(self.state.lattice[i]);
+            tag[i * 8..(i + 1) * 8].copy_from_slice(&w.to_le_bytes());
+        }
+        tag
+        // `self` drops here: ks_block is zeroized (Drop), and the inner
+        // CmlSpongeState zeroizes its lattice/counter/buffer.
+    }
+}
+
+impl Drop for AeadSession {
+    fn drop(&mut self) {
+        // ks_block holds keystream (secret).  ct_block holds ciphertext
+        // (public) but is scrubbed too — it costs nothing.
+        self.ks_block.zeroize();
+        self.ct_block.zeroize();
+    }
 }
 
 // ── Reduced-round variant (for cryptanalysis) ─────────────────────────────────

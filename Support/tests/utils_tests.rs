@@ -3,7 +3,7 @@
 // decompression path.
 
 use catwalk::crypto::constants::{
-    FLAG_KEYFILE, FLAG_NO_COMPRESS, FLAG_STRIP_METADATA, FLAG_ZSTD, MIN_HEADER_LEN,
+    FLAG_KEYFILE, FLAG_NO_COMPRESS, FLAG_STRIP_METADATA, FLAG_ZSTD, MIN_HEADER_LEN, VERSION,
 };
 use catwalk::crypto::{decrypt, encrypt, validate_password, EncryptOptions};
 use catwalk::error::CryptoError;
@@ -77,7 +77,7 @@ fn empty_password_rejected() {
 fn parse_file_info_invalid_magic() {
     let mut data = vec![0u8; MIN_HEADER_LEN + 10];
     data[0..4].copy_from_slice(b"JUNK");
-    data[4] = 9;
+    data[4] = VERSION;
     let result = parse_file_info(&data);
     assert!(
         matches!(result, Err(CryptoError::InvalidMagicBytes)),
@@ -104,7 +104,7 @@ fn parse_file_info_truncated_data() {
     // Correct magic and version but too short for a full header.
     let mut data = vec![0u8; MIN_HEADER_LEN - 1];
     data[0..4].copy_from_slice(b"CATW");
-    data[4] = 9;
+    data[4] = VERSION;
     let result = parse_file_info(&data);
     assert!(
         matches!(result, Err(CryptoError::InvalidCiphertextLength)),
@@ -124,7 +124,7 @@ fn parse_file_info_succeeds_on_real_file() {
         encrypt(b"hello", "pw", "doc.txt", &opts, None, None).expect("encryption failed");
 
     let info = parse_file_info(&encrypted).expect("parse_file_info failed on valid data");
-    assert_eq!(info.version, 9);
+    assert_eq!(info.version, VERSION);
     assert_eq!(info.extension, "txt");
     assert_eq!(info.flags & FLAG_NO_COMPRESS, FLAG_NO_COMPRESS);
     assert_eq!(info.flags & FLAG_STRIP_METADATA, 0);
@@ -317,7 +317,7 @@ fn oversized_ext_len_rejected() {
     // then set ext_len so large that cipher_start > tag_start.
     let mut data = vec![0u8; MIN_HEADER_LEN + 40]; // just enough room
     data[0..4].copy_from_slice(b"CATW");
-    data[4] = 9; // version
+    data[4] = VERSION;
     data[5] = 0; // flags
                  // salt: bytes 6..22 — leave as zero
                  // timestamp: bytes 22..30 — leave as zero
@@ -377,7 +377,7 @@ fn weak_t_cost_rejected_at_decrypt() {
     // decrypt() must return WeakKdfParameters before running the KDF.
     let mut data = vec![0u8; MIN_HEADER_LEN + 1]; // +1 for at least 1 ciphertext byte
     data[0..4].copy_from_slice(b"CATW");
-    data[4] = 9; // version
+    data[4] = VERSION;
     data[5] = 0; // flags
                  // salt: bytes 6..22 (leave as zero)
                  // timestamp: bytes 22..30 (leave as zero)
@@ -401,7 +401,7 @@ fn weak_m_log2_rejected_at_decrypt() {
     // Craft a header with m_log2 = 15 (below minimum of 16).
     let mut data = vec![0u8; MIN_HEADER_LEN + 1];
     data[0..4].copy_from_slice(b"CATW");
-    data[4] = 9; // version
+    data[4] = VERSION;
     data[5] = 0; // flags
     data[46] = 15; // m_log2 = 15 (BELOW minimum of 16)
     data[47] = 2; // t_cost = 2 (meets floor)

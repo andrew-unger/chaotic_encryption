@@ -292,7 +292,7 @@ fn subspace_anf_sweep(
 
 fn main() {
     println!("==========================================================");
-    println!("  CATWALK v9 — Algebraic Degree Analysis");
+    println!("  CATWALK — Algebraic Degree Analysis");
     println!("  CML-Sponge permutation (raw, no Mix13 finalizer)");
     println!("==========================================================");
     println!();

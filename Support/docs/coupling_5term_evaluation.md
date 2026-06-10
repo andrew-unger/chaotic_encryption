@@ -254,7 +254,7 @@ damping and thus no effective diffusion of differences in that mode.
 
 If {1, 3, 7, 11} is adopted:
 
-1. **Benchmark measurement.** Run `cml_perf_test` to confirm the ~6-8% overhead estimate.
+1. **Benchmark measurement.** Run `cargo bench --bench catwalk_bench` to confirm the ~6-8% overhead estimate.
    If throughput drops below the v9 {1,5,11} numbers by more than ~10%, consider whether
    a 2-round further optimisation elsewhere compensates.
 

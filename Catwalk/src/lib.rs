@@ -8,8 +8,10 @@
 //! - **Primitive:** 16×u64 (1024-bit) CML lattice; 512-bit rate / 512-bit capacity split.
 //! - **Key schedule:** Argon2id (256 MB / 4 iterations) → BLAKE3 domain derivation →
 //!   32-byte cipher key.
-//! - **AEAD mode:** SpongeWrap-style — absorb AAD (domain 0x03), encrypt+absorb
-//!   ciphertext (domain 0x04), finalise tag (domain 0x05).
+//! - **AEAD mode (format v10):** SpongeWrap duplex — absorb AAD (domain 0x03), then
+//!   one permutation per 64-byte block: keystream = Mix13(rate), ciphertext = plaintext
+//!   ⊕ keystream, rate ⊕= ciphertext, permute.  Finalisation injects a DOMAIN_CT (0x04)
+//!   padded terminal block and a DOMAIN_TAG (0x05) block, then squeezes a 32-byte tag.
 //! - **Security target:** 128-bit confidentiality and integrity under standard sponge
 //!   assumptions; 256-bit pre-image resistance for the permutation state.
 //!
@@ -50,9 +52,11 @@
 //!
 //! ## Low-level AEAD API
 //!
-//! The [`cml_sponge`] module exposes the raw sponge primitives for testing and
-//! research.  Callers are responsible for nonce management and tag verification.
-//! See [`cml_sponge::aead_finalize`] for the no-output-before-verification contract.
+//! The [`cml_sponge`] module exposes the raw sponge primitives and the
+//! [`cml_sponge::AeadSession`] duplex AEAD for testing and research.  Callers
+//! are responsible for nonce management and tag verification.  See the
+//! [`cml_sponge::AeadSession`] docs for the no-output-before-verification
+//! contract.
 
 pub mod cml_sponge;
 pub mod crypto;
