@@ -314,10 +314,17 @@ hypothetical scenarios where the same master key is used in multiple contexts.
 The cipher key enters the sponge via `cipher_init(key, nonce)` where the nonce is
 the 16-byte random value stored in the file header.
 
-**Minimum accepted parameters on decryption:**
-- m_log2 ≥ 16 (64 MB): prevents headers that were crafted with weak KDF settings.
-- t_cost ≥ 2: prevents single-iteration downgrade.
-These checks occur *before* the KDF executes, preventing timing oracles.
+**Accepted parameter range on decryption:**
+- m_log2 ∈ [16, 22] (64 MB – 4 GiB): the lower bound prevents headers crafted with
+  weak KDF settings; the upper bound prevents a hostile header from forcing a
+  multi-terabyte allocation (e.g. m_log2 = 31 → 2 TiB) as a denial-of-service.
+- t_cost ∈ [2, 16]: the lower bound prevents single-iteration downgrade; the upper
+  bound caps CPU cost.
+- p_cost ≤ 16: caps lane count.
+These checks occur *before* the KDF executes, preventing both timing oracles and
+resource-exhaustion attacks.  The encrypt path only ever emits the defaults
+(m_log2 = 18, t_cost = 4, p_cost = 1), so any header outside this range is
+malformed or hostile.
 
 ### 2.10 AEAD Construction
 

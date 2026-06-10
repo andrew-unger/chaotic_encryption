@@ -37,7 +37,7 @@ fn aead_encrypt(plaintext: &[u8]) -> (Vec<u8>, [u8; 32]) {
     let mut state = cipher_init(&KEY, &IV);
     absorb_aad(&mut state, AAD);
     let mut ct = plaintext.to_vec();
-    aead_encrypt_chunk(&mut state, &mut ct, &mut vec![]);
+    aead_encrypt_chunk(&mut state, &mut ct);
     let tag = aead_finalize(&mut state);
     (ct, tag)
 }
@@ -78,8 +78,7 @@ fn bench_encrypt(c: &mut Criterion) {
                 let mut state = cipher_init(&KEY, &IV);
                 absorb_aad(&mut state, AAD);
                 let mut ct = plaintext.clone();
-                let mut scratch = vec![];
-                aead_encrypt_chunk(&mut state, &mut ct, &mut scratch);
+                aead_encrypt_chunk(&mut state, &mut ct);
                 aead_finalize(&mut state)
             });
         });

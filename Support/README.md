@@ -267,6 +267,7 @@ The CML-Sponge keystream (8 rounds, seed 0) has been validated with:
 - The CML-Sponge cipher is experimental and has not undergone formal cryptographic review
 - Key derivation uses Argon2id (256 MB, 4 iterations) — each brute-force guess costs ~1 second and 256 MB of RAM
 - Argon2 parameter floor: decryption rejects `m_log2 < 16` or `t_cost < 2` to prevent KDF downgrade timing attacks
+- Argon2 parameter ceiling: decryption rejects `m_log2 > 22` (4 GiB), `t_cost > 16`, or `p_cost > 16` so a crafted header cannot trigger a multi-terabyte allocation or runaway CPU as a denial-of-service
 - Authentication tag is produced natively by the sponge capacity — bound to cipher key, nonce, all header fields, and every ciphertext byte
 - Constant-time tag comparison prevents timing side-channels during verification
 - Key material is heap-allocated for reliable VirtualLock page-alignment (Windows), preventing swap to disk

@@ -54,8 +54,8 @@ pub fn extract_archive(data: &[u8], output_dir: &Path) -> Result<usize, CryptoEr
         .canonicalize()
         .map_err(|e| CryptoError::ArchiveError(format!("Cannot canonicalize output dir: {}", e)))?;
 
-    let count = archive.len();
-    for i in 0..count {
+    let mut extracted = 0;
+    for i in 0..archive.len() {
         let mut file = archive
             .by_index(i)
             .map_err(|e| CryptoError::ArchiveError(format!("Archive error: {}", e)))?;
@@ -80,7 +80,8 @@ pub fn extract_archive(data: &[u8], output_dir: &Path) -> Result<usize, CryptoEr
             )));
         }
         std::io::copy(&mut file, &mut out_file)?;
+        extracted += 1;
     }
 
-    Ok(count)
+    Ok(extracted)
 }

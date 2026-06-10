@@ -242,11 +242,16 @@ impl Drop for CmlSpongeState {
 
 // ── Absorb ────────────────────────────────────────────────────────────────────
 
-/// XOR one 64-byte block into the rate portion (sites 0–7) then permute.
-fn absorb_block(state: &mut CmlSpongeState, block: &[u8; BLOCK_BYTES]) {
+/// XOR one 64-byte block into the rate portion (sites 0–7) then permute
+/// with the supplied permutation.
+fn absorb_block_with<F: FnOnce(&mut CmlSpongeState)>(
+    state: &mut CmlSpongeState,
+    block: &[u8; BLOCK_BYTES],
+    permute: F,
+) {
     for i in 0..N_RATE {
-        // SAFETY invariant: block is &[u8; BLOCK_BYTES] (64 bytes), i < N_RATE (8),
-        // so each slice i*8..(i+1)*8 is exactly 8 bytes — try_into is infallible.
+        // block is &[u8; BLOCK_BYTES] (64 bytes), i < N_RATE (8), so each
+        // slice i*8..(i+1)*8 is exactly 8 bytes — try_into is infallible.
         let word = u64::from_le_bytes(
             block[i * 8..(i + 1) * 8]
                 .try_into()
@@ -254,31 +259,70 @@ fn absorb_block(state: &mut CmlSpongeState, block: &[u8; BLOCK_BYTES]) {
         );
         state.lattice[i] ^= word;
     }
-    cml_permute(state);
+    permute(state);
 }
 
-/// Build a padded message: `data || domain_byte || 0x00…00 || 0x80`
-/// such that the total length is a multiple of BLOCK_BYTES.
-fn pad_message(data: &[u8], domain: u8) -> Vec<u8> {
-    let mut msg: Vec<u8> = data.to_vec();
-    msg.push(domain);
-    while msg.len() % BLOCK_BYTES != BLOCK_BYTES - 1 {
-        msg.push(0x00);
-    }
-    msg.push(0x80);
-    debug_assert_eq!(msg.len() % BLOCK_BYTES, 0);
-    msg
-}
-
-/// Absorb arbitrary-length data with Keccak-style multi-rate padding.
+/// Absorb arbitrary-length data with Keccak-style multi-rate padding, using
+/// the supplied permutation (`cml_permute` in production; a reduced-round
+/// variant for cryptanalysis via [`cipher_init_r`]).
 ///
 /// Padding: `data || domain_byte || 0x00…00 || 0x80`
 /// where the total length is a multiple of BLOCK_BYTES (64).
-fn absorb(state: &mut CmlSpongeState, data: &[u8], domain: u8) {
-    for chunk in pad_message(data, domain).chunks_exact(BLOCK_BYTES) {
+///
+/// Full input blocks are absorbed directly from `data` without copying; only
+/// the final partial block — plus, when `data.len() % 64 == 63`, one extra
+/// pad-only block — is staged on the stack.  This is byte-for-byte equivalent
+/// to absorbing the padded message as one buffer, but performs no heap
+/// allocation and leaves no unzeroized copy of secret input (the key passes
+/// through here during `cipher_init`).
+fn absorb_with<F: Fn(&mut CmlSpongeState)>(
+    state: &mut CmlSpongeState,
+    data: &[u8],
+    domain: u8,
+    permute: F,
+) {
+    let mut chunks = data.chunks_exact(BLOCK_BYTES);
+    for chunk in &mut chunks {
         // chunks_exact(BLOCK_BYTES) guarantees each chunk is exactly BLOCK_BYTES bytes.
-        absorb_block(state, chunk.try_into().unwrap_or_else(|_| unreachable!()));
+        absorb_block_with(
+            state,
+            chunk.try_into().unwrap_or_else(|_| unreachable!()),
+            &permute,
+        );
     }
+
+    let rem = chunks.remainder();
+    let mut tail = [0u8; BLOCK_BYTES];
+    tail[..rem.len()].copy_from_slice(rem);
+    tail[rem.len()] = domain;
+    if rem.len() == BLOCK_BYTES - 1 {
+        // The domain byte landed in the block's last position, so the 0x80
+        // terminator spills into an extra all-zero block — matching the
+        // reference padding rule exactly.
+        absorb_block_with(state, &tail, &permute);
+        let mut terminator = [0u8; BLOCK_BYTES];
+        terminator[BLOCK_BYTES - 1] = 0x80;
+        absorb_block_with(state, &terminator, &permute);
+    } else {
+        tail[BLOCK_BYTES - 1] = 0x80;
+        absorb_block_with(state, &tail, &permute);
+    }
+    // The tail block may hold a partial copy of secret input (e.g. key bytes).
+    tail.zeroize();
+
+    // Absorbing mutated the lattice, so any keystream still buffered from an
+    // earlier squeeze predates this absorption.  Reusing it would let the start
+    // of the next chunk's keystream depend on state from *before* the just-
+    // absorbed ciphertext (violating the SpongeWrap chaining the AEAD relies on)
+    // whenever a caller passes a chunk whose length is not a multiple of the
+    // rate.  Invalidate the buffer so the next `keystream` call squeezes fresh
+    // bytes from the updated state.
+    state.buf_pos = BLOCK_BYTES;
+}
+
+/// Absorb with the standard full-round permutation.
+fn absorb(state: &mut CmlSpongeState, data: &[u8], domain: u8) {
+    absorb_with(state, data, domain, cml_permute);
 }
 
 // ── Output finalizer ──────────────────────────────────────────────────────────
@@ -315,9 +359,39 @@ fn squeeze_block_with<F: FnOnce(&mut CmlSpongeState)>(
     block
 }
 
-/// Squeeze one 64-byte block from the rate portion, then permute.
-fn squeeze_block(state: &mut CmlSpongeState) -> [u8; BLOCK_BYTES] {
-    squeeze_block_with(state, cml_permute)
+/// Core buffered-keystream loop shared by [`keystream`] and [`keystream_r`]:
+/// refill the internal block buffer with the supplied permutation as needed
+/// and hand each available span to `consume`.
+fn keystream_spans_with<F, C>(state: &mut CmlSpongeState, total: usize, permute: F, mut consume: C)
+where
+    F: Fn(&mut CmlSpongeState),
+    C: FnMut(usize, &[u8]),
+{
+    let mut pos = 0;
+    while pos < total {
+        if state.buf_pos >= BLOCK_BYTES {
+            state.buf = squeeze_block_with(state, &permute);
+            state.buf_pos = 0;
+        }
+        let take = (BLOCK_BYTES - state.buf_pos).min(total - pos);
+        consume(pos, &state.buf[state.buf_pos..state.buf_pos + take]);
+        state.buf_pos += take;
+        pos += take;
+    }
+}
+
+/// XOR keystream into `data` in place, advancing the state.
+///
+/// Equivalent to generating `data.len()` keystream bytes and XOR-ing them in,
+/// but never materialises the keystream in a separate buffer — less copying,
+/// and no transient keystream allocation to scrub afterwards.
+fn xor_keystream(state: &mut CmlSpongeState, data: &mut [u8]) {
+    let total = data.len();
+    keystream_spans_with(state, total, cml_permute, |pos, ks| {
+        for (d, k) in data[pos..pos + ks.len()].iter_mut().zip(ks) {
+            *d ^= *k;
+        }
+    });
 }
 
 // ── Public API ────────────────────────────────────────────────────────────────
@@ -348,28 +422,15 @@ pub fn cipher_init(key: &[u8; 32], iv: &[u8; 16]) -> CmlSpongeState {
 ///
 /// Sequential calls are consistent with a single call of the total length.
 pub fn keystream(state: &mut CmlSpongeState, out: &mut [u8]) {
-    let mut pos = 0;
-    while pos < out.len() {
-        if state.buf_pos >= BLOCK_BYTES {
-            state.buf = squeeze_block(state);
-            state.buf_pos = 0;
-        }
-        let available = BLOCK_BYTES - state.buf_pos;
-        let take = available.min(out.len() - pos);
-        out[pos..pos + take].copy_from_slice(&state.buf[state.buf_pos..state.buf_pos + take]);
-        state.buf_pos += take;
-        pos += take;
-    }
+    let total = out.len();
+    keystream_spans_with(state, total, cml_permute, |pos, ks| {
+        out[pos..pos + ks.len()].copy_from_slice(ks);
+    });
 }
 
 /// Encrypt `plaintext` in place by XOR with keystream.
 pub fn encrypt_in_place(state: &mut CmlSpongeState, data: &mut [u8]) {
-    let mut ks = vec![0u8; data.len()];
-    keystream(state, &mut ks);
-    for (d, k) in data.iter_mut().zip(ks.iter()) {
-        *d ^= k;
-    }
-    ks.zeroize();
+    xor_keystream(state, data);
 }
 
 /// Decrypt is identical to encrypt for a stream cipher.
@@ -400,26 +461,17 @@ pub fn absorb_aad(state: &mut CmlSpongeState, data: &[u8]) {
 /// Encrypt `data` in place as one AEAD chunk, absorbing the resulting
 /// ciphertext for authentication.
 ///
-/// `buf` is a caller-owned scratch buffer reused across calls to avoid
-/// per-chunk heap allocation.  It will be resized if necessary and
-/// zeroized after use.
-///
 /// Call in order for consecutive plaintext chunks, then call `aead_finalize`.
 /// Chunk sizes need not be multiples of 64; any size is accepted.
-pub fn aead_encrypt_chunk(state: &mut CmlSpongeState, data: &mut [u8], buf: &mut Vec<u8>) {
+/// Allocation-free: keystream is XOR-ed directly into `data` and the
+/// resulting ciphertext is absorbed straight from `data`.
+pub fn aead_encrypt_chunk(state: &mut CmlSpongeState, data: &mut [u8]) {
     if data.is_empty() {
         return;
     }
-    // Ensure scratch buffer is large enough.
-    buf.resize(data.len(), 0);
-    let ks = &mut buf[..data.len()];
-    // Generate keystream and XOR plaintext → ciphertext in place.
-    keystream(state, ks);
-    for (d, k) in data.iter_mut().zip(ks.iter()) {
-        *d ^= k;
-    }
-    ks.zeroize();
-    // Absorb the ciphertext for authentication.
+    // XOR plaintext → ciphertext in place, then absorb the ciphertext
+    // for authentication.
+    xor_keystream(state, data);
     absorb(state, data, DOMAIN_CT);
 }
 
@@ -428,8 +480,8 @@ pub fn aead_encrypt_chunk(state: &mut CmlSpongeState, data: &mut [u8], buf: &mut
 /// state evolution exactly.
 ///
 /// `buf` is a caller-owned scratch buffer reused across calls to avoid
-/// per-chunk heap allocation.  It must be at least `2 * data.len()` usable
-/// bytes (the function resizes it if needed).  It is zeroized after use.
+/// per-chunk heap allocation.  It holds a copy of the chunk's ciphertext
+/// (the function resizes it to `data.len()` if needed).
 ///
 /// Call in order for consecutive ciphertext chunks, then call `aead_finalize`
 /// and compare the returned tag against the stored tag in constant time.
@@ -449,21 +501,16 @@ pub fn aead_decrypt_chunk(state: &mut CmlSpongeState, data: &mut [u8], buf: &mut
         return;
     }
     let len = data.len();
-    // Ensure scratch buffer holds keystream + ciphertext copy.
-    buf.resize(len * 2, 0);
-    let (ks, ct) = buf.split_at_mut(len);
-    // Generate keystream (same state evolution as encryption).
-    keystream(state, ks);
-    // Save original ciphertext before XOR-ing to plaintext.
+    // Save the ciphertext before XOR-ing — it must be absorbed for
+    // authentication after the keystream is consumed, matching encryption's
+    // squeeze-then-absorb state evolution.
+    buf.resize(len, 0);
+    let ct = &mut buf[..len];
     ct.copy_from_slice(data);
-    // XOR to recover plaintext in place.
-    for (d, k) in data.iter_mut().zip(ks.iter()) {
-        *d ^= k;
-    }
-    ks.zeroize();
+    // XOR to recover plaintext in place (same state evolution as encryption).
+    xor_keystream(state, data);
     // Absorb the ciphertext (not the plaintext) — must match encryption order.
     absorb(state, ct, DOMAIN_CT);
-    ct.zeroize();
 }
 
 /// Finalise the AEAD session and return a 32-byte authentication tag.
@@ -523,42 +570,22 @@ pub fn raw_rate_bytes(state: &CmlSpongeState, out: &mut [u8; BLOCK_BYTES]) {
 /// Useful for automated distinguisher tests.
 pub fn cipher_init_r(key: &[u8; 32], iv: &[u8; 16], rounds: usize) -> CmlSpongeState {
     let mut state = CmlSpongeState::new();
-    let absorb_r = |st: &mut CmlSpongeState, data: &[u8], domain: u8| {
-        for chunk in pad_message(data, domain).chunks_exact(BLOCK_BYTES) {
-            // chunks_exact guarantees exactly BLOCK_BYTES bytes per chunk.
-            let block: &[u8; BLOCK_BYTES] = chunk.try_into().unwrap_or_else(|_| unreachable!());
-            for i in 0..N_RATE {
-                // block is &[u8; BLOCK_BYTES], i < N_RATE — slice is exactly 8 bytes.
-                let word = u64::from_le_bytes(
-                    block[i * 8..(i + 1) * 8]
-                        .try_into()
-                        .unwrap_or_else(|_| unreachable!()),
-                );
-                st.lattice[i] ^= word;
-            }
-            cml_permute_r(st, rounds);
-        }
-    };
-    absorb_r(&mut state, key, DOMAIN_KEY);
-    absorb_r(&mut state, iv, DOMAIN_IV);
+    absorb_with(&mut state, key, DOMAIN_KEY, |st| cml_permute_r(st, rounds));
+    absorb_with(&mut state, iv, DOMAIN_IV, |st| cml_permute_r(st, rounds));
     state
 }
 
 /// Generate keystream with a custom round count per permutation.
 pub fn keystream_r(state: &mut CmlSpongeState, out: &mut [u8], rounds: usize) {
-    let mut pos = 0;
-    while pos < out.len() {
-        if state.buf_pos >= BLOCK_BYTES {
-            state.buf = squeeze_block_with(state, |st| cml_permute_r(st, rounds));
-            state.buf_pos = 0;
-        }
-        let available = BLOCK_BYTES - state.buf_pos;
-        let want = out.len() - pos;
-        let take = available.min(want);
-        out[pos..pos + take].copy_from_slice(&state.buf[state.buf_pos..state.buf_pos + take]);
-        state.buf_pos += take;
-        pos += take;
-    }
+    let total = out.len();
+    keystream_spans_with(
+        state,
+        total,
+        |st| cml_permute_r(st, rounds),
+        |pos, ks| {
+            out[pos..pos + ks.len()].copy_from_slice(ks);
+        },
+    );
 }
 
 // ── Raw permutation for offline analysis ──────────────────────────────────

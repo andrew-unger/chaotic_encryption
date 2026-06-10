@@ -18,6 +18,8 @@ pub enum CryptoError {
     DecompressionTooLarge,
     #[error("File header contains KDF parameters below the minimum security threshold.")]
     WeakKdfParameters,
+    #[error("File header contains KDF parameters above the maximum accepted range.")]
+    KdfParametersOutOfRange,
     /// Keyfile exceeds the 1 GB maximum size.
     #[error("Keyfile exceeds maximum size of 1 GB")]
     KeyfileTooLarge,

@@ -129,6 +129,15 @@ pub mod constants {
     pub const ARGON2_T_COST_MIN: u8 = 2; // 2 iterations minimum
     pub const ARGON2_P_COST_MIN: u8 = 1; // at least 1 lane (argon2 crate rejects 0 internally)
 
+    // Maximum Argon2id parameters accepted on decryption.  The encrypt path only
+    // ever emits the defaults above, so any header exceeding these ceilings is
+    // malformed or hostile.  Rejecting them before the KDF runs prevents a
+    // denial-of-service in which a crafted header forces a multi-terabyte memory
+    // allocation (e.g. m_log2 = 31 → 2 TiB) or pathological CPU cost.
+    pub const ARGON2_M_LOG2_MAX: u8 = 22; // 4 GiB ceiling (2^22 KiB)
+    pub const ARGON2_T_COST_MAX: u8 = 16; // 16 iterations ceiling
+    pub const ARGON2_P_COST_MAX: u8 = 16; // 16 lanes ceiling
+
     // Password policy
     pub const MIN_PASSWORD_LEN: usize = 18;
     pub const MAX_CONSECUTIVE_REPEAT: usize = 3;
@@ -389,6 +398,13 @@ fn parse_v9_header_prefix(buf: &[u8]) -> Result<V9HeaderPrefix, CryptoError> {
     if m_log2 < ARGON2_M_LOG2_MIN || t_cost < ARGON2_T_COST_MIN || p_cost < ARGON2_P_COST_MIN {
         return Err(CryptoError::WeakKdfParameters);
     }
+    // Reject absurdly inflated parameters from a hostile header before the KDF
+    // attempts the allocation — otherwise a crafted file could force a
+    // multi-terabyte memory request or runaway CPU cost on anyone who merely
+    // tries to decrypt it (even with the wrong password).
+    if m_log2 > ARGON2_M_LOG2_MAX || t_cost > ARGON2_T_COST_MAX || p_cost > ARGON2_P_COST_MAX {
+        return Err(CryptoError::KdfParametersOutOfRange);
+    }
 
     let ext_len = buf[ext_len_pos] as usize;
 
@@ -542,33 +558,28 @@ fn init_aead_sponge(
 /// Process an in-memory buffer through the AEAD chunk operation in
 /// STREAM_CHUNK-sized slices, reporting progress along the way.
 ///
-/// `chunk_op` is `cml_sponge::aead_encrypt_chunk` for the encrypt path or
-/// `cml_sponge::aead_decrypt_chunk` for the decrypt path.  Allocates and
-/// zeroizes the scratch buffer locally so callers don't repeat that ritual.
+/// `chunk_op` is `cml_sponge::aead_encrypt_chunk` for the encrypt path or a
+/// closure wrapping `cml_sponge::aead_decrypt_chunk` (which owns the reusable
+/// ciphertext scratch buffer) for the decrypt path.
 fn aead_process_in_place(
     sponge: &mut cml_sponge::CmlSpongeState,
     data: &mut [u8],
-    chunk_op: fn(&mut cml_sponge::CmlSpongeState, &mut [u8], &mut Vec<u8>),
-    scratch_cap: usize,
+    mut chunk_op: impl FnMut(&mut cml_sponge::CmlSpongeState, &mut [u8]),
     progress: &Option<&ProgressFn>,
     progress_start: f32,
     progress_span: f32,
 ) {
-    let mut scratch = Vec::with_capacity(scratch_cap);
     let total_len = data.len();
-    if total_len > 0 {
-        let mut offset = 0;
-        while offset < total_len {
-            let end = (offset + STREAM_CHUNK).min(total_len);
-            chunk_op(sponge, &mut data[offset..end], &mut scratch);
-            offset = end;
-            if progress.is_some() {
-                let frac = offset as f32 / total_len as f32;
-                report(progress, progress_start + frac * progress_span);
-            }
+    let mut offset = 0;
+    while offset < total_len {
+        let end = (offset + STREAM_CHUNK).min(total_len);
+        chunk_op(sponge, &mut data[offset..end]);
+        offset = end;
+        if progress.is_some() {
+            let frac = offset as f32 / total_len as f32;
+            report(progress, progress_start + frac * progress_span);
         }
     }
-    scratch.zeroize();
 }
 
 // ── Encrypt (v9 — CML-Sponge AEAD) ──────────────────────────────────────────
@@ -601,11 +612,14 @@ pub fn encrypt(
 
     // Phase 1: Compression (0.00 → 0.05)
     report(progress, 0.0);
-    let data = if options.skip_compression {
-        plaintext.to_vec()
+    // `body` borrows the caller's plaintext directly when compression is
+    // skipped — the bytes are copied exactly once, into the output buffer.
+    let compressed = if options.skip_compression {
+        None
     } else {
-        compress_data(plaintext)?
+        Some(compress_data(plaintext)?)
     };
+    let body: &[u8] = compressed.as_deref().unwrap_or(plaintext);
     report(progress, 0.05);
 
     let mut salt = [0u8; SALT_LEN];
@@ -641,24 +655,30 @@ pub fn encrypt(
 
     let mut sponge = init_aead_sponge(cipher_key.get(), &nonce, &header);
 
-    // Phase 3: Stream encrypt + authenticate (0.35 → 0.85)
-    let mut ciphertext = data;
+    // Phase 3: Stream encrypt + authenticate (0.35 → 0.85).
+    // The output bundle is assembled first and encrypted in place, so the
+    // plaintext body is copied exactly once.
+    let body_start = header.len();
+    let mut result = Vec::with_capacity(header.len() + body.len() + HASH_LEN);
+    result.extend_from_slice(&header);
+    result.extend_from_slice(body);
+    // The compressed copy of the plaintext is no longer needed; scrub it
+    // (the copy now inside `result` is about to be encrypted in place).
+    if let Some(mut c) = compressed {
+        c.zeroize();
+    }
     aead_process_in_place(
         &mut sponge,
-        &mut ciphertext,
+        &mut result[body_start..],
         cml_sponge::aead_encrypt_chunk,
-        STREAM_CHUNK,
         progress,
         0.35,
         0.50,
     );
     report(progress, 0.85);
 
-    // Phase 4: Finalise tag + assemble output (0.85 → 0.90)
+    // Phase 4: Finalise tag + append (0.85 → 0.90)
     let tag = cml_sponge::aead_finalize(&mut sponge);
-    let mut result = Vec::with_capacity(header.len() + ciphertext.len() + HASH_LEN);
-    result.extend_from_slice(&header);
-    result.extend_from_slice(&ciphertext);
     result.extend_from_slice(&tag);
     report(progress, 0.90);
     Ok(result)
@@ -813,7 +833,6 @@ pub fn encrypt_stream<R: Read, W: Write>(
 
     // Stream encrypt (0.35 → 0.85).
     let mut buf = vec![0u8; STREAM_CHUNK];
-    let mut scratch = Vec::with_capacity(STREAM_CHUNK);
     let mut bytes_out: u64 = 0;
 
     let mut encrypt_loop = |source: &mut dyn Read| -> Result<(), CryptoError> {
@@ -822,7 +841,7 @@ pub fn encrypt_stream<R: Read, W: Write>(
             if n == 0 {
                 break;
             }
-            cml_sponge::aead_encrypt_chunk(&mut sponge, &mut buf[..n], &mut scratch);
+            cml_sponge::aead_encrypt_chunk(&mut sponge, &mut buf[..n]);
             writer.write_all(&buf[..n])?;
             bytes_out += n as u64;
             if let Some(total) = input_len {
@@ -842,7 +861,9 @@ pub fn encrypt_stream<R: Read, W: Write>(
             zstd::stream::read::Encoder::new(reader, 1).map_err(CryptoError::IoError)?;
         encrypt_loop(&mut compressor)?;
     }
-    scratch.zeroize();
+    // `buf` held plaintext before each in-place encryption; the final chunk's
+    // bytes were overwritten by ciphertext, but scrub anyway for consistency.
+    buf.zeroize();
     report(progress, 0.85);
 
     let tag = cml_sponge::aead_finalize(&mut sponge);
@@ -915,7 +936,7 @@ pub fn decrypt_stream<R: Read + Seek, W: Write>(
     let use_zstd = (stream_header.prefix.flags & FLAG_ZSTD) != 0;
     let cipher_len = stream_header.cipher_len;
     let mut buf = vec![0u8; STREAM_CHUNK];
-    let mut scratch = Vec::with_capacity(STREAM_CHUNK * 2);
+    let mut scratch = Vec::with_capacity(STREAM_CHUNK);
     let mut remaining = cipher_len;
 
     let mut decrypt_loop = |sink: &mut dyn Write| -> Result<(), CryptoError> {
@@ -936,17 +957,30 @@ pub fn decrypt_stream<R: Read + Seek, W: Write>(
 
     if no_compress {
         decrypt_loop(writer)?;
-    } else if use_zstd {
-        let mut decoder =
-            zstd::stream::write::Decoder::new(writer).map_err(CryptoError::IoError)?;
-        decrypt_loop(&mut decoder)?;
-        decoder.flush().map_err(CryptoError::IoError)?;
     } else {
-        let mut decoder = flate2::write::ZlibDecoder::new(writer);
-        decrypt_loop(&mut decoder)?;
-        decoder.finish().map_err(CryptoError::IoError)?;
+        // Cap total decompressed output so a hostile or corrupted file cannot
+        // expand into a disk-filling decompression bomb.  Mirrors the 4 GB
+        // limit enforced by the in-memory decrypt path.
+        let mut capped =
+            crate::utils::CappedWriter::new(writer, crate::utils::MAX_DECOMPRESSED_SIZE);
+        let result = if use_zstd {
+            match zstd::stream::write::Decoder::new(&mut capped) {
+                Ok(mut decoder) => decrypt_loop(&mut decoder)
+                    .and_then(|()| decoder.flush().map_err(CryptoError::IoError)),
+                Err(e) => Err(CryptoError::IoError(e)),
+            }
+        } else {
+            let mut decoder = flate2::write::ZlibDecoder::new(&mut capped);
+            decrypt_loop(&mut decoder)
+                .and_then(|()| decoder.finish().map(|_| ()).map_err(CryptoError::IoError))
+        };
+        if capped.exceeded() {
+            return Err(CryptoError::DecompressionTooLarge);
+        }
+        result?;
     }
-    scratch.zeroize();
+    // `buf` held decrypted plaintext chunks.
+    buf.zeroize();
     report(progress, 0.85);
 
     // Verify authentication tag (constant-time).
@@ -977,11 +1011,11 @@ fn decrypt_v9(
 
     // Phase 3: Stream decrypt (0.40 → 0.85)
     let mut decrypted = encrypted.to_vec();
+    let mut scratch = Vec::with_capacity(STREAM_CHUNK);
     aead_process_in_place(
         &mut sponge,
         &mut decrypted,
-        cml_sponge::aead_decrypt_chunk,
-        STREAM_CHUNK * 2,
+        |sponge, chunk| cml_sponge::aead_decrypt_chunk(sponge, chunk, &mut scratch),
         progress,
         0.40,
         0.45,
@@ -1064,5 +1098,68 @@ mod tests {
         assert_eq!(constants::ARGON2_T_COST_MIN, 2);
         assert_eq!(constants::ARGON2_M_LOG2_MIN, 16);
         assert_eq!(constants::ARGON2_P_COST_MIN, 1);
+    }
+
+    #[test]
+    fn parse_rejects_inflated_argon2_memory() {
+        // A hostile header advertising m_log2 = 31 would, without an upper-bound
+        // check, force a ~2 TiB allocation on anyone who tries to decrypt the
+        // file (even with the wrong password).  It must be rejected up front.
+        let salt = [0u8; constants::SALT_LEN];
+        let ts = [0u8; constants::TIMESTAMP_LEN];
+        let nonce = [0u8; constants::NONCE_LEN];
+        let header = build_v9_header(
+            0,
+            &salt,
+            &ts,
+            &nonce,
+            31, // 2 TiB
+            constants::ARGON2_T_COST,
+            constants::ARGON2_P_COST,
+            &[],
+        );
+        assert!(matches!(
+            parse_v9_header_prefix(&header),
+            Err(CryptoError::KdfParametersOutOfRange)
+        ));
+    }
+
+    #[test]
+    fn parse_rejects_inflated_argon2_time_and_lanes() {
+        let salt = [0u8; constants::SALT_LEN];
+        let ts = [0u8; constants::TIMESTAMP_LEN];
+        let nonce = [0u8; constants::NONCE_LEN];
+        let header = build_v9_header(
+            0,
+            &salt,
+            &ts,
+            &nonce,
+            constants::ARGON2_M_LOG2,
+            u8::MAX, // 255 iterations
+            u8::MAX, // 255 lanes
+            &[],
+        );
+        assert!(matches!(
+            parse_v9_header_prefix(&header),
+            Err(CryptoError::KdfParametersOutOfRange)
+        ));
+    }
+
+    #[test]
+    fn parse_accepts_default_argon2_params() {
+        let salt = [0u8; constants::SALT_LEN];
+        let ts = [0u8; constants::TIMESTAMP_LEN];
+        let nonce = [0u8; constants::NONCE_LEN];
+        let header = build_v9_header(
+            0,
+            &salt,
+            &ts,
+            &nonce,
+            constants::ARGON2_M_LOG2,
+            constants::ARGON2_T_COST,
+            constants::ARGON2_P_COST,
+            &[],
+        );
+        assert!(parse_v9_header_prefix(&header).is_ok());
     }
 }

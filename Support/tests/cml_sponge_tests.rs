@@ -338,7 +338,7 @@ fn aead_tag_changes_with_aad() {
         let mut s = cipher_init(&key, &iv);
         absorb_aad(&mut s, b"header_a");
         let mut ct = plaintext.to_vec();
-        aead_encrypt_chunk(&mut s, &mut ct, &mut vec![]);
+        aead_encrypt_chunk(&mut s, &mut ct);
         aead_finalize(&mut s)
     };
 
@@ -346,7 +346,7 @@ fn aead_tag_changes_with_aad() {
         let mut s = cipher_init(&key, &iv);
         absorb_aad(&mut s, b"header_b"); // different AAD
         let mut ct = plaintext.to_vec();
-        aead_encrypt_chunk(&mut s, &mut ct, &mut vec![]);
+        aead_encrypt_chunk(&mut s, &mut ct);
         aead_finalize(&mut s)
     };
 
@@ -369,7 +369,7 @@ fn aead_tag_changes_with_ciphertext_tamper() {
         let mut s = cipher_init(&key, &iv);
         absorb_aad(&mut s, aad);
         let mut ct = plaintext.to_vec();
-        aead_encrypt_chunk(&mut s, &mut ct, &mut vec![]);
+        aead_encrypt_chunk(&mut s, &mut ct);
         let tag = aead_finalize(&mut s);
         (ct, tag)
     };
@@ -405,7 +405,7 @@ fn aead_encrypt_decrypt_roundtrip_direct() {
         let mut s = cipher_init(&key, &iv);
         absorb_aad(&mut s, aad);
         let mut ct = plaintext.to_vec();
-        aead_encrypt_chunk(&mut s, &mut ct, &mut vec![]);
+        aead_encrypt_chunk(&mut s, &mut ct);
         let tag = aead_finalize(&mut s);
         (ct, tag)
     };
@@ -470,7 +470,7 @@ fn aead_absorb_aad_domain_separation() {
     let tag_ct_only = {
         let mut s = cipher_init(&key, &iv);
         let mut buf = data.to_vec();
-        aead_encrypt_chunk(&mut s, &mut buf, &mut vec![]);
+        aead_encrypt_chunk(&mut s, &mut buf);
         aead_finalize(&mut s)
     };
 
@@ -501,9 +501,9 @@ fn aead_multi_chunk_encrypt_decrypt_roundtrip() {
         let mut c0 = plaintext[0..64].to_vec();
         let mut c1 = plaintext[64..128].to_vec();
         let mut c2 = plaintext[128..192].to_vec();
-        aead_encrypt_chunk(&mut s, &mut c0, &mut vec![]);
-        aead_encrypt_chunk(&mut s, &mut c1, &mut vec![]);
-        aead_encrypt_chunk(&mut s, &mut c2, &mut vec![]);
+        aead_encrypt_chunk(&mut s, &mut c0);
+        aead_encrypt_chunk(&mut s, &mut c1);
+        aead_encrypt_chunk(&mut s, &mut c2);
         let tag = aead_finalize(&mut s);
         (c0, c1, c2, tag)
     };
@@ -623,7 +623,7 @@ fn aead_roundtrip_63_bytes() {
 
     let mut enc = cipher_init(&key, &iv);
     absorb_aad(&mut enc, aad);
-    aead_encrypt_chunk(&mut enc, &mut pt, &mut buf);
+    aead_encrypt_chunk(&mut enc, &mut pt);
     let enc_tag = aead_finalize(&mut enc);
 
     let ct = pt.clone();
@@ -652,7 +652,7 @@ fn aead_roundtrip_64_bytes() {
 
     let mut enc = cipher_init(&key, &iv);
     absorb_aad(&mut enc, aad);
-    aead_encrypt_chunk(&mut enc, &mut pt, &mut buf);
+    aead_encrypt_chunk(&mut enc, &mut pt);
     let enc_tag = aead_finalize(&mut enc);
 
     let mut dec_ct = pt.clone();
@@ -680,7 +680,7 @@ fn aead_roundtrip_65_bytes() {
 
     let mut enc = cipher_init(&key, &iv);
     absorb_aad(&mut enc, aad);
-    aead_encrypt_chunk(&mut enc, &mut pt, &mut buf);
+    aead_encrypt_chunk(&mut enc, &mut pt);
     let enc_tag = aead_finalize(&mut enc);
 
     let mut dec_ct = pt.clone();
@@ -708,7 +708,7 @@ fn aead_roundtrip_128_bytes() {
 
     let mut enc = cipher_init(&key, &iv);
     absorb_aad(&mut enc, aad);
-    aead_encrypt_chunk(&mut enc, &mut pt, &mut buf);
+    aead_encrypt_chunk(&mut enc, &mut pt);
     let enc_tag = aead_finalize(&mut enc);
 
     let mut dec_ct = pt.clone();
@@ -722,6 +722,59 @@ fn aead_roundtrip_128_bytes() {
         dec_ct,
         vec![0xDDu8; 128],
         "128-byte plaintext must decrypt correctly"
+    );
+}
+
+/// AEAD round-trip across multiple chunks whose lengths are NOT multiples of
+/// the 64-byte rate.  This exercises the keystream-buffer invalidation that must
+/// happen after each `absorb`: a partial-block chunk leaves keystream bytes
+/// buffered, and the following chunk must squeeze fresh state rather than reuse
+/// pre-absorb keystream.  Encrypt and decrypt must agree and recover the input.
+#[test]
+fn aead_roundtrip_unaligned_multi_chunk() {
+    let key = [0x9Cu8; 32];
+    let iv = [0x5Au8; 16];
+    let aad = b"unaligned-chunks";
+    let plaintext: Vec<u8> = (0..200u32).map(|i| (i % 251) as u8).collect();
+    let sizes = [50usize, 70, 80]; // none a multiple of 64; sum = 200
+
+    // Encrypt chunk-by-chunk.
+    let (ciphertext, enc_tag) = {
+        let mut s = cipher_init(&key, &iv);
+        absorb_aad(&mut s, aad);
+        let mut ct = plaintext.clone();
+        let mut off = 0;
+        for &n in &sizes {
+            aead_encrypt_chunk(&mut s, &mut ct[off..off + n]);
+            off += n;
+        }
+        let tag = aead_finalize(&mut s);
+        (ct, tag)
+    };
+    assert_ne!(
+        ciphertext, plaintext,
+        "ciphertext must differ from plaintext"
+    );
+
+    // Decrypt with the same chunk boundaries.
+    let (recovered, dec_tag) = {
+        let mut s = cipher_init(&key, &iv);
+        absorb_aad(&mut s, aad);
+        let mut pt = ciphertext.clone();
+        let mut buf = Vec::new();
+        let mut off = 0;
+        for &n in &sizes {
+            aead_decrypt_chunk(&mut s, &mut pt[off..off + n], &mut buf);
+            off += n;
+        }
+        let tag = aead_finalize(&mut s);
+        (pt, tag)
+    };
+
+    assert_eq!(enc_tag, dec_tag, "encrypt and decrypt tags must match");
+    assert_eq!(
+        recovered, plaintext,
+        "unaligned multi-chunk must round-trip"
     );
 }
 

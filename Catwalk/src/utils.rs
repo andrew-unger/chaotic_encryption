@@ -6,8 +6,57 @@ use std::fs;
 use std::io::{Read, Write};
 use std::path::Path;
 
-const MAX_DECOMPRESSED_SIZE: u64 = 4 * 1024 * 1024 * 1024; // 4 GB
+/// Maximum decompressed plaintext size accepted on decryption (4 GB).
+/// Enforced by both the in-memory path (`read_all_capped`) and the streaming
+/// path (`CappedWriter`) so a hostile or corrupted file cannot expand into a
+/// disk-filling decompression bomb.
+pub const MAX_DECOMPRESSED_SIZE: u64 = 4 * 1024 * 1024 * 1024; // 4 GB
 const DECOMPRESS_BUF: usize = 64 * 1024;
+
+/// `Write` adapter that enforces a ceiling on the total bytes written through it.
+///
+/// Wrapped around the output sink during streaming decompression, it converts
+/// a decompression bomb into a clean [`CryptoError::DecompressionTooLarge`]
+/// instead of filling the disk.  The caller checks [`CappedWriter::exceeded`]
+/// after the decode loop to distinguish the cap from a genuine I/O error.
+pub struct CappedWriter<W: Write> {
+    inner: W,
+    remaining: u64,
+    exceeded: bool,
+}
+
+impl<W: Write> CappedWriter<W> {
+    pub fn new(inner: W, cap: u64) -> Self {
+        Self {
+            inner,
+            remaining: cap,
+            exceeded: false,
+        }
+    }
+
+    /// True if a write was rejected because it would exceed the cap.
+    pub fn exceeded(&self) -> bool {
+        self.exceeded
+    }
+}
+
+impl<W: Write> Write for CappedWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if buf.len() as u64 > self.remaining {
+            self.exceeded = true;
+            return Err(std::io::Error::other(
+                "decompressed data exceeds maximum allowed size",
+            ));
+        }
+        let n = self.inner.write(buf)?;
+        self.remaining -= n as u64;
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
 
 /// Compress data using zstd (level 1 — fast, good ratio).
 pub fn compress_data(data: &[u8]) -> Result<Vec<u8>, CryptoError> {
@@ -228,5 +277,45 @@ pub fn format_byte_size(bytes: u64) -> String {
         format!("{:.2} MB", b / MB)
     } else {
         format!("{:.2} GB", b / GB)
+    }
+}
+
+// ── Unit tests ─────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn capped_writer_passes_writes_under_cap() {
+        let mut sink = Vec::new();
+        let mut capped = CappedWriter::new(&mut sink, 100);
+        capped.write_all(&[0xAA; 60]).unwrap();
+        capped.write_all(&[0xBB; 40]).unwrap();
+        assert!(!capped.exceeded());
+        assert_eq!(sink.len(), 100);
+    }
+
+    #[test]
+    fn capped_writer_rejects_writes_over_cap() {
+        let mut sink = Vec::new();
+        let mut capped = CappedWriter::new(&mut sink, 100);
+        capped.write_all(&[0xAA; 60]).unwrap();
+        let err = capped.write_all(&[0xBB; 41]).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::Other);
+        assert!(capped.exceeded());
+        // Nothing from the rejected write reached the sink.
+        assert_eq!(sink.len(), 60);
+    }
+
+    #[test]
+    fn capped_writer_exact_cap_is_allowed() {
+        let mut sink = Vec::new();
+        let mut capped = CappedWriter::new(&mut sink, 64);
+        capped.write_all(&[0x01; 64]).unwrap();
+        assert!(!capped.exceeded());
+        // The very next byte trips the cap.
+        assert!(capped.write_all(&[0x02]).is_err());
+        assert!(capped.exceeded());
     }
 }
