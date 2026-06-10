@@ -1,4 +1,4 @@
-# CLAUDE.md — Chaotic Encryption (CATWALK)
+# CLAUDE.md — CATWALK
 
 ## Project Overview
 
@@ -10,7 +10,7 @@ It implements a novel AEAD scheme on top of a CML-Sponge primitive (Coupled Map 
 ## Repository Layout
 
 ```
-chaotic_encryption/
+.                     # repository root (project: Catwalk)
 ├── Catwalk/          # Rust crate (library + CLI binary)
 │   ├── src/
 │   │   ├── lib.rs          — public API surface

@@ -21,7 +21,7 @@ const DEFAULT_OPTS: EncryptOptions = EncryptOptions {
 
 #[test]
 fn round_trip_basic() {
-    let plaintext = b"Hello, this is a test of CATWALK chaotic encryption!";
+    let plaintext = b"Hello, this is a test of CATWALK authenticated encryption!";
     let password = "testpassword123";
     let filename = "test.txt";
 

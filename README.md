@@ -11,8 +11,8 @@ cross-platform GUI.
 ## Quick start
 
 ```bash
-git clone https://github.com/andrew-unger/chaotic_encryption.git
-cd chaotic_encryption/Catwalk
+git clone https://github.com/andrew-unger/chaotic_encryption.git catwalk
+cd catwalk/Catwalk
 cargo build --release
 ./target/release/catwalk encrypt input.bin output.catwalk
 ./target/release/catwalk decrypt output.catwalk recovered.bin
@@ -23,7 +23,7 @@ Build with the GUI: `cargo build --release --features gui`.
 ## Repository layout
 
 ```
-chaotic_encryption/
+.               # repository root (project: Catwalk)
 ├── Catwalk/    # Rust crate (library + CLI binary)
 ├── Support/    # tests, benches, docs, paper
 ├── CLAUDE.md   # contributor / agent guidelines
@@ -39,6 +39,7 @@ chaotic_encryption/
   coupling-matrix analysis, security argument.
 - [Support/docs/](Support/docs/) — design spec, security argument, and
   empirical analysis (PractRand validation, reduced-round, algebraic degree).
+- [CHANGELOG.md](CHANGELOG.md) — notable changes, including format history.
 - [CLAUDE.md](CLAUDE.md) — coding conventions and build commands.
 
 ## License

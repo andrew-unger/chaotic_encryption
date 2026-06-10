@@ -1,4 +1,4 @@
-# CATWALK: Chaotic Encryption Tool
+# CATWALK: CML-Sponge AEAD Encryption Tool
 
 ## Overview
 
@@ -44,17 +44,17 @@ The paper includes the complete construction specification, coupling matrix eige
 ### Build
 
 ```bash
-git clone https://github.com/andrew-unger/chaotic_encryption.git
-cd chaotic_encryption
+git clone https://github.com/andrew-unger/chaotic_encryption.git catwalk
+cd catwalk/Catwalk
 cargo build --release
 ```
 
 The binary will be at `target/release/catwalk` (or `catwalk.exe` on Windows).
-
-To build without the GUI (CLI only):
+The default build is CLI-only; opt into the GUI or archive support with:
 
 ```bash
-cargo build --release --no-default-features
+cargo build --release --features gui      # GUI (implies archive)
+cargo build --release --features archive  # CLI + encrypted archives
 ```
 
 ## Usage
@@ -82,23 +82,41 @@ The GUI provides:
 #### Encrypt
 
 ```bash
-catwalk encrypt <input_file> <output_file> [--no-metadata] [--no-compress]
+catwalk encrypt <input_file> <output_file> [--no-metadata] [--no-compress] [--keyfile PATH] [--password-file PATH]
 ```
 
-You will be prompted for a password.
+You will be prompted for a password (interactive use).
 
 | Flag | Effect |
 |------|--------|
 | `--no-metadata` | Strips timestamp and file extension from the header |
 | `--no-compress` | Skips compression (prevents compression oracle attacks) |
+| `--keyfile PATH` | Mixes a keyfile into the KDF (two-factor encryption) |
+| `--password-file PATH` | Reads the password from the first line of PATH (scripting) |
+| `--secure-delete` | Best-effort overwrite + delete of the input after success |
 
 #### Decrypt
 
 ```bash
-catwalk decrypt <input_file> <output_file> [--force]
+catwalk decrypt <input_file> <output_file> [--force] [--keyfile PATH] [--password-file PATH]
 ```
 
 The `--force` flag allows overwriting existing output files. The original file extension is automatically restored.
+
+#### Scripting / batch mode
+
+For non-interactive use, supply the password with `--password-file` (the file
+should be permission-protected), or pipe it on stdin when stdin is not the
+data stream:
+
+```bash
+catwalk encrypt secret.db secret.catwalk --password-file /run/secrets/pw
+printf '%s\n' "$PW" | catwalk decrypt secret.catwalk secret
+```
+
+Passwords are never accepted as command-line arguments (they would be visible
+in process listings).  When stdin carries the data (`encrypt - -`),
+`--password-file` is required.
 
 #### File Info
 
