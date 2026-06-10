@@ -189,18 +189,25 @@ impl eframe::App for CatwalkGui {
         self.poll_worker();
         self.handle_dropped_files(ctx);
 
-        // Handle pending secure delete after successful encryption
-        if let Some(path) = self.pending_secure_delete.take() {
-            match secure_delete_file(&path) {
-                Ok(()) => {
-                    self.status_message =
-                        format!("{} | Original securely deleted", self.status_message);
-                }
-                Err(e) => {
-                    self.status_message = format!(
-                        "{} | Warning: secure delete failed: {}",
-                        self.status_message, e
-                    );
+        // Handle pending secure delete after successful encryption.
+        // MUST be gated on `!processing`: the pending path is queued when the
+        // worker is spawned, and deleting before the worker finishes (or has
+        // even read the input) would destroy the original without a valid
+        // ciphertext.  `poll_worker` clears the pending path on failure, so
+        // by the time `processing` is false the delete is known-safe.
+        if !self.processing {
+            if let Some(path) = self.pending_secure_delete.take() {
+                match secure_delete_file(&path) {
+                    Ok(()) => {
+                        self.status_message =
+                            format!("{} | Original securely deleted", self.status_message);
+                    }
+                    Err(e) => {
+                        self.status_message = format!(
+                            "{} | Warning: secure delete failed: {}",
+                            self.status_message, e
+                        );
+                    }
                 }
             }
         }
