@@ -25,11 +25,16 @@ allow = [
     "ISC",
     "MIT",
     "MPL-2.0",
+    "OFL-1.1",          # egui default fonts (epaint)
+    "Ubuntu-font-1.0",  # egui default fonts (epaint)
     "Unicode-3.0",
     "Unicode-DFS-2016",
     "Zlib",
 ]
 exceptions = []
+# The catwalk crate itself is proprietary ("All rights reserved", see
+# repository LICENSE) and is never published — skip the SPDX check for it.
+private = { ignore = true }
 
 [[licenses.clarify]]
 name = "ring"

@@ -4,11 +4,11 @@
 //! This tests the raw permutation output at reduced round counts to find
 //! the minimum round count at which the permutation alone passes PractRand.
 //!
-//! Usage: cml_rr_raw_dump <rounds> [seed_index]
+//! Usage: `cml_rr_raw_dump <rounds> [seed_index]`
 //!   rounds:     1–8 (number of CML rounds per permutation)
 //!   seed_index: 0–255 (default 0)
 //!
-//! Example: cml_rr_raw_dump 3 | RNG_test stdin64 -tlmax 4GB
+//! Example: `cml_rr_raw_dump 3 | RNG_test stdin64 -tlmax 4GB`
 
 use std::env;
 use std::io::{self, BufWriter, Write};

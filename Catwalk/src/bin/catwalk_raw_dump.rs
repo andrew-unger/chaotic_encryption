@@ -4,16 +4,16 @@
 //! permutation BEFORE the Stafford Mix13 output finalizer is applied.
 //!
 //! The standard squeeze path applies Mix13 to each rate word before output:
-//!   output[i] = stafford_mix13(state.lattice[i])
+//!   `output[i] = stafford_mix13(state.lattice[i])`
 //!
 //! This binary bypasses Mix13 and outputs the raw rate words:
-//!   output[i] = state.lattice[i]
+//!   `output[i] = state.lattice[i]`
 //!
 //! This answers whether Mix13 is defense-in-depth (permutation already strong)
 //! or load-bearing (masking permutation weaknesses).
 //!
 //! Usage (seed mode — matches cml_keystream_dump key derivation):
-//!   catwalk_raw_dump [seed_index]
+//!   `catwalk_raw_dump [seed_index]`
 //!   catwalk_raw_dump 0   | RNG_test stdin64 -tlmax 32GB
 //!   catwalk_raw_dump 254 | RNG_test stdin64 -tlmax 32GB
 //!

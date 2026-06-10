@@ -7,6 +7,10 @@ default-run = "catwalk"
 authors = ["Andrew Unger"]
 repository = "https://github.com/andrew-unger/chaotic_encryption"
 readme = "../Support/README.md"
+# Proprietary research code ("All rights reserved", see repository LICENSE).
+# publish = false prevents accidental `cargo publish` and lets cargo-deny
+# treat the crate as private.
+publish = false
 
 [lib]
 name = "catwalk"

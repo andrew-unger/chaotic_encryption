@@ -15,10 +15,10 @@
 //!    (0,1),(2,3),…,(14,15).  Computed as a snapshot into m[].
 //!    cat_map(x,y) = (x+y, x+2y) mod 2^64 — area-preserving, hyperbolic,
 //!    Lyapunov exponent ln((3+√5)/2) ≈ 0.9624.
-//! 3. CML coupling — s[i] = m[i] + m[(i+1)%16] + m[(i+3)%16] + m[(i+7)%16] + m[(i+11)%16].
+//! 3. CML coupling — `s[i] = m[i] + m[(i+1)%16] + m[(i+3)%16] + m[(i+7)%16] + m[(i+11)%16]`.
 //!    Distances {1,3,7,11} (5-term) achieve full 16-site diffusion in exactly 2 rounds.
 //!    p(x) = 1+x+x³+x⁷+x¹¹; p(1)=5 (odd) → C invertible over Z/2⁶⁴Z; det(C)=−33075.
-//! 4. Multiplicative mixing — s[2k+1] *= (s[2k] | 1) for k=0..7.
+//! 4. Multiplicative mixing — `s[2k+1] *= (s[2k] | 1)` for k=0..7.
 //!
 //! **Sponge construction (Bertoni et al.):**
 //! - Absorb key  (32 bytes, domain 0x01): XOR into rate, permute.
@@ -688,7 +688,7 @@ pub fn cml_permute_r(state: &mut CmlSpongeState, rounds: usize) {
 /// Copy the raw rate words (sites 0–7) into `out` as little-endian bytes,
 /// WITHOUT applying the Stafford Mix13 output finalizer.
 ///
-/// `out` must be exactly [`BLOCK_BYTES`] (64) bytes.
+/// `out` must be exactly `BLOCK_BYTES` (64) bytes.
 ///
 /// This is used exclusively by the `catwalk_raw_dump` PractRand binary to
 /// test the intrinsic statistical quality of the CML-Sponge permutation
