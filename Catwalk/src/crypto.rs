@@ -880,28 +880,25 @@ pub fn encrypt_stream<R: Read, W: Write>(
 ///
 /// Returns the original file extension (empty string if metadata was stripped).
 ///
-/// # Security note
+/// # Verify-then-emit
 ///
-/// Unlike [`decrypt`], this function writes decrypted data to `writer`
-/// **before** the authentication tag is verified.  If the tag check fails,
-/// the caller is responsible for deleting or discarding the output.
-/// This trade-off is inherent to streaming AEAD decryption and is standard
-/// practice (cf. `age`, `gpg`).
+/// This function makes **two passes** over the ciphertext:
 ///
-/// Callers **must** treat the emitted bytes as unauthenticated until this
-/// function returns `Ok(())`. In particular:
+/// 1. Decrypt and compute the authentication tag *without writing anything*.
+///    A wrong password, wrong keyfile, or tampered file is rejected here —
+///    before a single plaintext byte reaches `writer` (and before any
+///    decompression of attacker-influenced bytes is attempted).
+/// 2. Seek back, decrypt again, and stream the now-authenticated plaintext
+///    through the decompressor to `writer`.  The tag is recomputed and
+///    re-checked after this pass to close the window in which the underlying
+///    file could have been swapped between passes; on mismatch the caller
+///    must discard the output (the CATWALK CLI deletes the file).
 ///
-/// - When `writer` is a file, delete the file on `Err` (the CATWALK CLI does
-///   this via [`std::fs::remove_file`]).
-/// - When `writer` is stdout, a pipe, or any unseekable sink, downstream
-///   consumers may have already read unauthenticated data before the tag is
-///   checked. Document this to end users and advise them not to act on the
-///   output until the process exits with code 0.
-/// - When `writer` is an in-memory buffer, clear it on `Err` before reuse.
-///
-/// If any of these post-conditions cannot be guaranteed by the caller, use
-/// the non-streaming [`decrypt`] function instead — it verifies the tag before
-/// returning any plaintext.
+/// The cost is decrypting twice (~530 MiB/s per pass), which is dominated by
+/// I/O for most workloads.  In exchange, `writer` never observes
+/// unauthenticated plaintext under any passive-corruption scenario — only an
+/// active mid-read substitution can reach pass 2, and that is caught by the
+/// final re-check.
 pub fn decrypt_stream<R: Read + Seek, W: Write>(
     reader: &mut R,
     writer: &mut W,
@@ -928,17 +925,45 @@ pub fn decrypt_stream<R: Read + Seek, W: Write>(
     )?;
     report(progress, 0.35);
 
+    let no_compress = (stream_header.prefix.flags & FLAG_NO_COMPRESS) != 0;
+    let use_zstd = (stream_header.prefix.flags & FLAG_ZSTD) != 0;
+    let cipher_len = stream_header.cipher_len;
+    let cipher_start = reader.stream_position()?;
+    let mut buf = vec![0u8; STREAM_CHUNK];
+
+    // ── Pass 1: decrypt + verify tag, emitting nothing (0.40 → 0.62) ──────
+    {
+        let mut session = init_aead_session(
+            cipher_key.get(),
+            &stream_header.prefix.nonce,
+            &stream_header.header_bytes,
+        );
+        let mut remaining = cipher_len;
+        while remaining > 0 {
+            let to_read = remaining.min(STREAM_CHUNK);
+            reader.read_exact(&mut buf[..to_read])?;
+            session.decrypt_chunk(&mut buf[..to_read]);
+            remaining -= to_read;
+            let frac = (cipher_len - remaining) as f32 / cipher_len.max(1) as f32;
+            report(progress, 0.40 + frac * 0.22);
+        }
+        // `buf` holds the final chunk's (unverified) plaintext.  Zeroize the
+        // contents via the slice — Vec::zeroize would also truncate the
+        // buffer, which pass 2 reuses at full capacity.
+        buf.as_mut_slice().zeroize();
+        let computed_tag = session.finalize();
+        if computed_tag.ct_eq(&stream_header.stored_tag).unwrap_u8() != 1 {
+            return Err(CryptoError::IntegrityCheckFailed);
+        }
+    }
+    reader.seek(SeekFrom::Start(cipher_start))?;
+
+    // ── Pass 2: decrypt again and emit authenticated plaintext (0.62 → 0.85) ─
     let mut session = init_aead_session(
         cipher_key.get(),
         &stream_header.prefix.nonce,
         &stream_header.header_bytes,
     );
-
-    // Stream decrypt (0.40 → 0.85).
-    let no_compress = (stream_header.prefix.flags & FLAG_NO_COMPRESS) != 0;
-    let use_zstd = (stream_header.prefix.flags & FLAG_ZSTD) != 0;
-    let cipher_len = stream_header.cipher_len;
-    let mut buf = vec![0u8; STREAM_CHUNK];
     let mut remaining = cipher_len;
 
     let mut decrypt_loop = |sink: &mut dyn Write| -> Result<(), CryptoError> {
@@ -952,7 +977,7 @@ pub fn decrypt_stream<R: Read + Seek, W: Write>(
             // (the loop body never runs in that case, but the guard is kept
             // for clarity).
             let frac = (cipher_len - remaining) as f32 / cipher_len.max(1) as f32;
-            report(progress, 0.40 + frac * 0.45);
+            report(progress, 0.62 + frac * 0.23);
         }
         Ok(())
     };
@@ -962,7 +987,10 @@ pub fn decrypt_stream<R: Read + Seek, W: Write>(
     } else {
         // Cap total decompressed output so a hostile or corrupted file cannot
         // expand into a disk-filling decompression bomb.  Mirrors the 4 GB
-        // limit enforced by the in-memory decrypt path.
+        // limit enforced by the in-memory decrypt path.  (The compressed
+        // stream is authenticated by pass 1 before it reaches the
+        // decompressor, so a decoder error here indicates a genuine bug or
+        // an active substitution — not a wrong password.)
         let mut capped =
             crate::utils::CappedWriter::new(writer, crate::utils::MAX_DECOMPRESSED_SIZE);
         let result = if use_zstd {
@@ -985,7 +1013,8 @@ pub fn decrypt_stream<R: Read + Seek, W: Write>(
     buf.zeroize();
     report(progress, 0.85);
 
-    // Verify authentication tag (constant-time).
+    // Re-verify: detects the underlying data changing between the passes.
+    // On mismatch the caller must discard the emitted output.
     let computed_tag = session.finalize();
     if computed_tag.ct_eq(&stream_header.stored_tag).unwrap_u8() != 1 {
         return Err(CryptoError::IntegrityCheckFailed);
