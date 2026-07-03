@@ -1,23 +1,31 @@
 # CATWALK (CML-Sponge AEAD) — Performance Benchmarks
 
-**Date:** 2026-06-09
+**Date:** 2026-06-10
 **Crate version:** 0.1.0 (file format v10 — duplex AEAD)
 **Rust toolchain:** stable (1.96)
 **Profile:** release (opt-level=3, LTO=fat, codegen-units=1)
-**Platform:** Windows 11 Pro (x86-64)
+**Target CPU:** portable baseline (no `target-cpu` override — see note below)
+**Platform:** Windows 11 Pro (x86-64, measured on a Ryzen 9 3900X)
 **Benchmark harness:** criterion 0.5.1 (100 samples, default warmup/measurement time)
 
 All AEAD timings include session init (`AeadSession::new`) + `absorb_aad` +
 encrypt/decrypt + `finalize`.  They do **not** include the Argon2id KDF; see
 the `kdf_only` entry for that cost.
 
-> **Changelog vs. the v11 (2026-06-09, pre-duplex) baseline:** the AEAD was
-> rebuilt as a SpongeWrap duplex — one permutation per 64-byte block instead
-> of two (squeeze + absorb), with a word-wise fast path for block-aligned
-> data.  Measured same-machine A/B (criterion `--baseline v11`):
-> **encrypt 64 KB +86%, decrypt 1 MB +119% throughput.**  Combined with the
-> earlier allocation-elimination wave, total speedup since the 2026-03
-> implementation is ≈ 2.8× (encrypt) to 3.4× (decrypt).
+> **Portable optimization pass (2026-06-10).** Two changes, both ISA-agnostic
+> (they help every target, nothing machine-specific):
+> 1. `cml_round` rewritten from array-with-modular-indexing to fully-unrolled
+>    scalar SSA, cutting the per-round register spills (~117 → fewer stack
+>    moves) — byte-for-byte identical output (all test vectors unchanged),
+>    ~5% faster permutation.
+> 2. Dropped the committed `-C target-cpu=native` build flag. For this scalar
+>    64-bit-integer permutation it was a *pessimization* — LLVM's AVX2
+>    autovectorization regressed the workload — as well as pinning binaries to
+>    the build machine's ISA. Removing it is both portable and faster.
+>
+> Net same-machine effect vs. the pre-pass config: permutation 100.7 → 86.1 ns
+> (**−15%**), AEAD 64 KB encrypt 488 → 629 MiB/s (**+29%**). (SIMD-accelerated
+> dependencies blake3/zstd are unaffected — they do runtime CPU dispatch.)
 
 ---
 
@@ -27,24 +35,24 @@ the `kdf_only` entry for that cost.
 
 | Benchmark | Mean time | Notes |
 |-----------|-----------|-------|
-| `permutation_only` | 98.0 ns | 8 × CML rounds; 1024-bit state |
-| `keystream_64b` | 105.4 ns | 579 MiB/s; cipher_init state reused across iterations |
+| `permutation_only` | 86.1 ns | 8 × CML rounds; 1024-bit state |
+| `keystream_64b` | 105.5 ns | 578 MiB/s; cipher_init state reused across iterations |
 
 ### AEAD encrypt throughput (duplex)
 
 | Payload | Mean time | Throughput |
 |---------|-----------|------------|
-| 1 KB | 2.80 µs | 349 MiB/s |
-| 64 KB | 128.3 µs | 487 MiB/s |
-| 1 MB | 2.38 ms | 419 MiB/s |
+| 1 KB | 2.28 µs | 429 MiB/s |
+| 64 KB | 99.4 µs | 629 MiB/s |
+| 1 MB | 1.76 ms | 568 MiB/s |
 
 ### AEAD decrypt throughput (duplex)
 
 | Payload | Mean time | Throughput |
 |---------|-----------|------------|
-| 1 KB | 2.50 µs | 391 MiB/s |
-| 64 KB | 118.6 µs | 527 MiB/s |
-| 1 MB | 1.89 ms | 529 MiB/s |
+| 1 KB | 2.46 µs | 396 MiB/s |
+| 64 KB | 107.3 µs | 583 MiB/s |
+| 1 MB | 1.90 ms | 526 MiB/s |
 
 ### Key derivation
 
@@ -62,12 +70,25 @@ the `kdf_only` entry for that cost.
 
 ## Interpretation
 
-**Permutation cost (98 ns per call):**
+**Permutation cost (86 ns per call):**
 Each permutation applies 8 CML rounds over a 16×u64 (1024-bit) state.  The
 duplex AEAD performs exactly one permutation per 64-byte block, so the raw
-ceiling is `64 / 98ns ≈ 622 MiB/s`.  The measured streaming plateau of
-~490–530 MiB/s sits at 80–85% of that ceiling; the gap is the per-block
+ceiling is `64 / 86ns ≈ 710 MiB/s`.  The measured streaming plateau of
+~570–630 MiB/s sits at 80–89% of that ceiling; the gap is the per-block
 Mix13 keystream read, the XOR/injection word loop, and session bookkeeping.
+
+**Why no explicit SIMD / hand-vectorization:**
+The permutation is scalar 64-bit integer work.  The only lever big enough to
+matter would be vectorizing the round, but it does not pay off here and is not
+portable: (a) the sole nonlinear step is a 64-bit multiply, which has no AVX2
+equivalent (`vpmullq` is AVX-512DQ-only), forcing awkward 32×32 emulation;
+(b) the 5-tap ring coupling needs heavy cross-lane shuffles that eat the
+additive-layer savings; and (c) most decisively, the duplex chaining
+serialises permutations (each block depends on the previous), so the
+independent-lane batching that makes SIMD ciphers fast is structurally
+impossible for a single message.  The fastest portable form is well-scheduled
+scalar — which is why `target-cpu=native` (LLVM trying to vectorise anyway)
+measured *slower* here.
 
 **Duplex vs. the retired two-permutation mode:**
 The v9-format AEAD cost 2 permutations per 64 bytes (squeeze for keystream,
@@ -91,16 +112,20 @@ password-guessing attacks expensive.
 
 ## Baseline and regression tracking
 
-These numbers serve as the v10-duplex baseline.  To save them for future comparison:
+These numbers serve as the `portable-v1` baseline.  To save them for future comparison:
 
 ```sh
-cargo bench --bench catwalk_bench -- --save-baseline v10-duplex
+cargo bench --bench catwalk_bench -- --save-baseline portable-v1
 ```
 
 To compare a future change against this baseline:
 
 ```sh
-cargo bench --bench catwalk_bench -- --baseline v10-duplex
+cargo bench --bench catwalk_bench -- --baseline portable-v1
 ```
+
+Measure like-for-like: keep the same `target-cpu` (the default, portable
+baseline) on both sides, since the target CPU affects results as much as the
+code does.
 
 HTML reports are written to `target/criterion/` when `html_reports` feature is enabled.

@@ -45,24 +45,21 @@ const N_RATE: usize = 8;
 /// Full 16-site diffusion occurs at round 2; 8 rounds gives 4× margin.
 const N_ROUNDS: usize = 8;
 
-/// CML coupling distances for the 5-term polynomial p(x) = 1 + x + x³ + x⁷ + x¹¹.
-/// Together with self (distance 0) these achieve full 16-site diffusion in 2 rounds.
-///
-/// Distances {1, 3, 7, 11} were selected to satisfy:
-///   1. Non-singular coupling matrix — p(x) = 1 + x + x³ + x⁷ + x¹¹ has no roots
-///      among the 16th roots of unity; min |λ_k| = 1.259 (eigenvalue margin, +65%
-///      improvement over the prior {1,5,11} design's 0.765).
-///   2. Invertible over Z/2⁶⁴Z — p(1) = 5 (odd) → det(C) = −33075 = −3³×5²×7² (odd)
-///      → gcd(33075, 2⁶⁴) = 1 → kernel is trivial {0}.  No capacity loss.
-///      The prior 4-term {1,5,11} had det = −1088 = −2⁶×17 (even), giving a
-///      4-element kernel and 2-bit effective capacity reduction.
-///   3. Full 16-site diffusion by round 2 (symbolic simulation verified).
-///   4. All four distances are odd → p(-1) = 1−1−1−1−1 = −3 ≠ 0.
-///   5. All distances are prime (1,3,7,11) — nothing-up-my-sleeve character.
-const D1: usize = 1;
-const D2: usize = 3;
-const D3: usize = 7;
-const D4: usize = 11;
+// CML coupling distances for the 5-term polynomial p(x) = 1 + x + x³ + x⁷ + x¹¹
+// are {1, 3, 7, 11}.  Together with self (distance 0) they achieve full 16-site
+// diffusion in exactly 2 rounds.  They are baked as literal taps into the
+// unrolled coupling in `cml_round` (Step 3); `coupling_unroll_matches_reference`
+// in the tests locks that unrolling to the array formula.
+//
+// Selection rationale (all four distances odd and prime — nothing-up-my-sleeve):
+//   1. Non-singular over ℂ: p(x) has no root among the 16th roots of unity;
+//      min |λ_k| = 1.259 (+65% over the prior {1,5,11} design's 0.765).
+//   2. Invertible over Z/2⁶⁴Z: p(1) = 5 (odd) → det(C) = −33075 = −3³×5²×7²
+//      (odd) → gcd(33075, 2⁶⁴) = 1 → trivial kernel {0}, no capacity loss.
+//      The prior 4-term {1,5,11} had det = −1088 (even): a 4-element kernel
+//      and 2-bit effective capacity reduction.
+//   3. Full 16-site diffusion by round 2 (symbolic simulation verified).
+//   4. All distances odd → p(−1) = 1−1−1−1−1 = −3 ≠ 0.
 
 /// Per-site counter rotation amounts: first 16 primes ≥ 3.
 /// All odd, all coprime to 64, publicly verifiable as nothing-up-my-sleeve.
@@ -145,54 +142,150 @@ fn arnold_cat_map(x: u64, y: u64) -> (u64, u64) {
 // ── CML round and permutation ──────────────────────────────────────────────
 
 /// One CML round.  Mutates `s` and `counter` in place.
+///
+/// Written as fully-unrolled scalar SSA (16 named locals per stage) rather
+/// than array loops with modular indexing.  This is byte-for-byte identical
+/// to the array formulation — the coupling taps below are exactly
+/// `m[(i+d) mod 16]` for d ∈ {0,1,3,7,11} — but it lets LLVM keep the whole
+/// state in registers and schedule/CSE freely, instead of spilling the `m[]`
+/// snapshot to the stack (the `m[(i+D)%N]` access pattern defeated register
+/// promotion and cost ~117 stack moves per round).
 #[inline(always)]
 fn cml_round(s: &mut [u64; N], counter: &mut u64) {
     // Step 1 — Counter injection (all 16 sites, prime rotations).
     // Runs before the map to ensure no site pair is (0,0) when the Cat Map
     // is applied (see arnold_cat_map fixed-point note), and to diversify
     // state across sites before the nonlinear step.
-    *counter = counter.wrapping_add(GOLDEN);
-    for i in 0..N {
-        s[i] = s[i].wrapping_add(counter.rotate_left(ROT[i]));
-    }
+    let c = counter.wrapping_add(GOLDEN);
+    *counter = c;
+    let a0 = s[0].wrapping_add(c.rotate_left(ROT[0]));
+    let a1 = s[1].wrapping_add(c.rotate_left(ROT[1]));
+    let a2 = s[2].wrapping_add(c.rotate_left(ROT[2]));
+    let a3 = s[3].wrapping_add(c.rotate_left(ROT[3]));
+    let a4 = s[4].wrapping_add(c.rotate_left(ROT[4]));
+    let a5 = s[5].wrapping_add(c.rotate_left(ROT[5]));
+    let a6 = s[6].wrapping_add(c.rotate_left(ROT[6]));
+    let a7 = s[7].wrapping_add(c.rotate_left(ROT[7]));
+    let a8 = s[8].wrapping_add(c.rotate_left(ROT[8]));
+    let a9 = s[9].wrapping_add(c.rotate_left(ROT[9]));
+    let a10 = s[10].wrapping_add(c.rotate_left(ROT[10]));
+    let a11 = s[11].wrapping_add(c.rotate_left(ROT[11]));
+    let a12 = s[12].wrapping_add(c.rotate_left(ROT[12]));
+    let a13 = s[13].wrapping_add(c.rotate_left(ROT[13]));
+    let a14 = s[14].wrapping_add(c.rotate_left(ROT[14]));
+    let a15 = s[15].wrapping_add(c.rotate_left(ROT[15]));
 
-    // Step 2 — Arnold's Cat Map on adjacent pairs: (0,1),(2,3),...,(14,15).
-    // All pairs are written into snapshot m[] before coupling, preserving
-    // the sponge's snapshot semantics (no site's coupling sees another
-    // site's already-updated value from the same step).
-    let mut m = [0u64; N];
-    for k in 0..8 {
-        let (mx, my) = arnold_cat_map(s[2 * k], s[2 * k + 1]);
-        m[2 * k] = mx;
-        m[2 * k + 1] = my;
-    }
+    // Step 2 — Arnold's Cat Map on adjacent pairs (snapshot m[]).
+    let (m0, m1) = arnold_cat_map(a0, a1);
+    let (m2, m3) = arnold_cat_map(a2, a3);
+    let (m4, m5) = arnold_cat_map(a4, a5);
+    let (m6, m7) = arnold_cat_map(a6, a7);
+    let (m8, m9) = arnold_cat_map(a8, a9);
+    let (m10, m11) = arnold_cat_map(a10, a11);
+    let (m12, m13) = arnold_cat_map(a12, a13);
+    let (m14, m15) = arnold_cat_map(a14, a15);
 
     // Step 3 — CML additive coupling, 5-term p(x) = 1 + x + x³ + x⁷ + x¹¹.
-    // Distances {1, 3, 7, 11}: det(C) = −33075 (odd) → fully invertible over Z/2⁶⁴Z.
-    //
-    // Multi-pass accumulation: each pass is a single-offset sequential loop that
-    // the compiler can auto-vectorize with SIMD (each m[(i+D)%N] access is a
-    // predictable rotated load).  A single fused loop with 5 terms defeats
-    // auto-vectorization and is ~3× slower on x86-64.
-    *s = m; // distance 0 (self)
-    for i in 0..N {
-        s[i] = s[i].wrapping_add(m[(i + D1) % N]);
-    } // distance 1
-    for i in 0..N {
-        s[i] = s[i].wrapping_add(m[(i + D2) % N]);
-    } // distance 3
-    for i in 0..N {
-        s[i] = s[i].wrapping_add(m[(i + D3) % N]);
-    } // distance 7
-    for i in 0..N {
-        s[i] = s[i].wrapping_add(m[(i + D4) % N]);
-    } // distance 11
+    // o[i] = m[i] + m[(i+1)%16] + m[(i+3)%16] + m[(i+7)%16] + m[(i+11)%16].
+    let o0 = m0
+        .wrapping_add(m1)
+        .wrapping_add(m3)
+        .wrapping_add(m7)
+        .wrapping_add(m11);
+    let o1 = m1
+        .wrapping_add(m2)
+        .wrapping_add(m4)
+        .wrapping_add(m8)
+        .wrapping_add(m12);
+    let o2 = m2
+        .wrapping_add(m3)
+        .wrapping_add(m5)
+        .wrapping_add(m9)
+        .wrapping_add(m13);
+    let o3 = m3
+        .wrapping_add(m4)
+        .wrapping_add(m6)
+        .wrapping_add(m10)
+        .wrapping_add(m14);
+    let o4 = m4
+        .wrapping_add(m5)
+        .wrapping_add(m7)
+        .wrapping_add(m11)
+        .wrapping_add(m15);
+    let o5 = m5
+        .wrapping_add(m6)
+        .wrapping_add(m8)
+        .wrapping_add(m12)
+        .wrapping_add(m0);
+    let o6 = m6
+        .wrapping_add(m7)
+        .wrapping_add(m9)
+        .wrapping_add(m13)
+        .wrapping_add(m1);
+    let o7 = m7
+        .wrapping_add(m8)
+        .wrapping_add(m10)
+        .wrapping_add(m14)
+        .wrapping_add(m2);
+    let o8 = m8
+        .wrapping_add(m9)
+        .wrapping_add(m11)
+        .wrapping_add(m15)
+        .wrapping_add(m3);
+    let o9 = m9
+        .wrapping_add(m10)
+        .wrapping_add(m12)
+        .wrapping_add(m0)
+        .wrapping_add(m4);
+    let o10 = m10
+        .wrapping_add(m11)
+        .wrapping_add(m13)
+        .wrapping_add(m1)
+        .wrapping_add(m5);
+    let o11 = m11
+        .wrapping_add(m12)
+        .wrapping_add(m14)
+        .wrapping_add(m2)
+        .wrapping_add(m6);
+    let o12 = m12
+        .wrapping_add(m13)
+        .wrapping_add(m15)
+        .wrapping_add(m3)
+        .wrapping_add(m7);
+    let o13 = m13
+        .wrapping_add(m14)
+        .wrapping_add(m0)
+        .wrapping_add(m4)
+        .wrapping_add(m8);
+    let o14 = m14
+        .wrapping_add(m15)
+        .wrapping_add(m1)
+        .wrapping_add(m5)
+        .wrapping_add(m9);
+    let o15 = m15
+        .wrapping_add(m0)
+        .wrapping_add(m2)
+        .wrapping_add(m6)
+        .wrapping_add(m10);
 
-    // Step 4 — Multiplicative mixing of adjacent pairs.
-    for k in 0..8 {
-        let a = s[2 * k];
-        s[2 * k + 1] = s[2 * k + 1].wrapping_mul(a | 1);
-    }
+    // Step 4 — Multiplicative mixing of adjacent pairs:
+    // even site passes through; odd site *= (even | 1) (odd multiplier).
+    s[0] = o0;
+    s[1] = o1.wrapping_mul(o0 | 1);
+    s[2] = o2;
+    s[3] = o3.wrapping_mul(o2 | 1);
+    s[4] = o4;
+    s[5] = o5.wrapping_mul(o4 | 1);
+    s[6] = o6;
+    s[7] = o7.wrapping_mul(o6 | 1);
+    s[8] = o8;
+    s[9] = o9.wrapping_mul(o8 | 1);
+    s[10] = o10;
+    s[11] = o11.wrapping_mul(o10 | 1);
+    s[12] = o12;
+    s[13] = o13.wrapping_mul(o12 | 1);
+    s[14] = o14;
+    s[15] = o15.wrapping_mul(o14 | 1);
 }
 
 /// Apply N_ROUNDS of cml_round to the state.
@@ -736,5 +829,70 @@ pub fn keystream_r(state: &mut CmlSpongeState, out: &mut [u8], rounds: usize) {
 pub fn permute_raw(lattice: &mut [u64; 16], counter: &mut u64, rounds: usize) {
     for _ in 0..rounds.min(32) {
         cml_round(lattice, counter);
+    }
+}
+
+#[cfg(test)]
+mod round_tests {
+    use super::*;
+
+    /// Reference implementation of one round using array loops and modular
+    /// indexing — the readable spec that the hand-unrolled `cml_round`
+    /// replaced for speed.  Kept only in tests as the oracle.
+    fn cml_round_reference(s: &mut [u64; N], counter: &mut u64) {
+        const DIST: [usize; 4] = [1, 3, 7, 11];
+        *counter = counter.wrapping_add(GOLDEN);
+        for i in 0..N {
+            s[i] = s[i].wrapping_add(counter.rotate_left(ROT[i]));
+        }
+        let mut m = [0u64; N];
+        for k in 0..8 {
+            let (mx, my) = arnold_cat_map(s[2 * k], s[2 * k + 1]);
+            m[2 * k] = mx;
+            m[2 * k + 1] = my;
+        }
+        for i in 0..N {
+            s[i] = m[i]
+                .wrapping_add(m[(i + DIST[0]) % N])
+                .wrapping_add(m[(i + DIST[1]) % N])
+                .wrapping_add(m[(i + DIST[2]) % N])
+                .wrapping_add(m[(i + DIST[3]) % N]);
+        }
+        for k in 0..8 {
+            let a = s[2 * k];
+            s[2 * k + 1] = s[2 * k + 1].wrapping_mul(a | 1);
+        }
+    }
+
+    /// The optimized unrolled `cml_round` must be byte-for-byte identical to
+    /// the array-formula reference, across round counts and adversarial inputs.
+    /// This locks the manual unrolling (and its literal coupling taps) to the
+    /// spec on every platform, independent of the canonical keystream vectors.
+    #[test]
+    fn coupling_unroll_matches_reference() {
+        // A spread of inputs: zeros, all-ones, alternating, counter-like, and
+        // a deterministic LCG sweep — no RNG dependency, fully reproducible.
+        let seeds: [u64; 5] = [0, u64::MAX, 0xAAAA_AAAA_AAAA_AAAA, 1, 0x9E37_79B9_7F4A_7C15];
+        for &seed in &seeds {
+            for start_counter in [0u64, 12345, u64::MAX] {
+                let mut lat_opt = [0u64; N];
+                let mut x = seed.wrapping_add(1);
+                for w in lat_opt.iter_mut() {
+                    // simple splitmix-style fill, distinct per lane
+                    x = x.wrapping_mul(0x2545_F491_4F6C_DD1D).wrapping_add(seed | 1);
+                    *w = x ^ (x >> 29);
+                }
+                let mut lat_ref = lat_opt;
+                let mut c_opt = start_counter;
+                let mut c_ref = start_counter;
+                // Apply several rounds; state must agree at every step.
+                for _ in 0..5 {
+                    cml_round(&mut lat_opt, &mut c_opt);
+                    cml_round_reference(&mut lat_ref, &mut c_ref);
+                    assert_eq!(lat_opt, lat_ref, "lattice diverged (seed {seed:#x})");
+                    assert_eq!(c_opt, c_ref, "counter diverged (seed {seed:#x})");
+                }
+            }
+        }
     }
 }

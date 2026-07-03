@@ -2,6 +2,27 @@
 
 All notable changes to Catwalk are documented here. Dates are UTC.
 
+## 2026-06-10 — Portable performance pass
+
+Both changes are ISA-agnostic (help every target; nothing machine-specific)
+and **output-preserving** (all keystream/tag test vectors unchanged).
+
+### Changed
+- `cml_round` rewritten from array-with-modular-indexing to fully-unrolled
+  scalar SSA. Lets the compiler keep the 16-word state in registers instead
+  of spilling the `m[]` snapshot to the stack. A new co-located test
+  (`coupling_unroll_matches_reference`) locks the hand-unrolled coupling taps
+  to the readable array-formula spec. ~5% faster permutation.
+- Removed the committed `-C target-cpu=native` build flag. For CATWALK's
+  scalar 64-bit-integer permutation it was a *pessimization* (LLVM AVX2
+  autovectorization regressed the workload) and it pinned binaries to the
+  build machine's ISA. The default portable build is now both faster and runs
+  on any CPU of the target architecture. Opt in per-build with
+  `RUSTFLAGS="-C target-cpu=native"` if desired.
+
+Net same-machine effect: permutation 100.7 → 86.1 ns (−15%), AEAD 64 KB
+encrypt 488 → 629 MiB/s (+29%).
+
 ## 2026-06-10 — CLI hardening & verify-then-emit streaming
 
 ### Security

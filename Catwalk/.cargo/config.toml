@@ -1,2 +1,16 @@
-[build]
-rustflags = ["-C", "target-cpu=native"]
+# No `target-cpu` override — deliberately.
+#
+# The default (the portable baseline for whatever target triple is being built)
+# produces binaries that run on ANY CPU of that architecture. It is also FASTER
+# for CATWALK: the core permutation is scalar 64-bit integer arithmetic, and
+# `-C target-cpu=native` pushes LLVM toward AVX2 autovectorization that actually
+# regresses this workload (measured ~7-9% slower and noisier on Zen 2), while
+# also pinning the binary to the build machine's instruction set.
+#
+# Dependencies that genuinely benefit from SIMD (blake3, zstd) do their own
+# runtime CPU-feature detection, so they are unaffected by this choice.
+#
+# For a throwaway machine-local build you can still opt in per-invocation
+# without committing anything machine-specific:
+#
+#   RUSTFLAGS="-C target-cpu=native" cargo build --release
